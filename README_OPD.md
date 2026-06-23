@@ -206,7 +206,12 @@ MODEL_PATH=runs/opd_qwen25_3b_<RUN> SKIP_JUDGE=true bash scripts/eval_opd.sh
 ```
 
 Knobs (env): `EVAL_DATASETS`, `EVAL_BENCHMARKS` (e.g. `vilp-f,vilp-p,cv-bench`),
-`PASS_K`, `LIMIT`, `PROMPT_SUFFIX`, `JUDGE_MODEL`, `TENSOR_PARALLEL_SIZE`, …
+`PASS_K`, `LIMIT`, `GRADER` (`llm` default / `rule` = mathruler+option match, no API),
+`JUDGE_MODEL`, `TENSOR_PARALLEL_SIZE`, …
+
+For `Acc@1` use `PASS_K=1 GEN_TEMPERATURE=0` (greedy); for `Avg@k`/`Pass@k` use
+`PASS_K=k` with sampling (`GEN_TEMPERATURE=1.0`). `summary.json`: `pass_at_k` =
+Pass@k, `avg_at_k` = Avg@k.
 
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:

@@ -46,6 +46,7 @@ from vigos.eval_utils import (
     vllm_request,
 )
 
+from baseline.eval.grading import attempt_correct
 from baseline.eval.opd_eval_prompt import (
     GENERAL_PROMPT_DESCRIPTION,
     build_general_eval_prompt,
@@ -77,7 +78,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--limit-images", type=int, default=16)
     p.add_argument("--dtype", default="auto")
-    # judge
+    # grading / judge
+    p.add_argument(
+        "--grader",
+        default="llm",
+        choices=["rule", "llm"],
+        help="llm = OpenAI-compatible LLM judge (default, same as ViGOS); "
+        "rule = mathruler + option/exact match (no API, deterministic/reproducible).",
+    )
     p.add_argument("--skip-judge", action="store_true")
     p.add_argument("--judge-model", default="deepseek-v4-flash")
     p.add_argument("--judge-api-url", default="https://api.deepseek.com")
@@ -251,6 +259,36 @@ def judge_records(records: list[dict[str, Any]], args: argparse.Namespace) -> li
         return list(pool.map(judge_one, records))
 
 
+# ------------------------------------------------------------------ rule grading
+def grade_records_rule(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Deterministic per-attempt grading (no API), same schema as the LLM judge."""
+    judgments: list[dict[str, Any]] = []
+    for record in records:
+        attempts = record.get("attempts") or []
+        texts = [a.get("response", "") for a in attempts] or [record.get("response", "")]
+        verdicts = [
+            "correct" if attempt_correct(text, record["ground_truth"]) else "incorrect"
+            for text in texts
+        ]
+        correct = sum(v == "correct" for v in verdicts)
+        judgments.append(
+            {
+                "dataset": record["dataset"],
+                "sample_id": record["sample_id"],
+                "judge_verdict": "correct" if correct > 0 else "incorrect",
+                "judge_attempt_verdicts": verdicts,
+                "judge_attempt_count": len(verdicts),
+                "judge_attempt_correct_count": correct,
+                "avg_at_k": (correct / len(verdicts)) if verdicts else None,
+                "judge_extracted_answers": [extract_model_answer(t) for t in texts],
+                "judge_reasoning": "rule-based (mathruler + option/exact)",
+                "judge_error": None,
+                "benchmark_meta": record.get("benchmark_meta"),
+            }
+        )
+    return judgments
+
+
 # ------------------------------------------------------------------------- main
 def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -301,6 +339,7 @@ def main() -> None:
         "model_name": args.model_name or os.path.basename(args.model_path.rstrip("/")),
         "output_dir": str(output_dir),
         "pass_k": max(1, args.pass_k),
+        "grader": args.grader,
         "prompt": GENERAL_PROMPT_DESCRIPTION,
         "prompt_suffix": args.prompt_suffix,
         "generation": {
@@ -328,7 +367,10 @@ def main() -> None:
         if args.skip_judge:
             continue
 
-        judgments = judge_records(records, args)
+        if args.grader == "rule":
+            judgments = grade_records_rule(records)
+        else:
+            judgments = judge_records(records, args)
         write_jsonl(judgment_file, judgments)
 
         if source["kind"] == "benchmark":

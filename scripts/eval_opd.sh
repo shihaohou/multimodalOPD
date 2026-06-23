@@ -38,6 +38,9 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
 VLLM_LIMIT_IMAGES="${VLLM_LIMIT_IMAGES:-16}"
 DTYPE="${DTYPE:-auto}"
+# Grading: llm = LLM judge (default, same as ViGOS); rule = mathruler + option/exact
+# match (no API, deterministic/reproducible).
+GRADER="${GRADER:-llm}"
 SKIP_JUDGE="${SKIP_JUDGE:-false}"
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-v4-flash}"
 JUDGE_API_URL="${JUDGE_API_URL:-https://api.deepseek.com}"
@@ -55,6 +58,7 @@ CMD=(
   --datasets "$EVAL_DATASETS"
   --benchmarks "$EVAL_BENCHMARKS"
   --default-split "$DEFAULT_SPLIT"
+  --grader "$GRADER"
   --prompt-suffix "$PROMPT_SUFFIX"
   --pass-k "$PASS_K"
   --batch-size "$BATCH_SIZE"
