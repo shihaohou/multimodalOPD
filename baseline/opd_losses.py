@@ -67,7 +67,9 @@ def masked_topk_kl_loss(
         temperature=temperature,
     )
     if token_clip is not None and token_clip > 0:
-        per_token = per_token.clamp(max=token_clip)
+        # Symmetric clamp: the diff-clamped surrogate (see _topk_divergence) can dip
+        # slightly negative, so bound both tails — verl `loss_max_clamp` semantics.
+        per_token = per_token.clamp(min=-token_clip, max=token_clip)
     return per_token.sum() / mask.sum().to(dtype=per_token.dtype).clamp_min(1.0)
 
 
@@ -124,7 +126,8 @@ def masked_topk_kl_loss_from_teacher_topk(
     )
     per_token = summand.sum(dim=-1)
     if token_clip is not None and token_clip > 0:
-        per_token = per_token.clamp(max=token_clip)
+        # Symmetric clamp (see masked_topk_kl_loss) — verl `loss_max_clamp`.
+        per_token = per_token.clamp(min=-token_clip, max=token_clip)
     return per_token.sum() / mask.sum().to(dtype=per_token.dtype).clamp_min(1.0)
 
 
