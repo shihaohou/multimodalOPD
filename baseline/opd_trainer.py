@@ -152,9 +152,16 @@ class OPDTrainer(ViGOSTrainer):
                     }
                 ],
             )["opd"]
+            # Same-family checkpoints can have different padded vocab sizes (e.g.
+            # Qwen2.5-VL 3B=151936 vs 7B=152064). Truncate both to the shared (min)
+            # vocab — the extra columns are padding beyond the real tokenizer vocab,
+            # and log_softmax then renormalizes over the shared support.
+            vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
+            student_kl_logits = student_logits[..., :vocab]
+            teacher_logits = teacher_logits[..., :vocab]
             if self.opd_loss_mode == "full_kl" and self.opd_kl_direction == "reverse":
                 opd_loss = masked_kl_loss(
-                    student_logits,
+                    student_kl_logits,
                     teacher_logits,
                     completion_attention,
                     temperature=self.distill_temperature,
@@ -162,7 +169,7 @@ class OPDTrainer(ViGOSTrainer):
                 )
             else:
                 opd_loss = masked_topk_kl_loss(
-                    student_logits,
+                    student_kl_logits,
                     teacher_logits,
                     completion_attention,
                     top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
