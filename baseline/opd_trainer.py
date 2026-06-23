@@ -300,6 +300,14 @@ class OPDTrainer(ViGOSTrainer):
                 temperature=self.distill_temperature,
                 token_clip=self.token_loss_clip,
             )
+            if not bool(torch.isfinite(opd_loss.detach())):
+                self._report_opd_nan(
+                    student_logits,
+                    student_kl_logits,
+                    teacher_kl_logits,
+                    completion_attention,
+                    completion_ids,
+                )
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
