@@ -1,0 +1,357 @@
+"""Entry point for vanilla multimodal On-Policy Distillation (OPD).
+
+Standalone counterpart to ``vigos/train_vigos.py``. It trains a LoRA student
+against a separate, frozen, stronger same-family VLM teacher using on-policy
+reverse-KL distillation (see :class:`baseline.opd_trainer.OPDTrainer`). ViGOS /
+OPSD code paths are left completely untouched; this only reuses the ``vigos``
+framework as a library.
+
+Example
+-------
+    DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \\
+    TEACHER_MODEL=Qwen/Qwen2.5-VL-7B-Instruct \\
+    bash scripts/train_opd_qwen25_3b.sh
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional
+
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import torch
+from peft import LoraConfig, TaskType, get_peft_model
+from transformers import (
+    AutoProcessor,
+    HfArgumentParser,
+    TrainerCallback,
+    TrainingArguments,
+    set_seed,
+)
+
+import vigos.dataset_utils as dataset_utils
+from baseline.opd_data_collator import OPD_DEFAULT_PROMPT_SUFFIX, OPDDataCollator
+from baseline.opd_trainer import OPDTrainer
+from vigos.train_vigos import (
+    DEFAULT_LEARNING_RATE,
+    _cli_arg_was_provided,
+    _dtype,
+    _model_class_for_checkpoint,
+    _reporting_to_wandb,
+)
+
+_load_dataset = dataset_utils.load_vigos_dataset
+_filter_tiny_image_samples = dataset_utils.filter_tiny_image_samples
+
+
+@dataclass
+class OPDScriptArguments:
+    model_name_or_path: str = "Qwen/Qwen2.5-VL-3B-Instruct"
+    teacher_model_name_or_path: str | None = None
+    teacher_torch_dtype: str = "bfloat16"
+    teacher_attn_implementation: str = "flash_attention_2"
+    dataset_name: str | None = None
+    dataset_split: str = "train"
+    max_train_samples: Optional[int] = None
+    filter_tiny_images: bool = False
+    min_image_size: int = 3
+    max_prompt_length: int = 32768
+    max_completion_length: int = 4096
+    attn_implementation: str = "flash_attention_2"
+    torch_dtype: str = "bfloat16"
+    trust_remote_code: bool = True
+    lora_r: int = 64
+    lora_alpha: int = 128
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+    answer_field: str = "answer"
+    opd_prompt_suffix: str = OPD_DEFAULT_PROMPT_SUFFIX
+    generation_temperature: float = 1.1
+    generation_top_p: float = 0.95
+    generation_top_k: int = 20
+    distill_temperature: float = 1.0
+    lambda_opd: float = 1.0
+    token_loss_clip: float = 0.0
+    presence_penalty: float = 0.0
+    repetition_penalty: float = 1.0
+    min_p: float = 0.0
+    use_vllm: bool = False
+    vllm_mode: str = "colocate"
+    vllm_gpu_memory_utilization: float = 0.3
+    vllm_tensor_parallel_size: int = 1
+    vllm_sync_frequency: int = 1
+    vllm_max_model_len: Optional[int] = None
+    vllm_max_num_seqs: Optional[int] = None
+    vllm_disable_custom_all_reduce: bool = False
+    vllm_server_base_url: Optional[str] = None
+    vllm_server_host: str = "127.0.0.1"
+    vllm_server_port: int = 8000
+    vllm_server_timeout: float = 300.0
+    vllm_server_group_port: int = 51216
+    vllm_server_request_batch_size: Optional[int] = None
+    completion_log_steps: int = 0
+    completion_log_max_samples: int = 16
+    run_config: str | None = field(
+        default=None,
+        metadata={"help": "Run config label; appended to output_dir and WandB run name."},
+    )
+    run_name_suffix: str | None = field(
+        default=None,
+        metadata={"help": "Optional suffix appended to the Trainer run name."},
+    )
+
+
+class _OPDWandBConfigCallback(TrainerCallback):
+    """Log static run config to WandB once at train start (best effort)."""
+
+    def __init__(self, config: dict[str, object]) -> None:
+        self._config = config
+        self._logged = False
+
+    def on_train_begin(self, args, state, control, **kwargs):
+        if self._logged:
+            return control
+        self._logged = True
+        try:
+            import wandb
+
+            if wandb.run is not None:
+                wandb.config.update(self._config, allow_val_change=True)
+        except Exception:
+            pass
+        return control
+
+
+def main() -> None:
+    parser = HfArgumentParser((OPDScriptArguments, TrainingArguments))
+    script_args, training_args = parser.parse_args_into_dataclasses()
+    training_args.remove_unused_columns = False
+    if not _cli_arg_was_provided("--learning_rate", "--learning-rate"):
+        training_args.learning_rate = DEFAULT_LEARNING_RATE
+
+    if not script_args.dataset_name:
+        raise ValueError("--dataset_name is required (a HuggingFace dataset id).")
+    if not script_args.teacher_model_name_or_path:
+        raise ValueError(
+            "--teacher_model_name_or_path is required for OPD; point it at a "
+            "stronger same-family VLM checkpoint (base or RL-tuned)."
+        )
+
+    if script_args.run_config:
+        lr_str = f"{training_args.learning_rate:.0e}".replace("e-0", "e-")
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        effective_batch_size = (
+            training_args.per_device_train_batch_size
+            * training_args.gradient_accumulation_steps
+            * world_size
+        )
+        training_args.run_name = f"{script_args.run_config}_lr{lr_str}_bs{effective_batch_size}"
+        if not Path(training_args.output_dir).name == script_args.run_config:
+            training_args.output_dir = str(
+                Path(training_args.output_dir) / script_args.run_config
+            )
+    elif script_args.run_name_suffix:
+        base_name = training_args.run_name or "opd"
+        training_args.run_name = f"{base_name}_{script_args.run_name_suffix}"
+    elif not training_args.run_name or training_args.run_name == training_args.output_dir:
+        training_args.run_name = (
+            os.path.basename(os.path.normpath(training_args.output_dir)) or "opd"
+        )
+
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        print("\n" + "=" * 80)
+        print("OPD RUN CONFIGURATION")
+        print("=" * 80)
+        print(f"Student model: {script_args.model_name_or_path}")
+        print(f"Teacher model: {script_args.teacher_model_name_or_path}")
+        print(f"WandB/Trainer run name: {training_args.run_name}")
+        print(f"Output directory: {training_args.output_dir}")
+        print(f"Dataset name: {script_args.dataset_name}")
+        print(f"Answer/reference field: {script_args.answer_field}")
+        print(f"OPD prompt suffix: {script_args.opd_prompt_suffix!r}")
+        print(
+            "Rollout sampling: "
+            f"temperature={script_args.generation_temperature}, "
+            f"top_p={script_args.generation_top_p}, "
+            f"top_k={script_args.generation_top_k}"
+        )
+        print(
+            "Distillation: reverse_kl(student||teacher) over full completion, "
+            f"lambda_opd={script_args.lambda_opd}, "
+            f"distill_temperature={script_args.distill_temperature}, "
+            f"token_loss_clip={script_args.token_loss_clip}"
+        )
+        print(
+            "vLLM: "
+            f"use_vllm={script_args.use_vllm}, mode={script_args.vllm_mode}, "
+            f"tp={script_args.vllm_tensor_parallel_size}, "
+            f"gpu_memory_utilization={script_args.vllm_gpu_memory_utilization}"
+        )
+        print("=" * 80 + "\n")
+
+    set_seed(training_args.seed)
+
+    processor = AutoProcessor.from_pretrained(
+        script_args.model_name_or_path,
+        trust_remote_code=script_args.trust_remote_code,
+        use_fast=False,
+    )
+    tokenizer = getattr(processor, "tokenizer", processor)
+    if getattr(tokenizer, "pad_token", None) is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    # --- Student (trainable LoRA) -------------------------------------------------
+    model_kwargs = {
+        "trust_remote_code": script_args.trust_remote_code,
+        "attn_implementation": script_args.attn_implementation,
+        "dtype": _dtype(script_args.torch_dtype),
+    }
+    model_class, model_type = _model_class_for_checkpoint(
+        script_args.model_name_or_path,
+        trust_remote_code=script_args.trust_remote_code,
+    )
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        print(f"Resolved student model_type={model_type} to {model_class.__name__}.")
+    model = model_class.from_pretrained(script_args.model_name_or_path, **model_kwargs)
+    model.config.use_cache = False if training_args.gradient_checkpointing else True
+    if training_args.gradient_checkpointing:
+        model.gradient_checkpointing_enable()
+        model.config.use_cache = False
+
+    target_modules = [
+        module.strip()
+        for module in script_args.lora_target_modules.split(",")
+        if module.strip()
+    ]
+    lora_config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=script_args.lora_r,
+        lora_alpha=script_args.lora_alpha,
+        lora_dropout=script_args.lora_dropout,
+        target_modules=target_modules,
+        bias="none",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    # --- Teacher (frozen, separate checkpoint) -----------------------------------
+    teacher_class, teacher_type = _model_class_for_checkpoint(
+        script_args.teacher_model_name_or_path,
+        trust_remote_code=script_args.trust_remote_code,
+    )
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        print(
+            f"Loading OPD teacher {script_args.teacher_model_name_or_path} "
+            f"(model_type={teacher_type} -> {teacher_class.__name__})."
+        )
+    teacher_model = teacher_class.from_pretrained(
+        script_args.teacher_model_name_or_path,
+        trust_remote_code=script_args.trust_remote_code,
+        attn_implementation=script_args.teacher_attn_implementation,
+        dtype=_dtype(script_args.teacher_torch_dtype),
+    )
+    teacher_model.config.use_cache = False
+    teacher_model.requires_grad_(False)
+    teacher_model.eval()
+
+    # --- Data ---------------------------------------------------------------------
+    dataset = _load_dataset(script_args.dataset_name, script_args.dataset_split)
+    if script_args.max_train_samples is not None:
+        dataset = dataset.select(range(min(script_args.max_train_samples, len(dataset))))
+    if script_args.filter_tiny_images:
+        pre = len(dataset)
+        dataset = _filter_tiny_image_samples(
+            dataset, min_image_size=script_args.min_image_size
+        )
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(f"Dataset filtering removed {pre - len(dataset)}/{pre} samples.")
+
+    data_collator = OPDDataCollator(
+        processor=processor,
+        max_prompt_length=script_args.max_prompt_length,
+        answer_field=script_args.answer_field,
+        opd_prompt_suffix=script_args.opd_prompt_suffix,
+    )
+
+    # --- Trainer ------------------------------------------------------------------
+    trainer = OPDTrainer(
+        model=model,
+        args=training_args,
+        model_name_or_path=script_args.model_name_or_path,
+        train_dataset=dataset,
+        data_collator=data_collator,
+        processing_class=processor,
+        processor=processor,
+        teacher_model=teacher_model,
+        lambda_opd=script_args.lambda_opd,
+        max_prompt_length=script_args.max_prompt_length,
+        max_completion_length=script_args.max_completion_length,
+        generation_temperature=script_args.generation_temperature,
+        generation_top_p=script_args.generation_top_p,
+        generation_top_k=script_args.generation_top_k,
+        distill_temperature=script_args.distill_temperature,
+        token_loss_clip=(
+            script_args.token_loss_clip if script_args.token_loss_clip > 0 else None
+        ),
+        presence_penalty=script_args.presence_penalty,
+        repetition_penalty=script_args.repetition_penalty,
+        min_p=script_args.min_p,
+        use_vllm=script_args.use_vllm,
+        vllm_mode=script_args.vllm_mode,
+        vllm_gpu_memory_utilization=script_args.vllm_gpu_memory_utilization,
+        vllm_tensor_parallel_size=script_args.vllm_tensor_parallel_size,
+        vllm_sync_frequency=script_args.vllm_sync_frequency,
+        vllm_max_model_len=script_args.vllm_max_model_len
+        or script_args.max_prompt_length + script_args.max_completion_length,
+        vllm_max_num_seqs=script_args.vllm_max_num_seqs,
+        vllm_disable_custom_all_reduce=script_args.vllm_disable_custom_all_reduce,
+        vllm_server_base_url=script_args.vllm_server_base_url,
+        vllm_server_host=script_args.vllm_server_host,
+        vllm_server_port=script_args.vllm_server_port,
+        vllm_server_timeout=script_args.vllm_server_timeout,
+        vllm_server_group_port=script_args.vllm_server_group_port,
+        vllm_server_request_batch_size=script_args.vllm_server_request_batch_size,
+        completion_log_steps=script_args.completion_log_steps,
+        completion_log_max_samples=script_args.completion_log_max_samples,
+    )
+
+    if _reporting_to_wandb(training_args):
+        trainer.add_callback(
+            _OPDWandBConfigCallback(
+                {
+                    "opd_method": "opd",
+                    "opd_student_model": script_args.model_name_or_path,
+                    "opd_teacher_model": script_args.teacher_model_name_or_path,
+                    "opd_dataset_name": script_args.dataset_name,
+                    "opd_train_dataset_size": len(dataset),
+                    "opd_lambda_opd": script_args.lambda_opd,
+                    "opd_distill_temperature": script_args.distill_temperature,
+                    "opd_token_loss_clip": (
+                        script_args.token_loss_clip
+                        if script_args.token_loss_clip > 0
+                        else None
+                    ),
+                    "opd_kl_direction": "reverse_kl_full_completion",
+                    "opd_prompt_suffix": script_args.opd_prompt_suffix,
+                    "opd_max_prompt_length": script_args.max_prompt_length,
+                    "opd_max_completion_length": script_args.max_completion_length,
+                }
+            )
+        )
+
+    trainer.train()
+    trainer.save_model(training_args.output_dir)
+    processor.save_pretrained(training_args.output_dir)
+
+
+if __name__ == "__main__":
+    main()

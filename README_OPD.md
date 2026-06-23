@@ -1,0 +1,134 @@
+# Multimodal OPD
+
+**Vanilla multimodal On-Policy Distillation (OPD)** for vision-language models.
+This project is built on top of the [ViGOS](README.md) code framework (rollout,
+vLLM colocate, exact full-vocabulary KL, DDP-normalized losses) but implements a
+different and simpler objective, kept in **separate files** so the ViGOS / OPSD
+code paths stay untouched.
+
+> Status: training path implemented (`vigos/train_opd.py`). Evaluation framework
+> and model/architecture modifications (e.g. attention changes) are planned — see
+> [Roadmap](#roadmap).
+
+## What is OPD here (vs the ViGOS OPSD baseline)
+
+| | OPSD (ViGOS, upstream) | **OPD (this project)** |
+|---|---|---|
+| Teacher | the **same** weights with the LoRA adapter disabled | a **separate, frozen, stronger** same-family VLM checkpoint |
+| Teacher prompt | **privileged** (contains the reference answer) | the **same non-privileged** prompt the student sees |
+| Supervised tokens | description / think / answer spans | the **full completion** |
+| Loss | `λ_perc·L_perc + λ_reas·L_reas + λ_ref·L_ref` | a single per-token **reverse KL** `KL(student‖teacher)` |
+| Prompt | ViGOS `<description>…</description><think>…</think>\boxed{}` | the **dataset's own `problem`** + optional boxed-answer suffix |
+
+OPD mechanism per step:
+
+1. The LoRA **student** samples one on-policy rollout from the dataset prompt
+   (vLLM colocate by default).
+2. A **frozen teacher** (loaded from `TEACHER_MODEL`) runs a single forward pass
+   over the *same* prompt + the sampled completion.
+3. Loss = per-token reverse KL `KL(student‖teacher)` over the full completion,
+   re-normalized across DDP ranks by the global active-token count.
+
+The teacher is never updated and is never synced into vLLM; only the student is.
+
+References: [Agarwal et al., GKD (2023)](https://arxiv.org/pdf/2306.13649),
+[Thinking Machines: On-Policy Distillation (2025)](https://thinkingmachines.ai/blog/on-policy-distillation/),
+[awesome-on-policy-distillation](https://github.com/chrisliu298/awesome-on-policy-distillation).
+
+## Files added by this project
+
+All OPD code lives in the new top-level `baseline/` package; the `vigos/` package
+is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchanged.
+
+| File | Role |
+|------|------|
+| `baseline/opd_data_collator.py` | `OPDDataCollator` — builds only the non-privileged student prompt from the dataset's `problem`. Dataset-agnostic. |
+| `baseline/opd_trainer.py` | `OPDTrainer(ViGOSTrainer)` — overrides `compute_loss` with on-policy reverse-KL vs a frozen teacher; reuses all ViGOS rollout/teacher/KL helpers. |
+| `baseline/train_opd.py` | Standalone OPD entry point (loads student+LoRA, frozen teacher, OPD collator, trainer). |
+| `baseline/__init__.py` | Package marker for the `baseline` namespace. |
+| `scripts/train_opd_qwen25_3b.sh` | Launcher (runs `baseline/train_opd.py`); every hyperparameter is an env-var override. |
+
+ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
+
+## Environment
+
+```bash
+uv sync --python 3.11   # PyTorch 2.8, Transformers 4.57.1, TRL 0.26, vLLM 0.11
+```
+
+## Data
+
+Any HuggingFace dataset exposing `problem` (text), `images` (PIL), and `answer`.
+Default reference dataset:
+
+```bash
+export DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K
+```
+
+Because OPD uses the dataset's own prompt, switching datasets needs no prompt
+changes. A small dataset-agnostic suffix (asking for a `\boxed{}` final answer)
+is appended for eval compatibility; disable it with `OPD_PROMPT_SUFFIX=""`.
+
+## Training
+
+```bash
+DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \
+TEACHER_MODEL=Qwen/Qwen2.5-VL-7B-Instruct \
+bash scripts/train_opd_qwen25_3b.sh
+```
+
+`TEACHER_MODEL` may be a base checkpoint or an RL/SFT-tuned one; it must be the
+**same model family** as the student (shared tokenizer/vocab is required for
+exact full-vocabulary KL).
+
+### Key knobs (env vars)
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `TEACHER_MODEL` | *(required)* | Frozen teacher checkpoint path/id |
+| `MODEL_NAME_OR_PATH` | `Qwen/Qwen2.5-VL-3B-Instruct` | Student base |
+| `LAMBDA_OPD` | `1.0` | Reverse-KL loss weight |
+| `DISTILL_TEMPERATURE` | `1.0` | KL softmax temperature |
+| `TOKEN_LOSS_CLIP` | `0.0` | Per-token KL clip (0 = off) |
+| `OPD_PROMPT_SUFFIX` | boxed-answer instruction | Appended to the raw dataset prompt |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.30` | Lowered to make room for the teacher replica |
+
+### Memory / teacher scale
+
+The teacher is replicated (inference-only) on **every** GPU:
+
+- **7B teacher** ≈ 14 GB/GPU — fits alongside a 3B/7B student + colocate vLLM on
+  A100-80G (keep `VLLM_GPU_MEMORY_UTILIZATION` low).
+- **14B** ≈ 28 GB/GPU — tight; reduce vLLM util / per-device batch size.
+- **≥32B** — does not fit per-GPU; needs teacher tensor-parallel (separate
+  device group) or a switch to top-k KL. Out of scope for the default script.
+
+vLLM's logprob API returns only top-k, so the teacher must run a **local HF
+forward pass** for full-vocabulary KL.
+
+## Merge + evaluate
+
+Training writes a LoRA adapter under `runs/`. Reuse the ViGOS merge + eval tools:
+
+```bash
+uv run python scripts/merge_lora.py \
+  --adapter runs/opd_qwen25_3b_<RUN>/checkpoint-XXX \
+  --output runs/opd_qwen25_3b_merged --overwrite
+
+MODEL_PATH=runs/opd_qwen25_3b_merged SKIP_JUDGE=true bash scripts/eval_vigos.sh
+```
+
+> The current eval prompt is ViGOS-style. A general OPD/benchmark eval harness is
+> on the roadmap.
+
+## Roadmap
+
+- [ ] General multi-benchmark evaluation framework (not tied to the ViGOS prompt).
+- [ ] Model/architecture experiments (e.g. attention modifications) on the student.
+- [ ] Optional completion-sample logging for OPD rollouts.
+- [ ] Top-k KL / teacher tensor-parallel path to support ≥32B teachers.
+
+## Attribution & license
+
+Built on the ViGOS framework (see [`README.md`](README.md), [`NOTICE`](NOTICE)).
+Code under `vigos/`, `scripts/`, `configs/` follows the upstream Apache-2.0 terms.
