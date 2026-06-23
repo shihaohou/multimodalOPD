@@ -52,7 +52,10 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/opd_trainer.py` | `OPDTrainer(ViGOSTrainer)` — overrides `compute_loss` with on-policy reverse-KL vs a frozen teacher; reuses all ViGOS rollout/teacher/KL helpers. |
 | `baseline/train_opd.py` | Standalone OPD entry point (loads student+LoRA, frozen teacher, OPD collator, trainer). |
 | `baseline/__init__.py` | Package marker for the `baseline` namespace. |
-| `scripts/train_opd_qwen25_3b.sh` | Launcher (runs `baseline/train_opd.py`); every hyperparameter is an env-var override. |
+| `baseline/eval/opd_eval_prompt.py` | General eval prompt (dataset problem + suffix, no prefill). |
+| `baseline/eval/run_opd_eval.py` | General multi-benchmark eval harness (vLLM gen + LLM judge + pass@k/avg@k). |
+| `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
+| `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
 
 ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
 
@@ -143,30 +146,51 @@ The teacher is replicated (inference-only) on **every** GPU:
 vLLM's logprob API returns only top-k, so the teacher must run a **local HF
 forward pass** for full-vocabulary KL.
 
-## Merge + evaluate
+## Evaluation
 
-**Full FT (default):** `save_model` writes a full checkpoint under `runs/` — no
-merge step. Evaluate it directly:
+A **general** multi-benchmark harness (`baseline/eval/`, launched by
+`scripts/eval_opd.sh`) that uses the dataset's own prompt — **not** the ViGOS
+format — so it works for any checkpoint (OPD / OPSD / base) and any dataset. It
+reuses the generic `vigos.eval_utils` / `vigos.eval_benchmarks` helpers (sample
+extraction, LLM-judge prompts, scoring) and adds the general OPD prompt.
+
+Pipeline: vLLM generate pass@k → extract `\boxed` answer → OpenAI-compatible
+LLM-judge → pass@k / avg@k → `responses/`, `judgments/`, `summary.json`.
 
 ```bash
-MODEL_PATH=runs/opd_qwen25_3b_<RUN> SKIP_JUDGE=true bash scripts/eval_vigos.sh
+export DEEPSEEK_API_KEY=...                      # judge (or SKIP_JUDGE=true)
+# Full FT writes a full checkpoint, so point straight at the run dir:
+MODEL_PATH=runs/opd_qwen25_3b_<RUN> bash scripts/eval_opd.sh
+# Generation only, no judging:
+MODEL_PATH=runs/opd_qwen25_3b_<RUN> SKIP_JUDGE=true bash scripts/eval_opd.sh
 ```
 
-**LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then eval:
+Knobs (env): `EVAL_DATASETS`, `EVAL_BENCHMARKS` (e.g. `vilp-f,vilp-p,cv-bench`),
+`PASS_K`, `LIMIT`, `PROMPT_SUFFIX`, `JUDGE_MODEL`, `TENSOR_PARALLEL_SIZE`, …
+
+**LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
+`MODEL_PATH` at the merged dir:
 
 ```bash
 uv run python scripts/merge_lora.py \
   --adapter runs/opd_qwen25_3b_<RUN>/checkpoint-XXX \
   --output runs/opd_qwen25_3b_merged --overwrite
-MODEL_PATH=runs/opd_qwen25_3b_merged SKIP_JUDGE=true bash scripts/eval_vigos.sh
+MODEL_PATH=runs/opd_qwen25_3b_merged bash scripts/eval_opd.sh
 ```
+
+> Default `EVAL_DATASETS` covers the generic LLM-judged benchmarks (MM-Vet, MMMU,
+> MMMU-Pro, MathVerse, MathVista, MMSI, RealWorldQA). The bespoke benchmarks
+> (ViLP / CV-Bench) work via `EVAL_BENCHMARKS` but have their own answer-format
+> expectations — set `PROMPT_SUFFIX=""` for those.
 
 > The current eval prompt is ViGOS-style. A general OPD/benchmark eval harness is
 > on the roadmap.
 
 ## Roadmap
 
-- [ ] General multi-benchmark evaluation framework (not tied to the ViGOS prompt).
+- [x] General multi-benchmark evaluation harness (`baseline/eval/`, dataset prompt,
+      pass@k/avg@k, LLM judge) — generic-dataset path; bespoke benchmarks reused
+      from `vigos.eval_benchmarks`.
 - [ ] Model/architecture experiments (e.g. attention modifications) on the student.
 - [ ] Optional completion-sample logging for OPD rollouts.
 - [x] Top-k KL loss (`topk_kl`, forward/reverse/jsd) — local HF teacher.

@@ -113,6 +113,13 @@ Difference from what this repo does today:
 - `scripts/train_opd_qwen25_3b.sh` — launcher (runs `baseline/train_opd.py`;
   `TEACHER_MODEL` env required).
 - `README_OPD.md` — the project README for this OPD work.
+- `baseline/eval/` + `scripts/eval_opd.sh` — **general** multi-benchmark eval
+  harness. Uses the dataset's own prompt (not the ViGOS format) so it evaluates
+  any checkpoint; reuses generic `vigos.eval_utils` / `vigos.eval_benchmarks`
+  helpers (sample extraction, LLM-judge prompts, scoring) + the OPD eval prompt.
+  Pipeline: vLLM gen pass@k → `\boxed` extract → OpenAI-compatible judge →
+  pass@k/avg@k → `responses/`,`judgments/`,`summary.json`. Full-FT writes a full
+  checkpoint, so eval points straight at the run dir (no merge).
 
 Key reuse trick: `_batched_teacher_completion_logits(model, jobs)` already runs
 under `no_grad()/eval` and its adapter-disable context degrades to a no-op for a
