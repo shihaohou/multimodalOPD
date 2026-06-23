@@ -213,6 +213,38 @@ For `Acc@1` use `PASS_K=1 GEN_TEMPERATURE=0` (greedy); for `Avg@k`/`Pass@k` use
 `PASS_K=k` with sampling (`GEN_TEMPERATURE=1.0`). `summary.json`: `pass_at_k` =
 Pass@k, `avg_at_k` = Avg@k.
 
+### Standard benchmarks (MMMU, MMMU-Pro, MathVista, MathVerse, MathVision, MMStar, HallusionBench)
+
+Use the pre-formatted `zli12321/*` datasets (already `problem`/`answer`/`images`).
+Download once (behind a proxy: direct HF, no Xet/hf_transfer):
+
+```bash
+export HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0
+DSROOT=<datasets>/zli12321
+for d in mmstar MMMU mmmu_pro_10options mmmu-pro-vision mathvista mathverse mathvision hallusionbench; do
+  hf download "zli12321/$d" --repo-type dataset --local-dir "$DSROOT/$d"
+done
+```
+
+Then run Acc@1 (greedy) and Avg@8 / Pass@8 (sampled). vLLM eval needs the Q5
+triton patch on the venv (see the GRPO README); use a free GPU.
+
+```bash
+export DEEPSEEK_API_KEY=...
+DS="$DSROOT/mmstar,$DSROOT/MMMU,$DSROOT/mmmu_pro_10options,$DSROOT/mmmu-pro-vision,$DSROOT/mathvista,$DSROOT/mathverse,$DSROOT/mathvision,$DSROOT/hallusionbench"
+
+# Acc@1
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> EVAL_DATASETS="$DS" \
+  PASS_K=1 GEN_TEMPERATURE=0 OUTPUT_DIR=eval_outputs/<m>_acc1 bash scripts/eval_opd.sh
+# Avg@8 / Pass@8
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> EVAL_DATASETS="$DS" \
+  PASS_K=8 GEN_TEMPERATURE=1.0 GEN_TOP_P=0.9 OUTPUT_DIR=eval_outputs/<m>_passk8 bash scripts/eval_opd.sh
+```
+
+Caveats: HallusionBench here ≈ aAcc only (not fAcc/qAcc); MMMU-Pro = average the
+`mmmu_pro_10options` + `mmmu-pro-vision` sub-scores; ChartQA + the official
+per-benchmark metrics → use VLMEvalKit / lmms-eval.
+
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:
 
