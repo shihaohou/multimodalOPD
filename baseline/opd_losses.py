@@ -18,6 +18,11 @@ import torch.nn.functional as F
 
 from vigos.losses import js_tokens
 
+# Clamp the per-element log-prob difference (log p - log q) before weighting, like
+# verl. Bounds the reverse-KL gradient so an outlier token (teacher ~0 prob where
+# the student has mass) can't explode it; only affects extreme outliers.
+_LOGPROB_DIFF_CLAMP = 20.0
+
 
 def masked_topk_kl_loss(
     student_logits: torch.Tensor,
@@ -109,9 +114,12 @@ def masked_topk_kl_loss_from_teacher_topk(
     )
     valid = ids >= 0
     student_lp = torch.gather(student_log_probs, dim=-1, index=ids.clamp_min(0))
+    diff = (teacher_lp - student_lp).clamp(
+        min=-_LOGPROB_DIFF_CLAMP, max=_LOGPROB_DIFF_CLAMP
+    )
     summand = torch.where(
         valid,
-        teacher_lp.exp() * (teacher_lp - student_lp),
+        teacher_lp.exp() * diff,
         torch.zeros_like(student_lp),
     )
     per_token = summand.sum(dim=-1)
@@ -163,4 +171,7 @@ def _topk_divergence(
         p_log_probs = torch.gather(p_log_probs, dim=-1, index=indices)
         q_log_probs = torch.gather(q_log_probs, dim=-1, index=indices)
 
-    return (p_log_probs.exp() * (p_log_probs - q_log_probs)).sum(dim=-1)
+    diff = (p_log_probs - q_log_probs).clamp(
+        min=-_LOGPROB_DIFF_CLAMP, max=_LOGPROB_DIFF_CLAMP
+    )
+    return (p_log_probs.exp() * diff).sum(dim=-1)

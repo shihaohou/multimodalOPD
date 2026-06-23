@@ -162,24 +162,18 @@ class OPDTrainer(ViGOSTrainer):
             # fp32 (logits are tiny vs the model, so the cost is negligible).
             student_kl_logits = student_logits[..., :vocab].float()
             teacher_logits = teacher_logits[..., :vocab].float()
-            if self.opd_loss_mode == "full_kl" and self.opd_kl_direction == "reverse":
-                opd_loss = masked_kl_loss(
-                    student_kl_logits,
-                    teacher_logits,
-                    completion_attention,
-                    temperature=self.distill_temperature,
-                    token_clip=self.token_loss_clip,
-                )
-            else:
-                opd_loss = masked_topk_kl_loss(
-                    student_kl_logits,
-                    teacher_logits,
-                    completion_attention,
-                    top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
-                    direction=self.opd_kl_direction,
-                    temperature=self.distill_temperature,
-                    token_clip=self.token_loss_clip,
-                )
+            # Route everything through masked_topk_kl_loss so the verl-style log-prob
+            # diff clamp (gradient bound) also covers full_kl + reverse; top_k=None
+            # recovers exact full-vocab KL.
+            opd_loss = masked_topk_kl_loss(
+                student_kl_logits,
+                teacher_logits,
+                completion_attention,
+                top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
+                direction=self.opd_kl_direction,
+                temperature=self.distill_temperature,
+                token_clip=self.token_loss_clip,
+            )
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
