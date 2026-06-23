@@ -54,6 +54,13 @@ PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 # Vision-OPD uses 2e-6 for full-parameter OPD (vs 5e-6 for ViGOS LoRA).
 LEARNING_RATE="${LEARNING_RATE:-2e-6}"
+# LR warmup: ramps the early steps so the first reverse-KL gradients don't shock
+# the model. 0 = off (HF default).
+WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
+# Freeze the vision tower under full FT (default). The Qwen-VL ViT conv
+# patch_embed overflows in bf16 full FT and NaNs the weights; distillation
+# doesn't need to retrain it. Set false only for ablation.
+FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-true}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-32768}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-4096}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
@@ -161,8 +168,10 @@ uv run accelerate launch \
   --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --learning_rate "$LEARNING_RATE" \
+  --warmup_ratio "$WARMUP_RATIO" \
   --max_grad_norm 0.1 \
   --bf16 \
+  --freeze_vision_tower "$FREEZE_VISION_TOWER" \
   "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
   --max_prompt_length "$MAX_PROMPT_LENGTH" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \

@@ -98,6 +98,10 @@ class OPDScriptArguments:
     # lm_head rows, pad, vision/image/video control tokens) from the completion-KL
     # support. Stops full-vocab reverse KL from exploding on those columns.
     opd_mask_invalid_vocab: bool = True
+    # Freeze the Qwen-VL vision tower under full FT. Its ViT conv patch_embed is
+    # numerically unstable in bf16 full FT (gradient overflow -> NaN weights);
+    # distillation doesn't need to retrain it. Only applies to finetuning_mode=full.
+    freeze_vision_tower: bool = True
     token_loss_clip: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -260,9 +264,27 @@ def main() -> None:
     if script_args.finetuning_mode == "full":
         # Full-parameter training (default; matches Vision-OPD). save_model writes
         # the full checkpoint, so no LoRA merge step is needed before eval.
+        if script_args.freeze_vision_tower:
+            # The Qwen-VL vision tower (ViT conv patch_embed) is numerically
+            # unstable under bf16 full fine-tuning: its gradient overflows and
+            # poisons the Adam state -> NaN weights within a few steps (the OPD
+            # NaN probe pinned `visual.patch_embed.proj.weight` as the first
+            # tensor to go non-finite). Distillation doesn't need to retrain the
+            # ViT, so freeze it (standard for VLM post-training / RL).
+            frozen = 0
+            for name, param in model.named_parameters():
+                if "visual." in name:
+                    param.requires_grad_(False)
+                    frozen += param.numel()
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                print(f"Froze vision tower ('visual.*'): {frozen / 1e6:.1f}M params.")
         if os.environ.get("LOCAL_RANK", "0") == "0":
             total = sum(p.numel() for p in model.parameters())
-            print(f"Full fine-tuning: training all {total / 1e9:.2f}B parameters.")
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(
+                f"Full fine-tuning: {trainable / 1e9:.2f}B trainable / "
+                f"{total / 1e9:.2f}B total parameters."
+            )
     elif script_args.finetuning_mode == "lora":
         target_modules = [
             module.strip()
