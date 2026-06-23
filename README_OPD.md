@@ -20,9 +20,13 @@ code paths stay untouched.
 | Loss | `λ_perc·L_perc + λ_reas·L_reas + λ_ref·L_ref` | a single per-token **reverse KL** `KL(student‖teacher)` |
 | Prompt | ViGOS `<description>…</description><think>…</think>\boxed{}` | the **dataset's own `problem`** + optional boxed-answer suffix |
 
+The **student is trained with full fine-tuning by default** (matching
+[Vision-OPD](https://github.com/VisionOPD/Vision-OPD)); set `FINETUNING_MODE=lora`
+for a cheap memory-constrained run.
+
 OPD mechanism per step:
 
-1. The LoRA **student** samples one on-policy rollout from the dataset prompt
+1. The **student** samples one on-policy rollout from the dataset prompt
    (vLLM colocate by default).
 2. A **frozen teacher** (loaded from `TEACHER_MODEL`) runs a single forward pass
    over the *same* prompt + the sampled completion.
@@ -87,34 +91,50 @@ exact full-vocabulary KL).
 |-----|---------|---------|
 | `TEACHER_MODEL` | *(required)* | Frozen teacher checkpoint path/id |
 | `MODEL_NAME_OR_PATH` | `Qwen/Qwen2.5-VL-3B-Instruct` | Student base |
+| `FINETUNING_MODE` | `full` | `full` (all params) or `lora` |
+| `LEARNING_RATE` | `2e-6` | Full-FT LR (Vision-OPD uses 2e-6) |
 | `LAMBDA_OPD` | `1.0` | Reverse-KL loss weight |
 | `DISTILL_TEMPERATURE` | `1.0` | KL softmax temperature |
 | `TOKEN_LOSS_CLIP` | `0.0` | Per-token KL clip (0 = off) |
 | `OPD_PROMPT_SUFFIX` | boxed-answer instruction | Appended to the raw dataset prompt |
+| `ACCELERATE_CONFIG` | `configs/accelerate_zero2_gpu_8.yaml` | DeepSpeed ZeRO-2 (full-FT friendly) |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.30` | Lowered to make room for the teacher replica |
 
 ### Memory / teacher scale
 
+Full-FT is heavy: it co-locates a full-parameter student (params + grads +
+Adam state, ZeRO-2-sharded), a **replicated frozen teacher** on every GPU, and
+the colocate vLLM engine. The default `scripts/train_opd_qwen25_3b.sh` uses
+`per_device_train_batch_size=1`, `gradient_accumulation_steps=4`, and
+`VLLM_GPU_MEMORY_UTILIZATION=0.30`.
+
 The teacher is replicated (inference-only) on **every** GPU:
 
-- **7B teacher** ≈ 14 GB/GPU — fits alongside a 3B/7B student + colocate vLLM on
-  A100-80G (keep `VLLM_GPU_MEMORY_UTILIZATION` low).
-- **14B** ≈ 28 GB/GPU — tight; reduce vLLM util / per-device batch size.
-- **≥32B** — does not fit per-GPU; needs teacher tensor-parallel (separate
-  device group) or a switch to top-k KL. Out of scope for the default script.
+- **3B/4B student (full FT) + 7B teacher** — fits on 8×A100-80G under ZeRO-2.
+- **7B student (full FT)** — switch to a ZeRO-3 + CPU-offload accelerate config
+  (and note: under ZeRO-3 the frozen teacher must be loaded *unpartitioned*,
+  which is not yet wired up — validate before relying on it).
+- **≥32B teacher** — does not fit per-GPU; needs teacher tensor-parallel or a
+  switch to top-k KL. Out of scope for the default script.
 
 vLLM's logprob API returns only top-k, so the teacher must run a **local HF
 forward pass** for full-vocabulary KL.
 
 ## Merge + evaluate
 
-Training writes a LoRA adapter under `runs/`. Reuse the ViGOS merge + eval tools:
+**Full FT (default):** `save_model` writes a full checkpoint under `runs/` — no
+merge step. Evaluate it directly:
+
+```bash
+MODEL_PATH=runs/opd_qwen25_3b_<RUN> SKIP_JUDGE=true bash scripts/eval_vigos.sh
+```
+
+**LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then eval:
 
 ```bash
 uv run python scripts/merge_lora.py \
   --adapter runs/opd_qwen25_3b_<RUN>/checkpoint-XXX \
   --output runs/opd_qwen25_3b_merged --overwrite
-
 MODEL_PATH=runs/opd_qwen25_3b_merged SKIP_JUDGE=true bash scripts/eval_vigos.sh
 ```
 

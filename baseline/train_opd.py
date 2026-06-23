@@ -68,6 +68,7 @@ class OPDScriptArguments:
     attn_implementation: str = "flash_attention_2"
     torch_dtype: str = "bfloat16"
     trust_remote_code: bool = True
+    finetuning_mode: str = "full"  # "full" (default, like Vision-OPD) | "lora"
     lora_r: int = 64
     lora_alpha: int = 128
     lora_dropout: float = 0.05
@@ -172,6 +173,7 @@ def main() -> None:
         print("=" * 80)
         print(f"Student model: {script_args.model_name_or_path}")
         print(f"Teacher model: {script_args.teacher_model_name_or_path}")
+        print(f"Finetuning mode: {script_args.finetuning_mode}")
         print(f"WandB/Trainer run name: {training_args.run_name}")
         print(f"Output directory: {training_args.output_dir}")
         print(f"Dataset name: {script_args.dataset_name}")
@@ -227,21 +229,33 @@ def main() -> None:
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    target_modules = [
-        module.strip()
-        for module in script_args.lora_target_modules.split(",")
-        if module.strip()
-    ]
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=script_args.lora_r,
-        lora_alpha=script_args.lora_alpha,
-        lora_dropout=script_args.lora_dropout,
-        target_modules=target_modules,
-        bias="none",
-    )
-    model = get_peft_model(model, lora_config)
-    model.print_trainable_parameters()
+    if script_args.finetuning_mode == "full":
+        # Full-parameter training (default; matches Vision-OPD). save_model writes
+        # the full checkpoint, so no LoRA merge step is needed before eval.
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            total = sum(p.numel() for p in model.parameters())
+            print(f"Full fine-tuning: training all {total / 1e9:.2f}B parameters.")
+    elif script_args.finetuning_mode == "lora":
+        target_modules = [
+            module.strip()
+            for module in script_args.lora_target_modules.split(",")
+            if module.strip()
+        ]
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=script_args.lora_r,
+            lora_alpha=script_args.lora_alpha,
+            lora_dropout=script_args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+        )
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
+    else:
+        raise ValueError(
+            f"Unknown finetuning_mode {script_args.finetuning_mode!r}; "
+            "expected 'full' or 'lora'."
+        )
 
     # --- Teacher (frozen, separate checkpoint) -----------------------------------
     teacher_class, teacher_type = _model_class_for_checkpoint(
@@ -329,6 +343,7 @@ def main() -> None:
             _OPDWandBConfigCallback(
                 {
                     "opd_method": "opd",
+                    "opd_finetuning_mode": script_args.finetuning_mode,
                     "opd_student_model": script_args.model_name_or_path,
                     "opd_teacher_model": script_args.teacher_model_name_or_path,
                     "opd_dataset_name": script_args.dataset_name,

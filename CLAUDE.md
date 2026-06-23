@@ -111,9 +111,17 @@ Key reuse trick: `_batched_teacher_completion_logits(model, jobs)` already runs
 under `no_grad()/eval` and its adapter-disable context degrades to a no-op for a
 non-PEFT module — so `OPDTrainer` passes `self.teacher_model` to it directly.
 
+The student uses **full fine-tuning by default** (`--finetuning_mode full`, like
+Vision-OPD; `lora` still available). Full-FT runs on DeepSpeed ZeRO-2
+(`configs/accelerate_zero2_gpu_8.yaml`) and `save_model` writes a full checkpoint
+(no LoRA merge before eval). Default script uses LR `2e-6`, micro-batch 1, grad
+accum 4.
+
 Constraints: teacher must share the student's tokenizer/vocab (same family); the
 teacher must run a **local HF forward** (vLLM logprob is top-k only); the frozen
-teacher is replicated per GPU, so budget memory (7B ok, ≥32B needs TP/top-k KL).
+teacher is replicated per GPU, so budget memory (3B/4B student + 7B teacher fits
+on 8×A100-80G under ZeRO-2; 7B full-FT student needs ZeRO-3 offload + an
+unpartitioned-teacher fix; ≥32B teacher needs TP/top-k KL).
 Run: `DATASET_NAME=... TEACHER_MODEL=... bash scripts/train_opd_qwen25_3b.sh`.
 
 Roadmap (per user): general multi-benchmark eval framework, and model/attention

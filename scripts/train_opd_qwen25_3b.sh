@@ -24,20 +24,25 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost,0.0.0.0"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
-ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_lora_gpu_8.yaml}"
+ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_gpu_8.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/opd_qwen25_3b_${RUN_ID}}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
 TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-flash_attention_2}"
+# Full-parameter training by default (like Vision-OPD); set to "lora" for a
+# cheap memory-constrained run.
+FINETUNING_MODE="${FINETUNING_MODE:-full}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-}"
 FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-3}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-2}"
-LEARNING_RATE="${LEARNING_RATE:-5e-6}"
+# Full FT needs more memory than LoRA: smaller micro-batch, more accumulation.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
+# Vision-OPD uses 2e-6 for full-parameter OPD (vs 5e-6 for ViGOS LoRA).
+LEARNING_RATE="${LEARNING_RATE:-2e-6}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-32768}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-4096}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
@@ -112,6 +117,7 @@ uv run accelerate launch \
   --main_process_port "${MAIN_PROCESS_PORT:-13378}" \
   baseline/train_opd.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
+  --finetuning_mode "$FINETUNING_MODE" \
   --teacher_model_name_or_path "$TEACHER_MODEL" \
   --teacher_torch_dtype "$TEACHER_TORCH_DTYPE" \
   --teacher_attn_implementation "$TEACHER_ATTN_IMPLEMENTATION" \
