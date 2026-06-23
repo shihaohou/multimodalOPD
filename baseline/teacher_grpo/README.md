@@ -89,3 +89,8 @@ for transformers rollout (2 GPUs, LoRA).
   (math + short VQA + options); tune `_is_match` if accuracy looks off.
 - The GRPO `--system` prompt asks for `\boxed{}`; keep it consistent with how the
   teacher is later queried in OPD.
+- **Benign exit crash**: after `End time of running main` + the checkpoint is
+  saved, the process may abort with `Trying to free a pointer not allocated here`
+  / SIGABRT during Python finalization (vLLM CUDA allocator + process-group
+  teardown). The checkpoint is already written — this is cosmetic, but the exit
+  code is non-zero, so don't gate follow-up steps on it.
