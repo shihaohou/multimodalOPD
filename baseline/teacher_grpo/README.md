@@ -60,12 +60,32 @@ bash baseline/teacher_grpo/train_teacher_grpo.sh 2>&1 | tee grpo.log
 Then in OPD: `TEACHER_MODEL=<merged-or-full-ckpt> bash scripts/train_opd_qwen25_3b.sh`
 (student = Qwen3-VL-2B; both qwen3_vl, same vocab).
 
-## Notes / to verify on GPU
-- ms-swift must recognize the **Qwen3-VL** local path; if auto-detect fails add
-  `--model_type` (check `swift rlhf --help` / ms-swift model registry for the name).
+## Verified working setup (8×H800, driver 560.35.03 / CUDA 12.9, 2026-06-23)
+
+swift env (separate from OPD), pinned versions that work together:
+- **`transformers==4.57.1`** — NOT the 5.12.1 that ms-swift pulls by default.
+  vLLM 0.11.0 crashes loading Qwen3-VL on transformers 5
+  (`'Qwen3VLTextConfig' object has no attribute 'tie_word_embeddings'`). Downgrade:
+  `uv pip install transformers==4.57.1` (ms-swift 4.4 still runs; Qwen3-VL still supported).
+- `vllm==0.11.0`, `torch==2.8.0+cu128` (CUDA 13 / newer vLLM need driver ≥580 — we
+  only have 560).
+- `deepspeed==0.18.2`, `qwen_vl_utils==0.0.14`, `decord` (av).
+- **Q5 triton patch** (HPC-X box) — vLLM JIT crashes with `ldconfig`
+  `UnicodeDecodeError`; patch once (re-apply if triton is reinstalled):
+  ```bash
+  sed -i 's/decode()/decode("utf-8", errors="ignore")/' \
+    /root/shihao_project/swift-env/.venv/lib/python3.11/site-packages/triton/backends/nvidia/driver.py
+  ```
+
+Confirmed: ms-swift auto-recognized the Qwen3-VL local path (no `--model_type`);
+`vqa_accuracy`/`vqa_format` rewards fire; `USE_VLLM=true` step_time ≈16s vs ≈49s
+for transformers rollout (2 GPUs, LoRA).
+
+## Gotchas
+- **`NPROC_PER_NODE` must equal the number of visible GPUs**, else ms-swift errors
+  `DeepSpeed is not compatible with device_map`. Set `CUDA_VISIBLE_DEVICES`
+  accordingly (e.g. `0,1` with `NPROC_PER_NODE=2`; all 8 with `NPROC_PER_NODE=8`).
 - `reward_accuracy.py` is self-contained (no math_verify). Vision-SR1 is mixed
   (math + short VQA + options); tune `_is_match` if accuracy looks off.
-- vLLM rollout (`USE_VLLM=true`) needs vLLM with Qwen3-VL support; otherwise keep
-  transformers rollout.
 - The GRPO `--system` prompt asks for `\boxed{}`; keep it consistent with how the
   teacher is later queried in OPD.
