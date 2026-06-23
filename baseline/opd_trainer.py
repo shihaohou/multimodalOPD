@@ -156,6 +156,7 @@ class OPDTrainer(ViGOSTrainer):
 
     def _report_opd_nan(
         self,
+        model: nn.Module,
         student_logits: torch.Tensor,
         student_kl_logits: torch.Tensor,
         teacher_kl_logits: torch.Tensor,
@@ -165,7 +166,9 @@ class OPDTrainer(ViGOSTrainer):
         """Localize a non-finite OPD loss: is the source the student forward, the
         teacher forward, or the KL math, and at which completion token? The ±20
         diff clamp bounds the KL math, so a NaN here almost always means a forward
-        produced inf/NaN logits. Runs only on a NaN step (caller-guarded)."""
+        produced inf/NaN logits. Also scans the student parameters to tell a
+        corrupted optimizer update (weights already NaN) apart from a forward-only
+        overflow on this rollout. Runs only on a NaN step (caller-guarded)."""
         rank = getattr(self.accelerator, "process_index", 0)
         with torch.no_grad():
             s_fwd = bool(torch.isfinite(student_logits).all())
@@ -177,6 +180,19 @@ class OPDTrainer(ViGOSTrainer):
                 f"|teacher_logit|max={teacher_kl_logits.abs().amax().item():.4g} "
                 f"active_tokens={int(completion_attention.sum())}",
             ]
+            # Are the student's own parameters still finite? ZeRO-2 replicates
+            # params, so this sees the whole model. n_bad>0 => a prior optimizer
+            # update corrupted the weights; n_bad==0 => forward-only overflow.
+            n_bad_params = 0
+            first_bad: list[str] = []
+            for name, param in model.named_parameters():
+                if not bool(torch.isfinite(param).all()):
+                    n_bad_params += 1
+                    if len(first_bad) < 6:
+                        first_bad.append(name)
+            lines.append(
+                f"  nonfinite_param_tensors={n_bad_params} first={first_bad}"
+            )
             temp = max(self.distill_temperature, 1e-6)
             s_lp = torch.log_softmax(student_kl_logits.float() / temp, dim=-1)
             t_lp = torch.log_softmax(teacher_kl_logits.float() / temp, dim=-1)
@@ -302,6 +318,7 @@ class OPDTrainer(ViGOSTrainer):
             )
             if not bool(torch.isfinite(opd_loss.detach())):
                 self._report_opd_nan(
+                    model,
                     student_logits,
                     student_kl_logits,
                     teacher_kl_logits,
