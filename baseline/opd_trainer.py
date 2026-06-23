@@ -42,6 +42,7 @@ class OPDTrainer(ViGOSTrainer):
         opd_loss_mode: str = "full_kl",
         opd_kl_direction: str = "reverse",
         opd_top_k: int = 32,
+        opd_mask_invalid_vocab: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -63,9 +64,16 @@ class OPDTrainer(ViGOSTrainer):
         self.opd_loss_mode = opd_loss_mode
         self.opd_kl_direction = opd_kl_direction
         self.opd_top_k = int(opd_top_k)
+        self.opd_mask_invalid_vocab = bool(opd_mask_invalid_vocab)
         self.teacher_source = teacher_source
         self.teacher_client = teacher_client
         self.teacher_model = None
+        # IDs never valid as assistant text + real tokenizer length, used to drop
+        # padded/control columns from the completion-KL support (see compute_loss).
+        self._invalid_vocab_ids, self._tokenizer_vocab_len = (
+            self._collect_invalid_vocab_ids()
+        )
+        self._valid_vocab_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
 
         if teacher_source == "local_hf":
             if teacher_model is None:
@@ -85,6 +93,66 @@ class OPDTrainer(ViGOSTrainer):
                     "vllm_server teacher only supports opd_loss_mode='topk_kl' with "
                     "opd_kl_direction='forward' (the server returns top-k logprobs)."
                 )
+
+    def _collect_invalid_vocab_ids(self) -> tuple[set[int], int | None]:
+        """Vocab columns that are never valid assistant-text outputs.
+
+        Returns ``(ids, tokenizer_len)``: ``ids`` are the non-text multimodal
+        control tokens (vision/image/video placeholders) plus pad (unless it
+        doubles as EOS); ``tokenizer_len`` is the real tokenizer length so the
+        padded lm_head rows above it can be dropped too. The teacher assigns all
+        of these ~0 probability, so any student mass there is a sharp, exploding
+        reverse-KL tail term — they must leave the KL *support*, not just the
+        supervised positions.
+        """
+        ids: set[int] = set()
+        config = getattr(self.model, "config", None)
+        for name in (
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "vision_end_token_id",
+            "image_pad_token_id",
+            "video_pad_token_id",
+            "vision_token_id",
+        ):
+            tok_id = getattr(config, name, None)
+            if isinstance(tok_id, int) and tok_id >= 0:
+                ids.add(tok_id)
+        pad_id = self._pad_token_id()
+        eos_ids = set(self._normalize_eos_token_ids(self._eos_token_id()))
+        if isinstance(pad_id, int) and pad_id not in eos_ids:
+            ids.add(pad_id)
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        try:
+            tok_len: int | None = int(len(tokenizer))
+        except TypeError:
+            tok_len = None
+        return ids, tok_len
+
+    def _valid_vocab_mask(
+        self, vocab: int, device: torch.device
+    ) -> torch.Tensor | None:
+        """Bool ``[vocab]`` mask (True = keep in the KL), cached per (vocab, device).
+
+        Returns ``None`` when ``opd_mask_invalid_vocab`` is off.
+        """
+        if not self.opd_mask_invalid_vocab:
+            return None
+        key = (int(vocab), torch.device(device))
+        cached = self._valid_vocab_cache.get(key)
+        if cached is not None:
+            return cached
+        valid = torch.ones(int(vocab), dtype=torch.bool, device=device)
+        if self._tokenizer_vocab_len is not None and self._tokenizer_vocab_len < vocab:
+            valid[self._tokenizer_vocab_len :] = False
+        for tok_id in self._invalid_vocab_ids:
+            if 0 <= tok_id < vocab:
+                valid[tok_id] = False
+        if not bool(valid.any()):
+            raise ValueError("valid_vocab_mask excluded every column.")
+        self._valid_vocab_cache[key] = valid
+        return valid
 
     def compute_loss(
         self,
@@ -154,20 +222,29 @@ class OPDTrainer(ViGOSTrainer):
             )["opd"]
             # Same-family checkpoints can have different padded vocab sizes (e.g.
             # Qwen2.5-VL 3B=151936 vs 7B=152064). Truncate both to the shared (min)
-            # vocab — the extra columns are padding beyond the real tokenizer vocab,
-            # and log_softmax then renormalizes over the shared support.
+            # vocab; fp32 for KL numerical safety (the bf16 p·log p entropy term
+            # explodes when a student prob underflows to exactly 0).
             vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
-            # Reverse KL in bf16 can produce NaN gradients: the p·log p entropy term
-            # explodes when a student prob underflows to exactly 0. Compute the KL in
-            # fp32 (logits are tiny vs the model, so the cost is negligible).
             student_kl_logits = student_logits[..., :vocab].float()
-            teacher_logits = teacher_logits[..., :vocab].float()
-            # Route everything through masked_topk_kl_loss so the verl-style log-prob
-            # diff clamp (gradient bound) also covers full_kl + reverse; top_k=None
-            # recovers exact full-vocab KL.
+            teacher_kl_logits = teacher_logits[..., :vocab].float()
+            del teacher_logits
+            # Drop vocab columns that are never valid assistant-text outputs (padded
+            # lm_head rows, pad, vision/image/video control tokens) from the KL
+            # *support* before log_softmax. Full-vocab reverse KL otherwise spends a
+            # sharp, exploding tail term on those columns (teacher ~0 prob, small
+            # student mass) -> grad blow-up / NaN. This is distinct from the position
+            # mask (completion_attention), which says which positions are supervised.
+            valid = self._valid_vocab_mask(vocab, student_kl_logits.device)
+            if valid is not None:
+                fill = ~valid.view(1, 1, -1)
+                student_kl_logits = student_kl_logits.masked_fill(fill, -1e9)
+                teacher_kl_logits = teacher_kl_logits.masked_fill(fill, -1e9)
+            # Route through masked_topk_kl_loss so the verl-style log-prob diff clamp
+            # (gradient bound) also covers full_kl + reverse; top_k=None = exact
+            # full-vocab KL over the surviving support.
             opd_loss = masked_topk_kl_loss(
                 student_kl_logits,
-                teacher_logits,
+                teacher_kl_logits,
                 completion_attention,
                 top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
                 direction=self.opd_kl_direction,
@@ -177,7 +254,6 @@ class OPDTrainer(ViGOSTrainer):
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
-        del teacher_logits
         loss = self.lambda_opd * opd_loss
 
         rollout_answer_correct = self._rollout_answer_correctness(inputs, rollout)

@@ -71,6 +71,10 @@ LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
 OPD_LOSS_MODE="${OPD_LOSS_MODE:-full_kl}"          # full_kl | topk_kl
 OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-reverse}"    # reverse | forward | jsd
 OPD_TOP_K="${OPD_TOP_K:-32}"
+# Drop padded/control vocab columns (pad, vision/image/video tokens, padded
+# lm_head rows) from the completion-KL support; stops full-vocab reverse KL from
+# exploding on them. Set false only for ablation.
+OPD_MASK_INVALID_VOCAB="${OPD_MASK_INVALID_VOCAB:-true}"
 TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
@@ -170,6 +174,7 @@ uv run accelerate launch \
   --opd_loss_mode "$OPD_LOSS_MODE" \
   --opd_kl_direction "$OPD_KL_DIRECTION" \
   --opd_top_k "$OPD_TOP_K" \
+  --opd_mask_invalid_vocab "$OPD_MASK_INVALID_VOCAB" \
   --token_loss_clip "$TOKEN_LOSS_CLIP" \
   --presence_penalty "$PRESENCE_PENALTY" \
   --repetition_penalty "$REPETITION_PENALTY" \
