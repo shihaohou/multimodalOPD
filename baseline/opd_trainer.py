@@ -154,6 +154,55 @@ class OPDTrainer(ViGOSTrainer):
         self._valid_vocab_cache[key] = valid
         return valid
 
+    def _report_opd_nan(
+        self,
+        student_logits: torch.Tensor,
+        student_kl_logits: torch.Tensor,
+        teacher_kl_logits: torch.Tensor,
+        completion_attention: torch.Tensor,
+        completion_ids: torch.Tensor,
+    ) -> None:
+        """Localize a non-finite OPD loss: is the source the student forward, the
+        teacher forward, or the KL math, and at which completion token? The ±20
+        diff clamp bounds the KL math, so a NaN here almost always means a forward
+        produced inf/NaN logits. Runs only on a NaN step (caller-guarded)."""
+        rank = getattr(self.accelerator, "process_index", 0)
+        with torch.no_grad():
+            s_fwd = bool(torch.isfinite(student_logits).all())
+            t_fwd = bool(torch.isfinite(teacher_kl_logits).all())
+            lines = [
+                f"[OPD-NaN][rank{rank}] student_forward_finite={s_fwd} "
+                f"teacher_forward_finite={t_fwd}",
+                f"  |student_logit|max={student_logits.abs().amax().item():.4g} "
+                f"|teacher_logit|max={teacher_kl_logits.abs().amax().item():.4g} "
+                f"active_tokens={int(completion_attention.sum())}",
+            ]
+            temp = max(self.distill_temperature, 1e-6)
+            s_lp = torch.log_softmax(student_kl_logits.float() / temp, dim=-1)
+            t_lp = torch.log_softmax(teacher_kl_logits.float() / temp, dim=-1)
+            diff = (s_lp - t_lp).clamp(-20.0, 20.0)
+            per_tok = (s_lp.exp() * diff).sum(dim=-1)  # [B, C]
+            active = completion_attention.to(torch.bool)
+            bad = ~torch.isfinite(per_tok) & active
+            ok = torch.isfinite(per_tok) & active
+            kl_max = per_tok[ok].max().item() if bool(ok.any()) else float("nan")
+            lines.append(
+                f"  per_token_KL: nonfinite={int(bad.sum())} "
+                f"active_max_finite={kl_max:.4g}"
+            )
+            if bool(bad.any()):
+                bi, ci = bad.nonzero(as_tuple=True)
+                b0, c0 = int(bi[0]), int(ci[0])
+                lines.append(
+                    f"  first nonfinite KL at b={b0} c={c0} "
+                    f"token_id={int(completion_ids[b0, c0])} "
+                    f"student_pos_finite="
+                    f"{bool(torch.isfinite(student_kl_logits[b0, c0]).all())} "
+                    f"teacher_pos_finite="
+                    f"{bool(torch.isfinite(teacher_kl_logits[b0, c0]).all())}"
+                )
+        print("\n".join(lines), flush=True)
+
     def compute_loss(
         self,
         model: nn.Module,
