@@ -442,6 +442,23 @@ def main() -> None:
             )
         )
 
+    # Authoritative GPU/world-size report (from the live accelerator, not the env
+    # var) so every run self-documents whether it is actually multi-GPU.
+    if trainer.accelerator.is_main_process:
+        num_proc = trainer.accelerator.num_processes
+        eff_batch = (
+            training_args.per_device_train_batch_size
+            * training_args.gradient_accumulation_steps
+            * num_proc
+        )
+        print(
+            f"[OPD] num_processes(world_size)={num_proc}  "
+            f"per_device_bs={training_args.per_device_train_batch_size}  "
+            f"grad_accum={training_args.gradient_accumulation_steps}  "
+            f"-> effective_batch={eff_batch}",
+            flush=True,
+        )
+
     trainer.train()
     trainer.save_model(training_args.output_dir)
     processor.save_pretrained(training_args.output_dir)
