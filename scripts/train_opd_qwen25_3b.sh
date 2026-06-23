@@ -52,6 +52,10 @@ GENERATION_TOP_P="${GENERATION_TOP_P:-0.95}"
 GENERATION_TOP_K="${GENERATION_TOP_K:-20}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
+# Distillation loss (defaults follow verl forward_kl_topk, k=32).
+OPD_LOSS_MODE="${OPD_LOSS_MODE:-topk_kl}"          # topk_kl | full_kl
+OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-forward}"    # forward | reverse | jsd
+OPD_TOP_K="${OPD_TOP_K:-32}"
 TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
@@ -145,6 +149,9 @@ uv run accelerate launch \
   --generation_top_k "$GENERATION_TOP_K" \
   --distill_temperature "$DISTILL_TEMPERATURE" \
   --lambda_opd "$LAMBDA_OPD" \
+  --opd_loss_mode "$OPD_LOSS_MODE" \
+  --opd_kl_direction "$OPD_KL_DIRECTION" \
+  --opd_top_k "$OPD_TOP_K" \
   --token_loss_clip "$TOKEN_LOSS_CLIP" \
   --presence_penalty "$PRESENCE_PENALTY" \
   --repetition_penalty "$REPETITION_PENALTY" \

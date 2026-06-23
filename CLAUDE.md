@@ -101,6 +101,13 @@ Difference from what this repo does today:
   / `masked_kl_loss` / `_distributed_masked_loss_with_stats` / answer-accuracy
   helpers. Teacher is a separate frozen module (`requires_grad_(False)`, `eval()`,
   moved to `accelerator.device`, never synced into vLLM).
+- `baseline/opd_losses.py` — `masked_topk_kl_loss`: top-k (or full-vocab) KL,
+  `direction` ∈ forward/reverse/jsd. Loss is configurable via
+  `--opd_loss_mode {topk_kl,full_kl}` / `--opd_kl_direction` / `--opd_top_k`.
+  **Default = `topk_kl` forward k=32 (verl `forward_kl_topk`)**; `full_kl`+reverse
+  routes back to vigos `masked_kl_loss`. All OPD repos in this space (verl,
+  thunlp/OPD, Uni-OPD) use top-k, not full-vocab. A vLLM-server teacher (top-k
+  logprobs only) is the planned next step and will reuse this loss.
 - `baseline/train_opd.py` — standalone entry point (`OPDScriptArguments`,
   `--teacher_model_name_or_path` required). Imports `vigos.*` as a library.
 - `scripts/train_opd_qwen25_3b.sh` — launcher (runs `baseline/train_opd.py`;

@@ -17,7 +17,7 @@ code paths stay untouched.
 | Teacher | the **same** weights with the LoRA adapter disabled | a **separate, frozen, stronger** same-family VLM checkpoint |
 | Teacher prompt | **privileged** (contains the reference answer) | the **same non-privileged** prompt the student sees |
 | Supervised tokens | description / think / answer spans | the **full completion** |
-| Loss | `λ_perc·L_perc + λ_reas·L_reas + λ_ref·L_ref` | a single per-token **reverse KL** `KL(student‖teacher)` |
+| Loss | `λ_perc·L_perc + λ_reas·L_reas + λ_ref·L_ref` | a single per-token KL (default **top-k forward KL**, k=32; configurable) |
 | Prompt | ViGOS `<description>…</description><think>…</think>\boxed{}` | the **dataset's own `problem`** + optional boxed-answer suffix |
 
 The **student is trained with full fine-tuning by default** (matching
@@ -30,8 +30,10 @@ OPD mechanism per step:
    (vLLM colocate by default).
 2. A **frozen teacher** (loaded from `TEACHER_MODEL`) runs a single forward pass
    over the *same* prompt + the sampled completion.
-3. Loss = per-token reverse KL `KL(student‖teacher)` over the full completion,
-   re-normalized across DDP ranks by the global active-token count.
+3. Loss = per-token KL between student and teacher over the completion —
+   by default a **top-k forward KL** (`forward_kl_topk`, k=32, matching verl),
+   configurable to reverse KL / JSD and to full-vocabulary — re-normalized across
+   DDP ranks by the global active-token count.
 
 The teacher is never updated and is never synced into vLLM; only the student is.
 
@@ -93,12 +95,33 @@ exact full-vocabulary KL).
 | `MODEL_NAME_OR_PATH` | `Qwen/Qwen2.5-VL-3B-Instruct` | Student base |
 | `FINETUNING_MODE` | `full` | `full` (all params) or `lora` |
 | `LEARNING_RATE` | `2e-6` | Full-FT LR (Vision-OPD uses 2e-6) |
-| `LAMBDA_OPD` | `1.0` | Reverse-KL loss weight |
+| `OPD_LOSS_MODE` | `topk_kl` | `topk_kl` or `full_kl` (full vocabulary) |
+| `OPD_KL_DIRECTION` | `forward` | `forward` / `reverse` / `jsd` |
+| `OPD_TOP_K` | `32` | Top-k tokens for `topk_kl` (verl=32, thunlp=16) |
+| `LAMBDA_OPD` | `1.0` | Distillation loss weight |
 | `DISTILL_TEMPERATURE` | `1.0` | KL softmax temperature |
 | `TOKEN_LOSS_CLIP` | `0.0` | Per-token KL clip (0 = off) |
 | `OPD_PROMPT_SUFFIX` | boxed-answer instruction | Appended to the raw dataset prompt |
 | `ACCELERATE_CONFIG` | `configs/accelerate_zero2_gpu_8.yaml` | DeepSpeed ZeRO-2 (full-FT friendly) |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.30` | Lowered to make room for the teacher replica |
+
+### Distillation loss
+
+The OPD divergence is configurable, matching the wider top-k OPD ecosystem
+([verl](https://verl.readthedocs.io/en/latest/algo/opd.html) `forward_kl_topk`,
+[thunlp/OPD](https://github.com/thunlp/OPD), [Uni-OPD](https://github.com/WenjinHou/Uni-OPD)):
+
+- `OPD_LOSS_MODE=topk_kl` (default): KL over the top-`OPD_TOP_K` token support
+  only. The top-k tokens carry ~97-99% of the mass, and a top-k objective is what
+  later lets the teacher be served remotely (top-k logprobs only — roadmap).
+- `OPD_LOSS_MODE=full_kl`: exact full-vocabulary KL.
+- `OPD_KL_DIRECTION`: `forward` = `KL(teacher‖student)` over the teacher's top-k
+  (verl default; mass-covering); `reverse` = `KL(student‖teacher)` over the
+  student's top-k (mode-seeking, à la Thinking Machines); `jsd` = Jensen-Shannon.
+
+Currently the teacher always runs a local HF forward (full logits available, so
+top-k is computed locally). A vLLM-server teacher that returns only top-k logprobs
+is on the roadmap and will reuse the same `topk_kl` loss.
 
 ### Memory / teacher scale
 
@@ -146,7 +169,10 @@ MODEL_PATH=runs/opd_qwen25_3b_merged SKIP_JUDGE=true bash scripts/eval_vigos.sh
 - [ ] General multi-benchmark evaluation framework (not tied to the ViGOS prompt).
 - [ ] Model/architecture experiments (e.g. attention modifications) on the student.
 - [ ] Optional completion-sample logging for OPD rollouts.
-- [ ] Top-k KL / teacher tensor-parallel path to support ≥32B teachers.
+- [x] Top-k KL loss (`topk_kl`, forward/reverse/jsd) — local HF teacher.
+- [ ] vLLM-server teacher returning only top-k logprobs (no per-GPU replica;
+      enables ≥32B teachers) — reuses the `topk_kl` loss.
+- [ ] PG/GRPO OPD variant (reverse-KL-as-reward), like verl PG OPD.
 
 ## Attribution & license
 

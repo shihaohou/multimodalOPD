@@ -80,6 +80,10 @@ class OPDScriptArguments:
     generation_top_k: int = 20
     distill_temperature: float = 1.0
     lambda_opd: float = 1.0
+    # Distillation divergence. Defaults follow verl's forward_kl_topk (k=32).
+    opd_loss_mode: str = "topk_kl"  # "topk_kl" | "full_kl"
+    opd_kl_direction: str = "forward"  # "forward" | "reverse" | "jsd"
+    opd_top_k: int = 32
     token_loss_clip: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -186,7 +190,10 @@ def main() -> None:
             f"top_k={script_args.generation_top_k}"
         )
         print(
-            "Distillation: reverse_kl(student||teacher) over full completion, "
+            "Distillation: "
+            f"loss_mode={script_args.opd_loss_mode}, "
+            f"kl_direction={script_args.opd_kl_direction}, "
+            f"top_k={script_args.opd_top_k}, "
             f"lambda_opd={script_args.lambda_opd}, "
             f"distill_temperature={script_args.distill_temperature}, "
             f"token_loss_clip={script_args.token_loss_clip}"
@@ -307,6 +314,9 @@ def main() -> None:
         processor=processor,
         teacher_model=teacher_model,
         lambda_opd=script_args.lambda_opd,
+        opd_loss_mode=script_args.opd_loss_mode,
+        opd_kl_direction=script_args.opd_kl_direction,
+        opd_top_k=script_args.opd_top_k,
         max_prompt_length=script_args.max_prompt_length,
         max_completion_length=script_args.max_completion_length,
         generation_temperature=script_args.generation_temperature,
@@ -355,7 +365,9 @@ def main() -> None:
                         if script_args.token_loss_clip > 0
                         else None
                     ),
-                    "opd_kl_direction": "reverse_kl_full_completion",
+                    "opd_loss_mode": script_args.opd_loss_mode,
+                    "opd_kl_direction": script_args.opd_kl_direction,
+                    "opd_top_k": script_args.opd_top_k,
                     "opd_prompt_suffix": script_args.opd_prompt_suffix,
                     "opd_max_prompt_length": script_args.max_prompt_length,
                     "opd_max_completion_length": script_args.max_completion_length,

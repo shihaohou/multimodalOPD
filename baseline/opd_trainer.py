@@ -23,6 +23,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
+from baseline.opd_losses import masked_topk_kl_loss
 from vigos.losses import masked_kl_loss
 from vigos.trainer import ViGOSTrainer
 
@@ -33,6 +34,9 @@ class OPDTrainer(ViGOSTrainer):
         *args: Any,
         teacher_model: nn.Module | None = None,
         lambda_opd: float = 1.0,
+        opd_loss_mode: str = "topk_kl",
+        opd_kl_direction: str = "forward",
+        opd_top_k: int = 32,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -40,7 +44,19 @@ class OPDTrainer(ViGOSTrainer):
             raise ValueError(
                 "OPDTrainer requires a teacher_model (a separate frozen VLM)."
             )
+        if opd_loss_mode not in {"full_kl", "topk_kl"}:
+            raise ValueError(
+                f"Unknown opd_loss_mode {opd_loss_mode!r}; use 'full_kl' or 'topk_kl'."
+            )
+        if opd_kl_direction not in {"reverse", "forward", "jsd"}:
+            raise ValueError(
+                f"Unknown opd_kl_direction {opd_kl_direction!r}; "
+                "use 'reverse', 'forward', or 'jsd'."
+            )
         self.lambda_opd = float(lambda_opd)
+        self.opd_loss_mode = opd_loss_mode
+        self.opd_kl_direction = opd_kl_direction
+        self.opd_top_k = int(opd_top_k)
         # The teacher is inference-only: no grad, eval mode, and it is NOT wrapped
         # by Accelerate/DeepSpeed and NOT synced into vLLM (only self.model is).
         teacher_model.requires_grad_(False)
@@ -93,15 +109,28 @@ class OPDTrainer(ViGOSTrainer):
             ],
         )["opd"]
 
-        # Reverse KL: source=student -> KL(student || teacher), masked to the
-        # completion tokens (full completion, mode-seeking).
-        opd_loss = masked_kl_loss(
-            student_logits,
-            teacher_logits,
-            completion_attention,
-            temperature=self.distill_temperature,
-            token_clip=self.token_loss_clip,
-        )
+        # Distillation divergence over the completion tokens. full_kl+reverse uses
+        # the exact full-vocab path (vigos.losses.masked_kl_loss); everything else
+        # (top-k, forward, jsd) goes through masked_topk_kl_loss. top_k=None there
+        # recovers exact full-vocab KL for the forward/jsd full_kl cases.
+        if self.opd_loss_mode == "full_kl" and self.opd_kl_direction == "reverse":
+            opd_loss = masked_kl_loss(
+                student_logits,
+                teacher_logits,
+                completion_attention,
+                temperature=self.distill_temperature,
+                token_clip=self.token_loss_clip,
+            )
+        else:
+            opd_loss = masked_topk_kl_loss(
+                student_logits,
+                teacher_logits,
+                completion_attention,
+                top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
+                direction=self.opd_kl_direction,
+                temperature=self.distill_temperature,
+                token_clip=self.token_loss_clip,
+            )
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
