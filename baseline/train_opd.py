@@ -94,14 +94,12 @@ class OPDScriptArguments:
     opd_loss_mode: str = "full_kl"  # "full_kl" | "topk_kl"
     opd_kl_direction: str = "reverse"  # "reverse" | "forward" | "jsd"
     opd_top_k: int = 32
-    # Drop vocab columns that are never valid assistant-text outputs (padded
-    # lm_head rows, pad, vision/image/video control tokens) from the completion-KL
-    # support. Stops full-vocab reverse KL from exploding on those columns.
-    opd_mask_invalid_vocab: bool = True
-    # Freeze the Qwen-VL vision tower under full FT. Its ViT conv patch_embed is
-    # numerically unstable in bf16 full FT (gradient overflow -> NaN weights);
-    # distillation doesn't need to retrain it. Only applies to finetuning_mode=full.
-    freeze_vision_tower: bool = True
+    # Freeze the Qwen-VL vision tower under full FT. Off by default: at a real
+    # multi-GPU effective batch (e.g. 32) the ViT gradient spikes average out and
+    # full FT incl. ViT is stable (matches Vision-OPD). Turn on only as a fallback
+    # for small-batch / single-GPU runs where the ViT bf16 grad can overflow.
+    # Only applies to finetuning_mode=full.
+    freeze_vision_tower: bool = False
     token_loss_clip: float = 0.0
     presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
@@ -220,8 +218,7 @@ def main() -> None:
             f"top_k={script_args.opd_top_k}, "
             f"lambda_opd={script_args.lambda_opd}, "
             f"distill_temperature={script_args.distill_temperature}, "
-            f"token_loss_clip={script_args.token_loss_clip}, "
-            f"mask_invalid_vocab={script_args.opd_mask_invalid_vocab}"
+            f"token_loss_clip={script_args.token_loss_clip}"
         )
         print(
             "vLLM: "
@@ -376,7 +373,6 @@ def main() -> None:
         opd_loss_mode=script_args.opd_loss_mode,
         opd_kl_direction=script_args.opd_kl_direction,
         opd_top_k=script_args.opd_top_k,
-        opd_mask_invalid_vocab=script_args.opd_mask_invalid_vocab,
         max_prompt_length=script_args.max_prompt_length,
         max_completion_length=script_args.max_completion_length,
         generation_temperature=script_args.generation_temperature,
@@ -434,7 +430,6 @@ def main() -> None:
                     "opd_loss_mode": script_args.opd_loss_mode,
                     "opd_kl_direction": script_args.opd_kl_direction,
                     "opd_top_k": script_args.opd_top_k,
-                    "opd_mask_invalid_vocab": script_args.opd_mask_invalid_vocab,
                     "opd_prompt_suffix": script_args.opd_prompt_suffix,
                     "opd_max_prompt_length": script_args.max_prompt_length,
                     "opd_max_completion_length": script_args.max_completion_length,

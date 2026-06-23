@@ -26,6 +26,8 @@ export TRANSFORMERS_NO_TF=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_PROJECT="${WANDB_PROJECT:-MultimodalOPD}"
+# WandB online by default (needs network + WANDB_API_KEY); set offline to disable.
+export WANDB_MODE="${WANDB_MODE:-online}"
 export NO_PROXY="${NO_PROXY:+${NO_PROXY},}127.0.0.1,localhost,0.0.0.0"
 export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost,0.0.0.0"
 
@@ -57,10 +59,11 @@ LEARNING_RATE="${LEARNING_RATE:-2e-6}"
 # LR warmup: ramps the early steps so the first reverse-KL gradients don't shock
 # the model. 0 = off (HF default).
 WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
-# Freeze the vision tower under full FT (default). The Qwen-VL ViT conv
-# patch_embed overflows in bf16 full FT and NaNs the weights; distillation
-# doesn't need to retrain it. Set false only for ablation.
-FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-true}"
+# Freeze the vision tower under full FT. Off by default: at a real multi-GPU
+# effective batch (e.g. 8 GPU x grad_accum 4 = 32) the ViT grad spikes average
+# out and full FT incl. ViT is stable (matches Vision-OPD). Turn on as a fallback
+# for small-batch / single-GPU runs where the ViT bf16 grad can overflow -> NaN.
+FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-32768}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-4096}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
@@ -78,10 +81,6 @@ LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
 OPD_LOSS_MODE="${OPD_LOSS_MODE:-full_kl}"          # full_kl | topk_kl
 OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-reverse}"    # reverse | forward | jsd
 OPD_TOP_K="${OPD_TOP_K:-32}"
-# Drop padded/control vocab columns (pad, vision/image/video tokens, padded
-# lm_head rows) from the completion-KL support; stops full-vocab reverse KL from
-# exploding on them. Set false only for ablation.
-OPD_MASK_INVALID_VOCAB="${OPD_MASK_INVALID_VOCAB:-true}"
 TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
@@ -183,7 +182,6 @@ uv run accelerate launch \
   --opd_loss_mode "$OPD_LOSS_MODE" \
   --opd_kl_direction "$OPD_KL_DIRECTION" \
   --opd_top_k "$OPD_TOP_K" \
-  --opd_mask_invalid_vocab "$OPD_MASK_INVALID_VOCAB" \
   --token_loss_clip "$TOKEN_LOSS_CLIP" \
   --presence_penalty "$PRESENCE_PENALTY" \
   --repetition_penalty "$REPETITION_PENALTY" \
