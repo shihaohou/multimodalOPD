@@ -103,6 +103,39 @@ bash scripts/train_opd_qwen25_3b.sh
 **same model family** as the student (shared tokenizer/vocab is required for
 exact full-vocabulary KL).
 
+### Verified multi-GPU launch — read this first
+
+The form above is minimal. For a real run, **pin the GPUs and clear stale
+smoke-test env vars explicitly** — on a shared box a fresh shell can default to a
+single visible GPU, which silently drops the effective batch to ~1:
+
+```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 NUM_PROCESSES=8   # pin all 8 GPUs
+unset  MAX_STEPS MAX_TRAIN_SAMPLES                            # clear smoke-test limits
+export WANDB_MODE=online                                      # or offline + `wandb sync` later
+M=/path/to/models
+MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct TEACHER_MODEL=$M/Qwen3-VL-8B-Instruct \
+DATASET_NAME=.../Vision-SR1-47K \
+RUN_CONFIG=opd_qwen3_8b_to_2b OUTPUT_DIR=runs/opd_qwen3_8b_to_2b \
+bash scripts/train_opd_qwen25_3b.sh
+```
+
+At startup the run prints its real world size — **confirm it before trusting a run**:
+
+```
+[OPD] num_processes(world_size)=8  per_device_bs=1  grad_accum=4  -> effective_batch=32
+```
+
+**Why this matters (NaN root cause).** Reverse-KL full-FT NaN'd within 3 steps when
+the effective batch was ~1 (single GPU). At batch 1, one image's Qwen2.5-VL ViT
+(`visual.patch_embed`) gradient spike (grad_norm ~448) overflows in bf16 and poisons
+the optimizer → NaN weights. At a real 8-GPU batch of 32 the spikes average out
+(grad_norm ~3–20) and full FT **including the ViT** is stable for both Qwen2.5-VL-3B
+and Qwen3-VL-2B. If a run NaNs, **check the effective batch / GPU count first**; the
+`[OPD-NaN]` probe in `opd_trainer.py` (fires only on a non-finite step) localizes
+forward-vs-weight NaNs. As a small-batch / single-GPU fallback,
+`FREEZE_VISION_TOWER=true` freezes the ViT.
+
 ### Key knobs (env vars)
 
 | Var | Default | Meaning |
@@ -110,7 +143,11 @@ exact full-vocabulary KL).
 | `TEACHER_MODEL` | *(required)* | Frozen teacher checkpoint path/id |
 | `MODEL_NAME_OR_PATH` | `Qwen/Qwen2.5-VL-3B-Instruct` | Student base |
 | `FINETUNING_MODE` | `full` | `full` (all params) or `lora` |
+| `FREEZE_VISION_TOWER` | `false` | Freeze the ViT under full-FT — small-batch / single-GPU NaN fallback (see above) |
 | `LEARNING_RATE` | `2e-6` | Full-FT LR (Vision-OPD uses 2e-6) |
+| `WARMUP_RATIO` | `0.03` | LR warmup fraction |
+| `CUDA_VISIBLE_DEVICES` / `NUM_PROCESSES` | `0..7` / `8` | **Pin explicitly** — a fresh shell may default to 1 GPU |
+| `WANDB_MODE` | `online` | `offline` on no-network boxes, then `wandb sync` later |
 | `OPD_LOSS_MODE` | `full_kl` | `full_kl` (full vocab) or `topk_kl` |
 | `OPD_KL_DIRECTION` | `reverse` | `reverse` / `forward` / `jsd` |
 | `OPD_TOP_K` | `32` | Top-k tokens when `topk_kl` (verl=32, thunlp=16) |
@@ -265,6 +302,9 @@ MODEL_PATH=runs/opd_qwen25_3b_merged bash scripts/eval_opd.sh
 
 ## Roadmap
 
+- [x] **GPU-validated full-FT training** on 8×H800 — Qwen2.5-VL-3B (←7B teacher)
+      and Qwen3-VL-2B (←8B teacher) train stably (reverse-KL, full vocab, unfrozen
+      ViT at effective batch 32). See `PROGRESS_OPD.md` for status & learnings.
 - [x] General multi-benchmark evaluation harness (`baseline/eval/`, dataset prompt,
       pass@k/avg@k, LLM judge) — generic-dataset path; bespoke benchmarks reused
       from `vigos.eval_benchmarks`.
