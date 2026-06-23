@@ -54,8 +54,11 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/__init__.py` | Package marker for the `baseline` namespace. |
 | `baseline/eval/opd_eval_prompt.py` | General eval prompt (dataset problem + suffix, no prefill). |
 | `baseline/eval/run_opd_eval.py` | General multi-benchmark eval harness (vLLM gen + LLM judge + pass@k/avg@k). |
+| `baseline/serve_teacher.py` | vLLM teacher scoring server (`/score_topk`, top-k `prompt_logprobs`). |
+| `baseline/teacher_client.py` | HTTP client the trainer uses for the `vllm_server` teacher. |
 | `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
 | `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
+| `scripts/serve_teacher_vllm.sh` | Launch the teacher scoring server. |
 
 ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
 
@@ -122,9 +125,34 @@ The OPD divergence is configurable, matching the wider top-k OPD ecosystem
   (verl default; mass-covering); `reverse` = `KL(student‖teacher)` over the
   student's top-k (mode-seeking, à la Thinking Machines); `jsd` = Jensen-Shannon.
 
-Currently the teacher always runs a local HF forward (full logits available, so
-top-k is computed locally). A vLLM-server teacher that returns only top-k logprobs
-is on the roadmap and will reuse the same `topk_kl` loss.
+### Teacher source
+
+`TEACHER_SOURCE` selects how teacher signals are obtained:
+
+- `local_hf` (default): a frozen teacher replica per GPU runs a full-logit HF
+  forward; supports all loss modes/directions. Memory cost = a teacher copy on
+  every training GPU (so ≤14B).
+- `vllm_server` (experimental): a **separate** vLLM server scores
+  `prompt_token_ids + completion_ids` (+image) with `prompt_logprobs=top_k` and
+  returns the teacher's top-k logprobs. No per-GPU replica, so the teacher can be
+  far larger than the student (32B/72B). Only `topk_kl` + `forward` is supported
+  (a server returns the teacher's top-k, i.e. forward KL).
+
+```bash
+# 1) Start the teacher server on its own GPU(s):
+CUDA_VISIBLE_DEVICES=0,1 TEACHER_MODEL=Qwen/Qwen2.5-VL-72B-Instruct \
+TENSOR_PARALLEL_SIZE=2 PORT=8200 bash scripts/serve_teacher_vllm.sh
+
+# 2) Train, pointing at the server (no local teacher replica):
+CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 \
+DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \
+TEACHER_SOURCE=vllm_server TEACHER_SERVER_URL=http://127.0.0.1:8200 \
+bash scripts/train_opd_qwen25_3b.sh
+```
+
+> Query the teacher at temperature 1.0 (the server does); `DISTILL_TEMPERATURE`
+> then scales only the student. The multimodal `prompt_token_ids` +
+> `prompt_logprobs` path is experimental and needs GPU validation.
 
 ### Memory / teacher scale
 
@@ -194,8 +222,9 @@ MODEL_PATH=runs/opd_qwen25_3b_merged bash scripts/eval_opd.sh
 - [ ] Model/architecture experiments (e.g. attention modifications) on the student.
 - [ ] Optional completion-sample logging for OPD rollouts.
 - [x] Top-k KL loss (`topk_kl`, forward/reverse/jsd) — local HF teacher.
-- [ ] vLLM-server teacher returning only top-k logprobs (no per-GPU replica;
-      enables ≥32B teachers) — reuses the `topk_kl` loss.
+- [x] vLLM-server teacher returning only top-k logprobs (no per-GPU replica;
+      enables ≥32B teachers) — reuses the `topk_kl` forward loss. *(experimental,
+      needs GPU validation.)*
 - [ ] PG/GRPO OPD variant (reverse-KL-as-reward), like verl PG OPD.
 
 ## Attribution & license

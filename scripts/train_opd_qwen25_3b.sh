@@ -12,7 +12,14 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
 
 : "${DATASET_NAME:?Set DATASET_NAME to the HuggingFace training dataset id.}"
-: "${TEACHER_MODEL:?Set TEACHER_MODEL to a stronger same-family VLM checkpoint.}"
+# Teacher source: local_hf (frozen replica per GPU) | vllm_server (separate
+# server returning top-k logprobs; start it with scripts/serve_teacher_vllm.sh).
+TEACHER_SOURCE="${TEACHER_SOURCE:-local_hf}"
+TEACHER_SERVER_URL="${TEACHER_SERVER_URL:-http://127.0.0.1:8200}"
+if [[ "$TEACHER_SOURCE" == "local_hf" ]]; then
+  : "${TEACHER_MODEL:?Set TEACHER_MODEL (local_hf), or use TEACHER_SOURCE=vllm_server.}"
+fi
+TEACHER_MODEL="${TEACHER_MODEL:-}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TRANSFORMERS_NO_TF=1
@@ -122,6 +129,8 @@ uv run accelerate launch \
   baseline/train_opd.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --finetuning_mode "$FINETUNING_MODE" \
+  --teacher_source "$TEACHER_SOURCE" \
+  --teacher_server_url "$TEACHER_SERVER_URL" \
   --teacher_model_name_or_path "$TEACHER_MODEL" \
   --teacher_torch_dtype "$TEACHER_TORCH_DTYPE" \
   --teacher_attn_implementation "$TEACHER_ATTN_IMPLEMENTATION" \

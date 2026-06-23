@@ -23,7 +23,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from baseline.opd_losses import masked_topk_kl_loss
+from baseline.opd_losses import (
+    masked_topk_kl_loss,
+    masked_topk_kl_loss_from_teacher_topk,
+)
 from vigos.losses import masked_kl_loss
 from vigos.trainer import ViGOSTrainer
 
@@ -33,6 +36,8 @@ class OPDTrainer(ViGOSTrainer):
         self,
         *args: Any,
         teacher_model: nn.Module | None = None,
+        teacher_source: str = "local_hf",
+        teacher_client: Any = None,
         lambda_opd: float = 1.0,
         opd_loss_mode: str = "topk_kl",
         opd_kl_direction: str = "forward",
@@ -40,9 +45,10 @@ class OPDTrainer(ViGOSTrainer):
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
-        if teacher_model is None:
+        if teacher_source not in {"local_hf", "vllm_server"}:
             raise ValueError(
-                "OPDTrainer requires a teacher_model (a separate frozen VLM)."
+                f"Unknown teacher_source {teacher_source!r}; "
+                "use 'local_hf' or 'vllm_server'."
             )
         if opd_loss_mode not in {"full_kl", "topk_kl"}:
             raise ValueError(
@@ -57,11 +63,28 @@ class OPDTrainer(ViGOSTrainer):
         self.opd_loss_mode = opd_loss_mode
         self.opd_kl_direction = opd_kl_direction
         self.opd_top_k = int(opd_top_k)
-        # The teacher is inference-only: no grad, eval mode, and it is NOT wrapped
-        # by Accelerate/DeepSpeed and NOT synced into vLLM (only self.model is).
-        teacher_model.requires_grad_(False)
-        teacher_model.eval()
-        self.teacher_model = teacher_model.to(self.accelerator.device)
+        self.teacher_source = teacher_source
+        self.teacher_client = teacher_client
+        self.teacher_model = None
+
+        if teacher_source == "local_hf":
+            if teacher_model is None:
+                raise ValueError("teacher_source='local_hf' requires a teacher_model.")
+            # Inference-only: no grad, eval, NOT wrapped by Accelerate/DeepSpeed and
+            # NOT synced into vLLM (only self.model is). Replicated per GPU.
+            teacher_model.requires_grad_(False)
+            teacher_model.eval()
+            self.teacher_model = teacher_model.to(self.accelerator.device)
+        else:  # vllm_server: no per-GPU replica; teacher returns top-k logprobs.
+            if teacher_client is None:
+                raise ValueError(
+                    "teacher_source='vllm_server' requires a teacher_client."
+                )
+            if not (self.opd_loss_mode == "topk_kl" and self.opd_kl_direction == "forward"):
+                raise ValueError(
+                    "vllm_server teacher only supports opd_loss_mode='topk_kl' with "
+                    "opd_kl_direction='forward' (the server returns top-k logprobs)."
+                )
 
     def compute_loss(
         self,
@@ -89,48 +112,64 @@ class OPDTrainer(ViGOSTrainer):
         )
         del student_outputs
 
-        # Teacher forward (frozen, no grad) on the SAME non-privileged prompt +
-        # completion. _batched_teacher_completion_logits already runs under
-        # torch.no_grad()/eval; for a non-PEFT teacher the adapter-disable context
-        # degrades to a no-op, so we can pass the separate teacher model directly.
-        teacher_inputs = self._append_completion(
-            student_prompt,
-            completion_ids,
-            rollout["completion_attention_mask"],
-        )
-        teacher_logits = self._batched_teacher_completion_logits(
-            self.teacher_model,
-            [
-                {
-                    "name": "opd",
-                    "inputs": teacher_inputs,
-                    "completion_length": completion_ids.shape[1],
-                }
-            ],
-        )["opd"]
-
-        # Distillation divergence over the completion tokens. full_kl+reverse uses
-        # the exact full-vocab path (vigos.losses.masked_kl_loss); everything else
-        # (top-k, forward, jsd) goes through masked_topk_kl_loss. top_k=None there
-        # recovers exact full-vocab KL for the forward/jsd full_kl cases.
-        if self.opd_loss_mode == "full_kl" and self.opd_kl_direction == "reverse":
-            opd_loss = masked_kl_loss(
+        if self.teacher_source == "vllm_server":
+            # Server returns the teacher's top-k token ids + logprobs at each
+            # completion position (vLLM prompt_logprobs); forward top-k KL only.
+            teacher_topk_ids, teacher_topk_logprobs = self.teacher_client.score_topk(
+                student_prompt["input_ids"],
+                student_prompt["attention_mask"],
+                completion_ids,
+                rollout["completion_attention_mask"],
+                inputs.get("student_images") or [],
+            )
+            opd_loss = masked_topk_kl_loss_from_teacher_topk(
                 student_logits,
-                teacher_logits,
+                teacher_topk_ids,
+                teacher_topk_logprobs,
                 completion_attention,
                 temperature=self.distill_temperature,
                 token_clip=self.token_loss_clip,
             )
         else:
-            opd_loss = masked_topk_kl_loss(
-                student_logits,
-                teacher_logits,
-                completion_attention,
-                top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
-                direction=self.opd_kl_direction,
-                temperature=self.distill_temperature,
-                token_clip=self.token_loss_clip,
+            # Local frozen teacher forward (full logits). full_kl+reverse uses the
+            # exact full-vocab path (vigos.losses.masked_kl_loss); everything else
+            # (top-k, forward, jsd) goes through masked_topk_kl_loss (top_k=None
+            # recovers exact full-vocab KL for the forward/jsd full_kl cases).
+            # _batched_teacher_completion_logits runs under no_grad/eval; for a
+            # non-PEFT teacher the adapter-disable context is a no-op.
+            teacher_inputs = self._append_completion(
+                student_prompt,
+                completion_ids,
+                rollout["completion_attention_mask"],
             )
+            teacher_logits = self._batched_teacher_completion_logits(
+                self.teacher_model,
+                [
+                    {
+                        "name": "opd",
+                        "inputs": teacher_inputs,
+                        "completion_length": completion_ids.shape[1],
+                    }
+                ],
+            )["opd"]
+            if self.opd_loss_mode == "full_kl" and self.opd_kl_direction == "reverse":
+                opd_loss = masked_kl_loss(
+                    student_logits,
+                    teacher_logits,
+                    completion_attention,
+                    temperature=self.distill_temperature,
+                    token_clip=self.token_loss_clip,
+                )
+            else:
+                opd_loss = masked_topk_kl_loss(
+                    student_logits,
+                    teacher_logits,
+                    completion_attention,
+                    top_k=self.opd_top_k if self.opd_loss_mode == "topk_kl" else None,
+                    direction=self.opd_kl_direction,
+                    temperature=self.distill_temperature,
+                    token_clip=self.token_loss_clip,
+                )
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )

@@ -58,6 +58,13 @@ class OPDScriptArguments:
     teacher_model_name_or_path: str | None = None
     teacher_torch_dtype: str = "bfloat16"
     teacher_attn_implementation: str = "flash_attention_2"
+    # Teacher source: "local_hf" = frozen replica per GPU (full-vocab KL options);
+    # "vllm_server" = separate vLLM server returning top-k logprobs (forward top-k
+    # KL only; no per-GPU replica, supports much larger teachers).
+    teacher_source: str = "local_hf"
+    teacher_server_url: str = "http://127.0.0.1:8200"
+    teacher_client_timeout: float = 120.0
+    teacher_client_retries: int = 2
     dataset_name: str | None = None
     dataset_split: str = "train"
     max_train_samples: Optional[int] = None
@@ -144,11 +151,13 @@ def main() -> None:
 
     if not script_args.dataset_name:
         raise ValueError("--dataset_name is required (a HuggingFace dataset id).")
-    if not script_args.teacher_model_name_or_path:
+    if script_args.teacher_source == "local_hf" and not script_args.teacher_model_name_or_path:
         raise ValueError(
-            "--teacher_model_name_or_path is required for OPD; point it at a "
-            "stronger same-family VLM checkpoint (base or RL-tuned)."
+            "teacher_source='local_hf' requires --teacher_model_name_or_path "
+            "(a stronger same-family VLM checkpoint; base or RL-tuned)."
         )
+    if script_args.teacher_source == "vllm_server" and not script_args.teacher_server_url:
+        raise ValueError("teacher_source='vllm_server' requires --teacher_server_url.")
 
     if script_args.run_config:
         lr_str = f"{training_args.learning_rate:.0e}".replace("e-0", "e-")
@@ -176,7 +185,11 @@ def main() -> None:
         print("OPD RUN CONFIGURATION")
         print("=" * 80)
         print(f"Student model: {script_args.model_name_or_path}")
-        print(f"Teacher model: {script_args.teacher_model_name_or_path}")
+        print(f"Teacher source: {script_args.teacher_source}")
+        if script_args.teacher_source == "vllm_server":
+            print(f"Teacher server: {script_args.teacher_server_url}")
+        else:
+            print(f"Teacher model: {script_args.teacher_model_name_or_path}")
         print(f"Finetuning mode: {script_args.finetuning_mode}")
         print(f"WandB/Trainer run name: {training_args.run_name}")
         print(f"Output directory: {training_args.output_dir}")
@@ -264,25 +277,39 @@ def main() -> None:
             "expected 'full' or 'lora'."
         )
 
-    # --- Teacher (frozen, separate checkpoint) -----------------------------------
-    teacher_class, teacher_type = _model_class_for_checkpoint(
-        script_args.teacher_model_name_or_path,
-        trust_remote_code=script_args.trust_remote_code,
-    )
-    if os.environ.get("LOCAL_RANK", "0") == "0":
-        print(
-            f"Loading OPD teacher {script_args.teacher_model_name_or_path} "
-            f"(model_type={teacher_type} -> {teacher_class.__name__})."
+    # --- Teacher -----------------------------------------------------------------
+    teacher_model = None
+    teacher_client = None
+    if script_args.teacher_source == "local_hf":
+        teacher_class, teacher_type = _model_class_for_checkpoint(
+            script_args.teacher_model_name_or_path,
+            trust_remote_code=script_args.trust_remote_code,
         )
-    teacher_model = teacher_class.from_pretrained(
-        script_args.teacher_model_name_or_path,
-        trust_remote_code=script_args.trust_remote_code,
-        attn_implementation=script_args.teacher_attn_implementation,
-        dtype=_dtype(script_args.teacher_torch_dtype),
-    )
-    teacher_model.config.use_cache = False
-    teacher_model.requires_grad_(False)
-    teacher_model.eval()
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(
+                f"Loading OPD teacher {script_args.teacher_model_name_or_path} "
+                f"(model_type={teacher_type} -> {teacher_class.__name__})."
+            )
+        teacher_model = teacher_class.from_pretrained(
+            script_args.teacher_model_name_or_path,
+            trust_remote_code=script_args.trust_remote_code,
+            attn_implementation=script_args.teacher_attn_implementation,
+            dtype=_dtype(script_args.teacher_torch_dtype),
+        )
+        teacher_model.config.use_cache = False
+        teacher_model.requires_grad_(False)
+        teacher_model.eval()
+    else:  # vllm_server: query a separate teacher server for top-k logprobs.
+        from baseline.teacher_client import VLLMServerTeacher
+
+        teacher_client = VLLMServerTeacher(
+            script_args.teacher_server_url,
+            top_k=script_args.opd_top_k,
+            timeout=script_args.teacher_client_timeout,
+            retries=script_args.teacher_client_retries,
+        )
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(f"Using vLLM teacher server at {script_args.teacher_server_url}.")
 
     # --- Data ---------------------------------------------------------------------
     dataset = _load_dataset(script_args.dataset_name, script_args.dataset_split)
@@ -313,6 +340,8 @@ def main() -> None:
         processing_class=processor,
         processor=processor,
         teacher_model=teacher_model,
+        teacher_source=script_args.teacher_source,
+        teacher_client=teacher_client,
         lambda_opd=script_args.lambda_opd,
         opd_loss_mode=script_args.opd_loss_mode,
         opd_kl_direction=script_args.opd_kl_direction,
@@ -355,7 +384,13 @@ def main() -> None:
                     "opd_method": "opd",
                     "opd_finetuning_mode": script_args.finetuning_mode,
                     "opd_student_model": script_args.model_name_or_path,
+                    "opd_teacher_source": script_args.teacher_source,
                     "opd_teacher_model": script_args.teacher_model_name_or_path,
+                    "opd_teacher_server_url": (
+                        script_args.teacher_server_url
+                        if script_args.teacher_source == "vllm_server"
+                        else None
+                    ),
                     "opd_dataset_name": script_args.dataset_name,
                     "opd_train_dataset_size": len(dataset),
                     "opd_lambda_opd": script_args.lambda_opd,

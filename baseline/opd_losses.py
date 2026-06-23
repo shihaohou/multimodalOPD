@@ -66,6 +66,60 @@ def masked_topk_kl_loss(
     return per_token.sum() / mask.sum().to(dtype=per_token.dtype).clamp_min(1.0)
 
 
+def masked_topk_kl_loss_from_teacher_topk(
+    student_logits: torch.Tensor,
+    teacher_topk_ids: torch.Tensor,
+    teacher_topk_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    token_clip: float | None = None,
+) -> torch.Tensor:
+    """Forward top-k KL ``KL(teacher||student)`` from a server teacher's top-k.
+
+    Used by the vLLM-server teacher path, where only the teacher's top-k token ids
+    and (full-vocab-normalized) log-probs are available per completion position —
+    not the full teacher logits. The student still has full logits locally, so its
+    log-probs are gathered at the teacher's top-k ids.
+
+    Shapes: ``student_logits`` [B, C, V]; ``teacher_topk_ids`` /
+    ``teacher_topk_logprobs`` [B, C, k] (pad unused slots with id ``-1``);
+    ``token_mask`` [B, C]. ``temperature`` scales the **student** only — query the
+    teacher server at temperature 1.0 so the provided log-probs match.
+    """
+    if teacher_topk_ids.shape != teacher_topk_logprobs.shape:
+        raise ValueError(
+            "teacher_topk_ids and teacher_topk_logprobs must share shape, got "
+            f"{tuple(teacher_topk_ids.shape)} and {tuple(teacher_topk_logprobs.shape)}."
+        )
+    if token_mask.shape != student_logits.shape[:-1]:
+        raise ValueError(
+            "token_mask must match student_logits without the vocab dim, got "
+            f"{tuple(token_mask.shape)} for logits {tuple(student_logits.shape)}."
+        )
+
+    mask = token_mask.to(device=student_logits.device, dtype=torch.bool)
+    if not bool(mask.any()):
+        return student_logits.sum() * 0.0
+
+    student_log_probs = F.log_softmax(student_logits[mask] / temperature, dim=-1)
+    ids = teacher_topk_ids[mask].to(device=student_logits.device, dtype=torch.long)
+    teacher_lp = teacher_topk_logprobs[mask].to(
+        device=student_logits.device, dtype=student_log_probs.dtype
+    )
+    valid = ids >= 0
+    student_lp = torch.gather(student_log_probs, dim=-1, index=ids.clamp_min(0))
+    summand = torch.where(
+        valid,
+        teacher_lp.exp() * (teacher_lp - student_lp),
+        torch.zeros_like(student_lp),
+    )
+    per_token = summand.sum(dim=-1)
+    if token_clip is not None and token_clip > 0:
+        per_token = per_token.clamp(max=token_clip)
+    return per_token.sum() / mask.sum().to(dtype=per_token.dtype).clamp_min(1.0)
+
+
 def _topk_divergence(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,

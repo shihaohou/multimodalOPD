@@ -120,6 +120,13 @@ Difference from what this repo does today:
   Pipeline: vLLM gen pass@k → `\boxed` extract → OpenAI-compatible judge →
   pass@k/avg@k → `responses/`,`judgments/`,`summary.json`. Full-FT writes a full
   checkpoint, so eval points straight at the run dir (no merge).
+- `baseline/serve_teacher.py` + `baseline/teacher_client.py` +
+  `scripts/serve_teacher_vllm.sh` — **`teacher_source=vllm_server`** (experimental):
+  a separate vLLM server scores `prompt_token_ids+completion` with
+  `prompt_logprobs=top_k` and returns top-k logprobs; the trainer computes forward
+  top-k KL via `masked_topk_kl_loss_from_teacher_topk`. No per-GPU teacher replica
+  → enables 32B/72B teachers. Only `topk_kl`+`forward`. `teacher_source=local_hf`
+  stays the default. Needs GPU validation (multimodal `prompt_token_ids` path).
 
 Key reuse trick: `_batched_teacher_completion_logits(model, jobs)` already runs
 under `no_grad()/eval` and its adapter-disable context degrades to a no-op for a
