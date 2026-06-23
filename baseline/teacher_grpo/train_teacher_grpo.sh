@@ -35,7 +35,10 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 SAVE_STEPS="${SAVE_STEPS:-200}"
 DEEPSPEED="${DEEPSPEED:-zero2}"         # use zero3 for TUNER_TYPE=full on 8B
 MAX_STEPS="${MAX_STEPS:-}"              # set small (e.g. 4) for a smoke
-SYSTEM_PROMPT="${SYSTEM_PROMPT:-Solve the problem step by step and put your final answer within \\boxed{}.}"
+# Default defined separately: `{}` inside a ${VAR:-default} default confuses bash
+# brace matching (mangles \boxed{}. -> \boxed{.}).
+_DEFAULT_SYSTEM_PROMPT='Solve the problem step by step and put your final answer within \boxed{}.'
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-$_DEFAULT_SYSTEM_PROMPT}"
 
 EXTRA_ARGS=()
 if [[ "$USE_VLLM" == "true" ]]; then

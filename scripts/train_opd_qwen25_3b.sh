@@ -57,7 +57,10 @@ LEARNING_RATE="${LEARNING_RATE:-2e-6}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-32768}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-4096}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
-OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-$'\nPlease reason step by step, and put your final answer within \\boxed{}.'}"
+# Define the default separately: `{}` inside a ${VAR:-default} default confuses
+# bash brace matching (mangles \boxed{}. -> \boxed{.}).
+_DEFAULT_OPD_SUFFIX=$'\nPlease reason step by step, and put your final answer within \\boxed{}.'
+OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-$_DEFAULT_OPD_SUFFIX}"
 GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.1}"
 GENERATION_TOP_P="${GENERATION_TOP_P:-0.95}"
 GENERATION_TOP_K="${GENERATION_TOP_K:-20}"
