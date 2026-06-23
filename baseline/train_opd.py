@@ -87,9 +87,11 @@ class OPDScriptArguments:
     generation_top_k: int = 20
     distill_temperature: float = 1.0
     lambda_opd: float = 1.0
-    # Distillation divergence. Defaults follow verl's forward_kl_topk (k=32).
-    opd_loss_mode: str = "topk_kl"  # "topk_kl" | "full_kl"
-    opd_kl_direction: str = "forward"  # "forward" | "reverse" | "jsd"
+    # Distillation divergence. Default = exact reverse KL (canonical OPD); the
+    # local teacher has full logits so full-vocab costs nothing. Use topk_kl +
+    # forward for the vllm_server teacher (it returns only the teacher's top-k).
+    opd_loss_mode: str = "full_kl"  # "full_kl" | "topk_kl"
+    opd_kl_direction: str = "reverse"  # "reverse" | "forward" | "jsd"
     opd_top_k: int = 32
     token_loss_clip: float = 0.0
     presence_penalty: float = 0.0

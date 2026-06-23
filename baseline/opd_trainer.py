@@ -39,8 +39,8 @@ class OPDTrainer(ViGOSTrainer):
         teacher_source: str = "local_hf",
         teacher_client: Any = None,
         lambda_opd: float = 1.0,
-        opd_loss_mode: str = "topk_kl",
-        opd_kl_direction: str = "forward",
+        opd_loss_mode: str = "full_kl",
+        opd_kl_direction: str = "reverse",
         opd_top_k: int = 32,
         **kwargs: Any,
     ) -> None:

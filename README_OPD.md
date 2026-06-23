@@ -17,7 +17,7 @@ code paths stay untouched.
 | Teacher | the **same** weights with the LoRA adapter disabled | a **separate, frozen, stronger** same-family VLM checkpoint |
 | Teacher prompt | **privileged** (contains the reference answer) | the **same non-privileged** prompt the student sees |
 | Supervised tokens | description / think / answer spans | the **full completion** |
-| Loss | `λ_perc·L_perc + λ_reas·L_reas + λ_ref·L_ref` | a single per-token KL (default **top-k forward KL**, k=32; configurable) |
+| Loss | `λ_perc·L_perc + λ_reas·L_reas + λ_ref·L_ref` | a single per-token KL (default **exact reverse KL** `KL(student‖teacher)`; top-k/forward/jsd configurable) |
 | Prompt | ViGOS `<description>…</description><think>…</think>\boxed{}` | the **dataset's own `problem`** + optional boxed-answer suffix |
 
 The **student is trained with full fine-tuning by default** (matching
@@ -30,10 +30,11 @@ OPD mechanism per step:
    (vLLM colocate by default).
 2. A **frozen teacher** (loaded from `TEACHER_MODEL`) runs a single forward pass
    over the *same* prompt + the sampled completion.
-3. Loss = per-token KL between student and teacher over the completion —
-   by default a **top-k forward KL** (`forward_kl_topk`, k=32, matching verl),
-   configurable to reverse KL / JSD and to full-vocabulary — re-normalized across
-   DDP ranks by the global active-token count.
+3. Loss = per-token KL between student and teacher over the completion — by
+   default **exact reverse KL** `KL(student‖teacher)` (canonical OPD,
+   mode-seeking); configurable to top-k / forward / JSD (top-k forward is what the
+   vllm_server teacher uses) — re-normalized across DDP ranks by the global
+   active-token count.
 
 The teacher is never updated and is never synced into vLLM; only the student is.
 
@@ -107,9 +108,9 @@ exact full-vocabulary KL).
 | `MODEL_NAME_OR_PATH` | `Qwen/Qwen2.5-VL-3B-Instruct` | Student base |
 | `FINETUNING_MODE` | `full` | `full` (all params) or `lora` |
 | `LEARNING_RATE` | `2e-6` | Full-FT LR (Vision-OPD uses 2e-6) |
-| `OPD_LOSS_MODE` | `topk_kl` | `topk_kl` or `full_kl` (full vocabulary) |
-| `OPD_KL_DIRECTION` | `forward` | `forward` / `reverse` / `jsd` |
-| `OPD_TOP_K` | `32` | Top-k tokens for `topk_kl` (verl=32, thunlp=16) |
+| `OPD_LOSS_MODE` | `full_kl` | `full_kl` (full vocab) or `topk_kl` |
+| `OPD_KL_DIRECTION` | `reverse` | `reverse` / `forward` / `jsd` |
+| `OPD_TOP_K` | `32` | Top-k tokens when `topk_kl` (verl=32, thunlp=16) |
 | `LAMBDA_OPD` | `1.0` | Distillation loss weight |
 | `DISTILL_TEMPERATURE` | `1.0` | KL softmax temperature |
 | `TOKEN_LOSS_CLIP` | `0.0` | Per-token KL clip (0 = off) |
@@ -123,13 +124,15 @@ The OPD divergence is configurable, matching the wider top-k OPD ecosystem
 ([verl](https://verl.readthedocs.io/en/latest/algo/opd.html) `forward_kl_topk`,
 [thunlp/OPD](https://github.com/thunlp/OPD), [Uni-OPD](https://github.com/WenjinHou/Uni-OPD)):
 
-- `OPD_LOSS_MODE=topk_kl` (default): KL over the top-`OPD_TOP_K` token support
-  only. The top-k tokens carry ~97-99% of the mass, and a top-k objective is what
-  later lets the teacher be served remotely (top-k logprobs only — roadmap).
-- `OPD_LOSS_MODE=full_kl`: exact full-vocabulary KL.
-- `OPD_KL_DIRECTION`: `forward` = `KL(teacher‖student)` over the teacher's top-k
-  (verl default; mass-covering); `reverse` = `KL(student‖teacher)` over the
-  student's top-k (mode-seeking, à la Thinking Machines); `jsd` = Jensen-Shannon.
+- `OPD_LOSS_MODE=full_kl` (default): exact full-vocabulary KL. With the local
+  teacher (full logits) it costs nothing, so it's the default.
+- `OPD_LOSS_MODE=topk_kl`: KL over the top-`OPD_TOP_K` tokens only — the point of
+  top-k is a remote teacher that returns just top-k logprobs (the vllm_server path);
+  for a local teacher it's only an approximation with no speedup.
+- `OPD_KL_DIRECTION`: `reverse` (default) = `KL(student‖teacher)`, mode-seeking —
+  the canonical OPD objective (Thinking Machines / GKD β=1); `forward` =
+  `KL(teacher‖student)`, mass-covering (verl's forward_kl_topk; **required by the
+  vllm_server teacher**); `jsd` = Jensen-Shannon.
 
 ### Teacher source
 

@@ -104,10 +104,11 @@ Difference from what this repo does today:
 - `baseline/opd_losses.py` — `masked_topk_kl_loss`: top-k (or full-vocab) KL,
   `direction` ∈ forward/reverse/jsd. Loss is configurable via
   `--opd_loss_mode {topk_kl,full_kl}` / `--opd_kl_direction` / `--opd_top_k`.
-  **Default = `topk_kl` forward k=32 (verl `forward_kl_topk`)**; `full_kl`+reverse
-  routes back to vigos `masked_kl_loss`. All OPD repos in this space (verl,
-  thunlp/OPD, Uni-OPD) use top-k, not full-vocab. A vLLM-server teacher (top-k
-  logprobs only) is the planned next step and will reuse this loss.
+  **Default = `full_kl` + `reverse`** (exact reverse KL `KL(student‖teacher)`,
+  the canonical OPD objective; the local teacher has full logits so full-vocab is
+  free). That path uses vigos `masked_kl_loss`. top-k matters only for a remote
+  teacher (the `vllm_server` path uses `topk_kl`+`forward`, since the server
+  returns only the teacher's top-k logprobs).
 - `baseline/train_opd.py` — standalone entry point (`OPDScriptArguments`,
   `--teacher_model_name_or_path` required). Imports `vigos.*` as a library.
 - `scripts/train_opd_qwen25_3b.sh` — launcher (runs `baseline/train_opd.py`;

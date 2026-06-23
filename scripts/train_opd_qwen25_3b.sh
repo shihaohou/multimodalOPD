@@ -66,9 +66,11 @@ GENERATION_TOP_P="${GENERATION_TOP_P:-0.95}"
 GENERATION_TOP_K="${GENERATION_TOP_K:-20}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
-# Distillation loss (defaults follow verl forward_kl_topk, k=32).
-OPD_LOSS_MODE="${OPD_LOSS_MODE:-topk_kl}"          # topk_kl | full_kl
-OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-forward}"    # forward | reverse | jsd
+# Distillation loss. Default = exact reverse KL (canonical OPD); the local teacher
+# has full logits so full-vocab is free. Use topk_kl + forward for the vllm_server
+# teacher (it returns only the teacher's top-k logprobs).
+OPD_LOSS_MODE="${OPD_LOSS_MODE:-full_kl}"          # full_kl | topk_kl
+OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-reverse}"    # reverse | forward | jsd
 OPD_TOP_K="${OPD_TOP_K:-32}"
 TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
