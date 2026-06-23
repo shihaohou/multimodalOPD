@@ -93,9 +93,10 @@ Difference from what this repo does today:
 **Implemented in a separate top-level `baseline/` package (ViGOS code untouched;
 `vigos/` is imported as a library):**
 
-- `baseline/opd_data_collator.py` — `OPDDataCollator`: builds only the
-  non-privileged student prompt from the dataset's `problem` (vanilla,
-  dataset-agnostic; optional `\boxed{}` suffix for eval).
+- `baseline/opd_data_collator.py` — `OPDDataCollator` + `OPD_SYSTEM_PROMPT`: the
+  **unified system prompt** (paper appendix B.4: `<reason></reason>` CoT + `\boxed{}`)
+  used across teacher GRPO / student OPD / eval for structural alignment. Student
+  prompt = system + user(image + raw question), no privileged answer.
 - `baseline/opd_trainer.py` — `OPDTrainer(ViGOSTrainer)`: overrides only
   `compute_loss`. Reuses inherited rollout / `_batched_teacher_completion_logits`
   / `masked_kl_loss` / `_distributed_masked_loss_with_stats` / answer-accuracy

@@ -50,7 +50,7 @@ from baseline.eval.opd_eval_prompt import (
     GENERAL_PROMPT_DESCRIPTION,
     build_general_eval_prompt,
 )
-from baseline.opd_data_collator import OPD_DEFAULT_PROMPT_SUFFIX
+# (system prompt is baked into baseline.eval.opd_eval_prompt; suffix defaults empty)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--benchmarks", default="", help="e.g. vilp-f,vilp-p,cv-bench (optional).")
     p.add_argument("--default-split", default="test")
     p.add_argument("--limit", type=int, default=None, help="Max samples per source.")
-    p.add_argument("--prompt-suffix", default=OPD_DEFAULT_PROMPT_SUFFIX)
+    p.add_argument("--prompt-suffix", default="")
     # generation
     p.add_argument("--pass-k", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=8, help="Questions per vLLM call.")

@@ -23,10 +23,9 @@ EVAL_DATASETS="${EVAL_DATASETS:-zli12321/mm-vet,zli12321/mmmu_pro_10options,zli1
 EVAL_BENCHMARKS="${EVAL_BENCHMARKS:-}"
 DEFAULT_SPLIT="${DEFAULT_SPLIT:-test}"
 LIMIT="${LIMIT:-}"
-# Default defined separately: `{}` inside a ${VAR:-default} default confuses bash
-# brace matching (mangles \boxed{}. -> \boxed{.}).
-_DEFAULT_PROMPT_SUFFIX=$'\nPlease reason step by step, and put your final answer within \\boxed{}.'
-PROMPT_SUFFIX="${PROMPT_SUFFIX:-$_DEFAULT_PROMPT_SUFFIX}"
+# Format instruction lives in the unified system prompt (baseline/eval/opd_eval_prompt
+# OPD_SYSTEM_PROMPT); the user turn is just the question, so no suffix by default.
+PROMPT_SUFFIX="${PROMPT_SUFFIX:-}"
 PASS_K="${PASS_K:-5}"
 BATCH_SIZE="${BATCH_SIZE:-8}"
 MAX_TOKENS="${MAX_TOKENS:-4096}"

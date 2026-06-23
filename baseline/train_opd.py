@@ -38,7 +38,7 @@ from transformers import (
 )
 
 import vigos.dataset_utils as dataset_utils
-from baseline.opd_data_collator import OPD_DEFAULT_PROMPT_SUFFIX, OPDDataCollator
+from baseline.opd_data_collator import OPDDataCollator
 from baseline.opd_trainer import OPDTrainer
 from vigos.train_vigos import (
     DEFAULT_LEARNING_RATE,
@@ -81,7 +81,8 @@ class OPDScriptArguments:
     lora_dropout: float = 0.05
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
     answer_field: str = "answer"
-    opd_prompt_suffix: str = OPD_DEFAULT_PROMPT_SUFFIX
+    # Format instruction now lives in the unified system prompt; user = raw question.
+    opd_prompt_suffix: str = ""
     generation_temperature: float = 1.1
     generation_top_p: float = 0.95
     generation_top_k: int = 20

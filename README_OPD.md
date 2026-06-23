@@ -84,9 +84,12 @@ Default reference dataset:
 export DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K
 ```
 
-Because OPD uses the dataset's own prompt, switching datasets needs no prompt
-changes. A small dataset-agnostic suffix (asking for a `\boxed{}` final answer)
-is appended for eval compatibility; disable it with `OPD_PROMPT_SUFFIX=""`.
+All stages (teacher GRPO, student OPD, eval) share **one unified system prompt**
+(paper appendix B.4) — enforcing `<reason></reason>` CoT + a `\boxed{}` final
+answer — with the user turn = image + the dataset's raw question. This structural
+alignment between teacher and student is what OPD needs. The system prompt lives in
+`baseline/opd_data_collator.py::OPD_SYSTEM_PROMPT` (and is mirrored in the GRPO
+launcher's `--system`); switching datasets needs no prompt changes.
 
 ## Training
 

@@ -14,12 +14,12 @@ from typing import Any
 from PIL import Image
 
 from baseline.opd_data_collator import (
-    OPD_DEFAULT_PROMPT_SUFFIX,
+    OPD_SYSTEM_PROMPT,
     format_opd_student_prompt,
 )
 
 GENERAL_PROMPT_DESCRIPTION = (
-    "Dataset problem prompt (+ optional boxed-answer suffix), no assistant prefill"
+    "Paper unified prompt: system (CoT + \\boxed{}) + user(image + question)"
 )
 
 
@@ -27,13 +27,18 @@ def build_general_eval_messages(
     problem: str,
     images: list[Image.Image],
     *,
-    suffix: str = OPD_DEFAULT_PROMPT_SUFFIX,
+    system_prompt: str = OPD_SYSTEM_PROMPT,
+    suffix: str = "",
 ) -> list[dict[str, Any]]:
     content: list[dict[str, Any]] = []
     for image in images:
         content.append({"type": "image", "image": image})
     content.append({"type": "text", "text": format_opd_student_prompt(problem, suffix)})
-    return [{"role": "user", "content": content}]
+    messages: list[dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+    return messages
 
 
 def build_general_eval_prompt(
@@ -41,7 +46,7 @@ def build_general_eval_prompt(
     problem: str,
     images: list[Image.Image],
     *,
-    suffix: str = OPD_DEFAULT_PROMPT_SUFFIX,
+    suffix: str = "",
 ) -> str:
     messages = build_general_eval_messages(problem, images, suffix=suffix)
     # No assistant prefill: the model generates freely (matches OPD training).

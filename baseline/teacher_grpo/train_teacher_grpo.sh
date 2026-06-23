@@ -35,9 +35,10 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 SAVE_STEPS="${SAVE_STEPS:-200}"
 DEEPSPEED="${DEEPSPEED:-zero2}"         # use zero3 for TUNER_TYPE=full on 8B
 MAX_STEPS="${MAX_STEPS:-}"              # set small (e.g. 4) for a smoke
-# Default defined separately: `{}` inside a ${VAR:-default} default confuses bash
-# brace matching (mangles \boxed{}. -> \boxed{.}).
-_DEFAULT_SYSTEM_PROMPT='Solve the problem step by step and put your final answer within \boxed{}.'
+# Unified system prompt (paper appendix B.4) — MUST match baseline/opd_data_collator
+# OPD_SYSTEM_PROMPT so the GRPO teacher and the OPD student/eval are structurally
+# aligned. Single-quoted so \boxed{} stays literal.
+_DEFAULT_SYSTEM_PROMPT='A conversation between user and assistant. The user asks a question, and the assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning process should be enclosed within <reason></reason> tags. The final answer MUST BE put in \boxed{}.'
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-$_DEFAULT_SYSTEM_PROMPT}"
 
 EXTRA_ARGS=()

@@ -41,11 +41,43 @@ def format_opd_student_prompt(
     return problem_text
 
 
+# Unified system prompt for ALL stages (teacher GRPO, student OPD, eval), from the
+# paper appendix. Keeps teacher and student structurally aligned, which is what OPD
+# needs (the teacher scores the student's tokens under the same prompt).
+OPD_SYSTEM_PROMPT = (
+    "A conversation between user and assistant. The user asks a question, and the "
+    "assistant solves it. The assistant first thinks about the reasoning process in "
+    "the mind and then provides the user with the answer. The reasoning process "
+    "should be enclosed within <reason></reason> tags. The final answer MUST BE put "
+    "in \\boxed{}."
+)
+
+
+def build_opd_messages(
+    problem: Any,
+    image: Any,
+    *,
+    system_prompt: str = OPD_SYSTEM_PROMPT,
+    suffix: str = "",
+) -> list[dict[str, Any]]:
+    """[system, user(image + question)] — the paper's unified template."""
+    content: list[dict[str, Any]] = []
+    if image is not None:
+        content.append({"type": "image", "image": image})
+    content.append({"type": "text", "text": format_opd_student_prompt(problem, suffix)})
+    messages: list[dict[str, Any]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+    return messages
+
+
 @dataclass
 class OPDDataCollator(ViGOSDataCollator):
     """Builds only the (non-privileged) student prompt for OPD training."""
 
-    opd_prompt_suffix: str = OPD_DEFAULT_PROMPT_SUFFIX
+    system_prompt: str = OPD_SYSTEM_PROMPT
+    opd_prompt_suffix: str = ""
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         student_messages: list[list[dict[str, Any]]] = []
@@ -63,9 +95,11 @@ class OPDDataCollator(ViGOSDataCollator):
             answer = normalize_reference_answer(feature.get(self.answer_field))
             sample_id = int(feature.get("problem_id", local_idx))
 
-            student_message = _message_with_optional_image(
-                format_opd_student_prompt(problem, self.opd_prompt_suffix),
+            student_message = build_opd_messages(
+                problem,
                 image,
+                system_prompt=self.system_prompt,
+                suffix=self.opd_prompt_suffix,
             )
             student_messages.append(student_message)
             # No assistant prefill: the model freely generates its own response.

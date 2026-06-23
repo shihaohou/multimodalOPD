@@ -76,11 +76,16 @@ class VQAAccuracy(ORM):
 
 
 class VQAFormat(ORM):
+    """Paper format: reasoning in <reason></reason> + final answer in \\boxed{}."""
+
     def __call__(self, completions, **kwargs) -> List[float]:
-        return [
-            1.0 if re.search(r"\\boxed\{.+?\}", str(completion or ""), flags=re.S) else 0.0
-            for completion in completions
-        ]
+        rewards = []
+        for completion in completions:
+            text = str(completion or "")
+            has_reason = bool(re.search(r"<reason>.*?</reason>", text, flags=re.S))
+            has_boxed = bool(re.search(r"\\boxed\{.+?\}", text, flags=re.S))
+            rewards.append(1.0 if (has_reason and has_boxed) else 0.0)
+        return rewards
 
 
 orms["vqa_accuracy"] = VQAAccuracy
