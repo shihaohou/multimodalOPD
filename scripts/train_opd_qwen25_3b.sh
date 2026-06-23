@@ -35,7 +35,11 @@ ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_gpu_8.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/opd_qwen25_3b_${RUN_ID}}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
-TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-flash_attention_2}"
+# Attention impl for the HF training forward (student + local_hf teacher). Default
+# sdpa so training runs without flash-attn installed; set flash_attention_2 once
+# it is built. (eval + vllm_server teacher use vLLM and never need flash-attn.)
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
+TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-sdpa}"
 # Full-parameter training by default (like Vision-OPD); set to "lora" for a
 # cheap memory-constrained run.
 FINETUNING_MODE="${FINETUNING_MODE:-full}"
@@ -129,6 +133,7 @@ uv run accelerate launch \
   baseline/train_opd.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
   --finetuning_mode "$FINETUNING_MODE" \
+  --attn_implementation "$ATTN_IMPLEMENTATION" \
   --teacher_source "$TEACHER_SOURCE" \
   --teacher_server_url "$TEACHER_SERVER_URL" \
   --teacher_model_name_or_path "$TEACHER_MODEL" \

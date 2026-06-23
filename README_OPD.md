@@ -68,6 +68,12 @@ ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, 
 uv sync --python 3.11   # PyTorch 2.8, Transformers 4.57.1, TRL 0.26, vLLM 0.11
 ```
 
+`flash-attn` is **not** a dependency. The training script defaults to
+`ATTN_IMPLEMENTATION=sdpa` for the HF forward, so it runs without flash-attn;
+eval and the `vllm_server` teacher use vLLM and never need it. Set
+`ATTN_IMPLEMENTATION=flash_attention_2` (and `TEACHER_ATTN_IMPLEMENTATION=...`)
+once flash-attn is installed.
+
 ## Data
 
 Any HuggingFace dataset exposing `problem` (text), `images` (PIL), and `answer`.
