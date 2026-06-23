@@ -20,7 +20,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+# Local dataset path: don't let `datasets` stall on a Hub metadata check (slow
+# behind a corporate proxy).
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
 
 
 def main() -> None:
@@ -38,8 +44,10 @@ def main() -> None:
 
     from datasets import load_dataset
 
+    print(f"Loading dataset from {args.dataset_path} (split={args.split}) ...", flush=True)
     dataset = load_dataset(args.dataset_path, split=args.split)
     total = len(dataset) if args.limit is None else min(args.limit, len(dataset))
+    print(f"Loaded {len(dataset)} rows; dumping {total} samples ...", flush=True)
 
     image_dir = Path(args.image_dir)
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -75,6 +83,8 @@ def main() -> None:
             }
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             written += 1
+            if written % 1000 == 0:
+                print(f"  ... {written}/{total} written", flush=True)
 
     print(f"Wrote {written} samples (skipped {skipped}) to {out_path}")
     print(f"Images under {image_dir}")
