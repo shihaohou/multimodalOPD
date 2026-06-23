@@ -36,7 +36,10 @@ def build_general_eval_messages(
     content.append({"type": "text", "text": format_opd_student_prompt(problem, suffix)})
     messages: list[dict[str, Any]] = []
     if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
+        # Qwen-VL apply_chat_template requires list-of-parts content per message.
+        messages.append(
+            {"role": "system", "content": [{"type": "text", "text": system_prompt}]}
+        )
     messages.append({"role": "user", "content": content})
     return messages
 
