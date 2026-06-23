@@ -123,7 +123,7 @@ class OPDTrainer(ViGOSTrainer):
                 inputs.get("student_images") or [],
             )
             opd_loss = masked_topk_kl_loss_from_teacher_topk(
-                student_logits,
+                student_logits.float(),
                 teacher_topk_ids,
                 teacher_topk_logprobs,
                 completion_attention,
@@ -157,8 +157,11 @@ class OPDTrainer(ViGOSTrainer):
             # vocab — the extra columns are padding beyond the real tokenizer vocab,
             # and log_softmax then renormalizes over the shared support.
             vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
-            student_kl_logits = student_logits[..., :vocab]
-            teacher_logits = teacher_logits[..., :vocab]
+            # Reverse KL in bf16 can produce NaN gradients: the p·log p entropy term
+            # explodes when a student prob underflows to exactly 0. Compute the KL in
+            # fp32 (logits are tiny vs the model, so the cost is negligible).
+            student_kl_logits = student_logits[..., :vocab].float()
+            teacher_logits = teacher_logits[..., :vocab].float()
             if self.opd_loss_mode == "full_kl" and self.opd_kl_direction == "reverse":
                 opd_loss = masked_kl_loss(
                     student_kl_logits,
