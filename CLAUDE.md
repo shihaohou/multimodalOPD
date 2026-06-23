@@ -120,6 +120,14 @@ Difference from what this repo does today:
   Pipeline: vLLM gen pass@k → `\boxed` extract → OpenAI-compatible judge →
   pass@k/avg@k → `responses/`,`judgments/`,`summary.json`. Full-FT writes a full
   checkpoint, so eval points straight at the run dir (no merge).
+- `baseline/teacher_grpo/` — recipe to GRPO-train a stronger **Qwen3-VL** teacher
+  on Vision-SR1 via **ms-swift** (separate venv `/root/shihao_project/swift-env`,
+  not the OPD env). `prepare_vision_sr1.py` (HF→ms-swift JSONL+images),
+  `reward_accuracy.py` (self-contained `vqa_accuracy`/`vqa_format` ORM via
+  `swift.rewards`), `train_teacher_grpo.sh` (Qwen3-VL-8B GRPO; transformers
+  rollout default, vLLM optional). Output (full ckpt, or merged LoRA) becomes the
+  OPD `TEACHER_MODEL`. Qwen3-VL line: student Qwen3-VL-2B + teacher Qwen3-VL-8B
+  (both `qwen3_vl`, same vocab).
 - `baseline/serve_teacher.py` + `baseline/teacher_client.py` +
   `scripts/serve_teacher_vllm.sh` — **`teacher_source=vllm_server`** (experimental):
   a separate vLLM server scores `prompt_token_ids+completion` with
