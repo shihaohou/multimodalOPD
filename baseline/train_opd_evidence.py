@@ -48,8 +48,12 @@ class OPDEvidenceScriptArguments(OPDScriptArguments):
 
     lambda_evidence: float = 1.0
     evidence_max_samples: int = 1
-    # Comma list of decoder layers to sum saliency over (default: all layers).
+    # Explicit comma list of decoder layers to sum saliency over (overrides
+    # evidence_num_layers). Empty => use the last `evidence_num_layers` layers.
     evidence_layers: str | None = None
+    # #decoder layers whose attention is captured + summed (the memory knob — each
+    # captured layer keeps an [H,S,S] tensor). <=0 means all layers.
+    evidence_num_layers: int = 4
     evidence_top_ratio: float = 0.2
     evidence_min_tokens: int = 1
     evidence_max_tokens: int = 8
@@ -257,6 +261,7 @@ def main() -> None:
         lambda_evidence=script_args.lambda_evidence,
         evidence_max_samples=script_args.evidence_max_samples,
         evidence_layers=evidence_layers,
+        evidence_num_layers=script_args.evidence_num_layers,
         evidence_top_ratio=script_args.evidence_top_ratio,
         evidence_min_tokens=script_args.evidence_min_tokens,
         evidence_max_tokens=script_args.evidence_max_tokens,

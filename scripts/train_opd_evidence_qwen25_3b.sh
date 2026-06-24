@@ -81,8 +81,11 @@ LAMBDA_EVIDENCE="${LAMBDA_EVIDENCE:-1.0}"
 # eager forward already covers the whole micro-batch; this just bounds the engine
 # work, so keeping per_device small is what bounds memory.
 EVIDENCE_MAX_SAMPLES="${EVIDENCE_MAX_SAMPLES:-1}"
-# Comma list of decoder layers to sum saliency over (empty = all).
+# Explicit comma list of decoder layers (overrides EVIDENCE_NUM_LAYERS; empty=off).
 EVIDENCE_LAYERS="${EVIDENCE_LAYERS:-}"
+# #layers whose attention is CAPTURED + summed = the main memory knob (each layer
+# keeps an [H,S,S] tensor for backward). Lower if OOM, raise for fidelity. <=0=all.
+EVIDENCE_NUM_LAYERS="${EVIDENCE_NUM_LAYERS:-4}"
 EVIDENCE_TOP_RATIO="${EVIDENCE_TOP_RATIO:-0.2}"
 EVIDENCE_MIN_TOKENS="${EVIDENCE_MIN_TOKENS:-1}"
 EVIDENCE_MAX_TOKENS="${EVIDENCE_MAX_TOKENS:-8}"
@@ -96,7 +99,9 @@ EVIDENCE_MASS_THRESHOLD="${EVIDENCE_MASS_THRESHOLD:-0.0}"
 
 USE_VLLM="${USE_VLLM:-true}"
 VLLM_MODE="${VLLM_MODE:-colocate}"
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
+# Lower than vanilla OPD (0.25): the eager evidence forward needs the headroom, and
+# the 2B-student rollout only needs a small vLLM pool. ~0.15 frees ~14GB/GPU.
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.15}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_SYNC_FREQUENCY="${VLLM_SYNC_FREQUENCY:-1}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH))}"
@@ -196,6 +201,7 @@ uv run accelerate launch \
   --lambda_evidence "$LAMBDA_EVIDENCE" \
   --evidence_max_samples "$EVIDENCE_MAX_SAMPLES" \
   "${EVIDENCE_LAYERS_ARGS[@]}" \
+  --evidence_num_layers "$EVIDENCE_NUM_LAYERS" \
   --evidence_top_ratio "$EVIDENCE_TOP_RATIO" \
   --evidence_min_tokens "$EVIDENCE_MIN_TOKENS" \
   --evidence_max_tokens "$EVIDENCE_MAX_TOKENS" \

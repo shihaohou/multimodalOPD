@@ -273,11 +273,12 @@ def compute_token_saliency_maps(
     n_heads, head_dim = parts.n_heads, parts.head_dim
     n_rep = parts.num_kv_groups
 
-    n_layers = len(attentions)
-    layer_ids = tuple(range(n_layers)) if layers is None else tuple(layers)
+    layer_ids = tuple(range(len(attentions))) if layers is None else tuple(layers)
 
     b = batch_index
-    device = attentions[0].device
+    # ``attentions`` may be a full tuple (output_attentions) or a {layer: weights}
+    # dict (hook-captured subset); index by the first used layer either way.
+    device = attentions[layer_ids[0]].device
     answer_query_positions = answer_query_positions.to(device)
     reason_key_positions = reason_key_positions.to(device)
     reason_query_positions = reason_query_positions.to(device)

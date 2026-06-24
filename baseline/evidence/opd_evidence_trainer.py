@@ -88,6 +88,39 @@ def force_eager_attention(model: nn.Module):
             c._attn_implementation = old
 
 
+@contextlib.contextmanager
+def capture_attention_weights(text_model: nn.Module, layer_ids):
+    """Capture post-softmax attention weights for a SUBSET of decoder layers via
+    forward hooks — instead of model-level ``output_attentions=True``, which
+    retains EVERY layer's ``[H, S, S]`` tensor (the OOM cause).
+
+    Eager attention returns ``(attn_output, attn_weights)`` from each ``self_attn``
+    module regardless of the ``output_attentions`` flag (the softmax matrix is
+    intrinsic to eager), so a forward hook on the selected layers grabs exactly
+    those weights — in-graph for a grad forward — while the other layers' weights
+    are computed and freed layer-by-layer (peak = one ``[H,S,S]`` transient).
+    Returns ``{layer_idx: weights}``.
+    """
+    captured: dict[int, torch.Tensor] = {}
+    handles = []
+
+    def make_hook(idx: int):
+        def hook(module, args, output):
+            if isinstance(output, (tuple, list)) and len(output) >= 2 and torch.is_tensor(output[1]):
+                captured[idx] = output[1]
+        return hook
+
+    for layer_idx in layer_ids:
+        handles.append(
+            text_model.layers[layer_idx].self_attn.register_forward_hook(make_hook(layer_idx))
+        )
+    try:
+        yield captured
+    finally:
+        for handle in handles:
+            handle.remove()
+
+
 class OPDEvidenceTrainer(OPDTrainer):
     def __init__(
         self,
@@ -95,6 +128,7 @@ class OPDEvidenceTrainer(OPDTrainer):
         lambda_evidence: float = 1.0,
         evidence_max_samples: int = 1,
         evidence_layers: tuple[int, ...] | None = None,
+        evidence_num_layers: int = 4,
         evidence_top_ratio: float = 0.2,
         evidence_min_tokens: int = 1,
         evidence_max_tokens: int = 8,
@@ -118,6 +152,7 @@ class OPDEvidenceTrainer(OPDTrainer):
         self.evidence_layers = (
             tuple(int(x) for x in evidence_layers) if evidence_layers else None
         )
+        self.evidence_num_layers = int(evidence_num_layers)
         self.evidence_top_ratio = float(evidence_top_ratio)
         self.evidence_min_tokens = int(evidence_min_tokens)
         self.evidence_max_tokens = int(evidence_max_tokens)
@@ -131,6 +166,22 @@ class OPDEvidenceTrainer(OPDTrainer):
         self._student_parts = None
         self._teacher_parts = None
 
+    def _resolve_evidence_layers(self, parts) -> tuple[int, ...]:
+        """Decoder-layer subset to sum saliency over (and capture attentions for).
+
+        Explicit ``evidence_layers`` wins; else the last ``evidence_num_layers``
+        layers (where the answer logit is most directly formed — a memory-bounded
+        approximation of Saliency_R1 summing all layers); ``evidence_num_layers<=0``
+        means all layers. Resolved per model so the 2B student and 8B teacher each
+        use the right depth.
+        """
+        n = len(parts.text_model.layers)
+        if self.evidence_layers:
+            return tuple(l for l in self.evidence_layers if 0 <= l < n)
+        if self.evidence_num_layers > 0:
+            return tuple(range(max(0, n - self.evidence_num_layers), n))
+        return tuple(range(n))
+
     def _evidence_loss(
         self,
         unwrapped_student: nn.Module,
@@ -139,10 +190,12 @@ class OPDEvidenceTrainer(OPDTrainer):
         completion_ids: torch.Tensor,
         spans_list: list,
         valid_idx: list[int],
-        s_attentions: tuple[torch.Tensor, ...],
-        s_hidden: tuple[torch.Tensor, ...],
-        t_attentions: tuple[torch.Tensor, ...],
-        t_hidden: tuple[torch.Tensor, ...],
+        s_layer_ids: tuple[int, ...],
+        t_layer_ids: tuple[int, ...],
+        s_attentions,
+        s_hidden,
+        t_attentions,
+        t_hidden,
         student_logits_det: torch.Tensor,
         teacher_logits_det: torch.Tensor,
     ) -> tuple[torch.Tensor | None, dict[str, float]]:
@@ -213,7 +266,7 @@ class OPDEvidenceTrainer(OPDTrainer):
                 visual_positions=visual_positions,
                 direction_ids=direction_ids,
                 grid_hw=grid_hw,
-                layers=self.evidence_layers,
+                layers=s_layer_ids,
                 signed=self.evidence_signed,
                 parts=s_parts,
             )
@@ -229,7 +282,7 @@ class OPDEvidenceTrainer(OPDTrainer):
                     visual_positions=visual_positions,
                     direction_ids=direction_ids,
                     grid_hw=grid_hw,
-                    layers=self.evidence_layers,
+                    layers=t_layer_ids,
                     signed=self.evidence_signed,
                     parts=t_parts,
                 ).detach()
@@ -285,33 +338,48 @@ class OPDEvidenceTrainer(OPDTrainer):
         run_evidence = bool(valid_idx)
         unwrapped = self.accelerator.unwrap_model(model)
 
-        # --- SINGLE student forward (one grad graph; see module docstring) ------
+        # Resolve the small decoder-layer subset whose attention weights we keep
+        # (capturing every layer's [H,S,S] is the OOM cause). Per model: the 2B
+        # student and 8B teacher have different depths.
+        s_layer_ids: tuple[int, ...] = ()
+        t_layer_ids: tuple[int, ...] = ()
+        if run_evidence:
+            if self._student_parts is None:
+                self._student_parts = resolve_model_parts(unwrapped)
+            if self._teacher_parts is None:
+                self._teacher_parts = resolve_model_parts(self.teacher_model)
+            s_layer_ids = self._resolve_evidence_layers(self._student_parts)
+            t_layer_ids = self._resolve_evidence_layers(self._teacher_parts)
+
+        # --- SINGLE student forward (one grad graph; see module docstring). The
+        #     evidence-layer attention weights are captured via forward hooks, NOT
+        #     output_attentions=True (which retains every layer's [H,S,S] -> OOM). -
         student_inputs = self._with_completion(
             student_prompt,
             full_input_ids=rollout["generated_ids"],
             full_attention_mask=rollout["generated_attention_mask"],
         )
         student_inputs["logits_to_keep"] = completion_length + 1
+        s_attentions = s_hidden = None
         if run_evidence:
-            with force_eager_attention(unwrapped):
-                student_outputs = model(
-                    **student_inputs, output_attentions=True, output_hidden_states=True
-                )
-            if not getattr(student_outputs, "attentions", None):
+            with force_eager_attention(unwrapped), capture_attention_weights(
+                self._student_parts.text_model, s_layer_ids
+            ) as s_attn:
+                student_outputs = model(**student_inputs, output_hidden_states=True)
+            if any(layer_idx not in s_attn for layer_idx in s_layer_ids):
                 print(
-                    "[OPD-evidence] student forward returned no attentions (gradient "
-                    "checkpointing?); OPD-only this step. Set GRADIENT_CHECKPOINTING=false "
-                    "to enable evidence.",
+                    "[OPD-evidence] student attention weights not captured (eager "
+                    "dispatch / gradient checkpointing?); OPD-only this step.",
                     flush=True,
                 )
                 run_evidence = False
+            else:
+                s_attentions, s_hidden = s_attn, student_outputs.hidden_states
         else:
             student_outputs = model(**student_inputs)
         student_logits = self._completion_logits(
             student_outputs.logits, completion_length
         )
-        s_attentions = student_outputs.attentions if run_evidence else None
-        s_hidden = student_outputs.hidden_states if run_evidence else None
 
         # --- teacher forward (frozen, no grad) ---------------------------------
         teacher_inputs = self._append_completion(
@@ -320,15 +388,24 @@ class OPDEvidenceTrainer(OPDTrainer):
         t_attentions = t_hidden = None
         if run_evidence:
             teacher_inputs["logits_to_keep"] = completion_length + 1
-            with torch.no_grad(), force_eager_attention(self.teacher_model):
+            with torch.no_grad(), force_eager_attention(
+                self.teacher_model
+            ), capture_attention_weights(
+                self._teacher_parts.text_model, t_layer_ids
+            ) as t_attn:
                 t_out = self.teacher_model(
-                    **teacher_inputs,
-                    output_attentions=True,
-                    output_hidden_states=True,
-                    use_cache=False,
+                    **teacher_inputs, output_hidden_states=True, use_cache=False
                 )
             teacher_logits = self._completion_logits(t_out.logits, completion_length)
-            t_attentions, t_hidden = t_out.attentions, t_out.hidden_states
+            if any(layer_idx not in t_attn for layer_idx in t_layer_ids):
+                print(
+                    "[OPD-evidence] teacher attention weights not captured; "
+                    "OPD-only this step.",
+                    flush=True,
+                )
+                run_evidence = False
+            else:
+                t_attentions, t_hidden = t_attn, t_out.hidden_states
         else:
             teacher_logits = self._batched_teacher_completion_logits(
                 self.teacher_model,
@@ -378,6 +455,8 @@ class OPDEvidenceTrainer(OPDTrainer):
                 completion_ids,
                 spans_list,
                 valid_idx,
+                s_layer_ids,
+                t_layer_ids,
                 s_attentions,
                 s_hidden,
                 t_attentions,
