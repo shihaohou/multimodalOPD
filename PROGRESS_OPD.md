@@ -124,23 +124,31 @@ representation level, which is exactly the teacher→student saliency transfer.
   `scripts/train_opd_evidence_qwen25_3b.sh`. Full method/knobs/caveats:
   `baseline/evidence/README.md`.
 
-**Status:** code written + byte-compiled; **NOT yet GPU-validated** (laptop has no
-env). Next action is the Step-1 sanity check on the box (backward grad nonzero +
-peak memory + teacher/student grid match), then a smoke `MAX_STEPS=5` evidence run.
+**Status (2026-06-25): GPU-VALIDATED on Qwen3-VL 8B→2B.** Step-1 sanity passed
+(grid match 196/14×14, `v_proj` grad nonzero, 28 GB peak on a small image); Step-3
+8-GPU smoke (5 steps) passed end-to-end: `loss_opd≈0.30`, `loss_ev≈0.7–1.0`,
+`answer_accuracy≈0.45`, `ev_n_selected≈1`, ~85s/step, no crash/OOM.
 
-**Two known unknowns to resolve on the box:** (1) **eager `output_attentions` memory**
-— at 16k prompt this is the OOM point; start with `EVIDENCE_MAX_SAMPLES=1` + a layer
-subset. (2) **gradient-checkpointing × output_attentions** — GC may swallow the
-attentions (trainer warns + skips evidence); if `loss_ev` never logs, set
-`GRADIENT_CHECKPOINTING=false`. (3) **Qwen3-VL grid** — the sanity check asserts the
-8B/2B pair shares the patch grid; if not, use Qwen2.5-VL 3B←7B (shared ViT).
+**Key design lesson:** `compute_loss` does ONE student grad-forward emitting both
+the OPD logits and the evidence attentions/hidden-states — a second grad forward
+through the DeepSpeed-wrapped student double-reduces gradients
+("parameter … already been reduced"). So the evidence launcher defaults to
+`PER_DEVICE_TRAIN_BATCH_SIZE=1` + `GRADIENT_CHECKPOINTING=false` (the single eager
+`output_attentions` forward is the memory wall). `output_attentions` materializes
+all-layer `[H,S,S]` regardless of `EVIDENCE_LAYERS`, so only smaller S or a Stage-2
+custom autograd (recompute just the selected query rows) reduces it further.
 
 ## Next / open items (for new planning)
 
-- [ ] **Run the evidence Step-1 sanity check** on the box (Qwen2.5-VL 3B+7B first —
-      guaranteed grid match; then test the Qwen3-VL 8B/2B grid). Read peak memory.
-- [ ] **Smoke evidence run** (`MAX_STEPS=5 REPORT_TO=none`), confirm `loss_ev`/`ev_corr`
-      log and `loss_opd` matches the vanilla OPD curve.
+- [x] **Evidence Step-1 sanity + Step-3 smoke** — DONE 2026-06-25 (Qwen3-VL 8B→2B,
+      see "Evidence-alignment extension" status above).
+- [ ] **Full evidence run** (`RUN_CONFIG=opd_ev_qwen3_8b_to_2b`, WANDB online, no
+      MAX_STEPS): does `ev_corr` rise (evidence transferring) without dropping
+      `answer_accuracy`, vs the vanilla-OPD baseline? + saliency-bbox pointing on
+      Visual-CoT/V* as external validation.
+- [ ] (perf) **Stage-2 custom autograd** for saliency if large images OOM / 85s/step
+      is too slow — recompute only the selected query rows instead of full
+      `output_attentions`.
 
 - [ ] **Run Stage 0 probe** on teacher=MMR1-7B-RL vs student-before=MMR1-3B-SFT
       (then candidates). GO → Stage 1: short vanilla token-KL OPD ckpt, re-probe
