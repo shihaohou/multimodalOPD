@@ -99,7 +99,48 @@ student); **STOP** if Reliance ≈ 0 everywhere. Pipeline + run block:
 **needs the box** to run (Stage 0). Open: confirm MMR1-7B-RL / MMR1-3B-SFT /
 Saliency-R1-7B checkpoint paths on the box.
 
+## Evidence-alignment extension (Saliency-R1 → OPD) — built 2026-06-25
+
+New additive package `baseline/evidence/` (vigos + vanilla OPD untouched). Adds a
+**differentiable evidence-alignment loss** beside the OPD token loss:
+`loss = λ_opd·L_opd + λ_evidence·L_evidence`, where `L_evidence` pulls the
+student's per-token **saliency map** toward the frozen teacher's
+(`1 − signed-Pearson`, gated on teacher-map concentration, on the top-KL answer
+tokens). Motivation: the Stage-0/1 probe showed OPD's behavioral gains are
+capability-confounded (Reliance ≈ 0.8·Acc) — so the intervention must live at the
+representation level, which is exactly the teacher→student saliency transfer.
+
+- `saliency_engine.py` — faithful **differentiable** port of `peterant330/Saliency_R1`'s
+  logit-decomposition saliency (two-hop answer→reason→visual routing, OV `o_proj(α·V)`
+  summed over layers, norm-rescale, unembed onto the generated token). Value states
+  recomputed via `v_proj(input_layernorm(h_l))` (grad-enabled); per-answer-token maps;
+  direction-only unembed (no `[n_ans,P,vocab]` blow-up). Config-driven → Qwen2.5-VL
+  **and** Qwen3-VL.
+- `span_utils.py` (`<reason>`/`\boxed{}` spans), `evidence_loss.py` (signed Pearson +
+  `|S_T|` gate + token selection), `opd_evidence_trainer.py`
+  (`OPDEvidenceTrainer(OPDTrainer)`: shared rollout + a second eager
+  `output_attentions` forward on `evidence_max_samples` rows + no-grad teacher),
+  `sanity_check.py` (Step-1 checks), `../train_opd_evidence.py`,
+  `scripts/train_opd_evidence_qwen25_3b.sh`. Full method/knobs/caveats:
+  `baseline/evidence/README.md`.
+
+**Status:** code written + byte-compiled; **NOT yet GPU-validated** (laptop has no
+env). Next action is the Step-1 sanity check on the box (backward grad nonzero +
+peak memory + teacher/student grid match), then a smoke `MAX_STEPS=5` evidence run.
+
+**Two known unknowns to resolve on the box:** (1) **eager `output_attentions` memory**
+— at 16k prompt this is the OOM point; start with `EVIDENCE_MAX_SAMPLES=1` + a layer
+subset. (2) **gradient-checkpointing × output_attentions** — GC may swallow the
+attentions (trainer warns + skips evidence); if `loss_ev` never logs, set
+`GRADIENT_CHECKPOINTING=false`. (3) **Qwen3-VL grid** — the sanity check asserts the
+8B/2B pair shares the patch grid; if not, use Qwen2.5-VL 3B←7B (shared ViT).
+
 ## Next / open items (for new planning)
+
+- [ ] **Run the evidence Step-1 sanity check** on the box (Qwen2.5-VL 3B+7B first —
+      guaranteed grid match; then test the Qwen3-VL 8B/2B grid). Read peak memory.
+- [ ] **Smoke evidence run** (`MAX_STEPS=5 REPORT_TO=none`), confirm `loss_ev`/`ev_corr`
+      log and `loss_opd` matches the vanilla OPD curve.
 
 - [ ] **Run Stage 0 probe** on teacher=MMR1-7B-RL vs student-before=MMR1-3B-SFT
       (then candidates). GO → Stage 1: short vanilla token-KL OPD ckpt, re-probe
