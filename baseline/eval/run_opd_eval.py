@@ -94,6 +94,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-max-tokens", type=int, default=4096)
     p.add_argument("--judge-timeout", type=float, default=120.0)
     p.add_argument("--judge-retries", type=int, default=2)
+    p.add_argument(
+        "--judge-extra-body",
+        default="",
+        help="JSON merged into each judge request's body (OpenAI client extra_body). "
+        'E.g. disable Qwen3 thinking: \'{"chat_template_kwargs": {"enable_thinking": false}}\'.',
+    )
     return p.parse_args()
 
 
@@ -206,6 +212,13 @@ def judge_records(records: list[dict[str, Any]], args: argparse.Namespace) -> li
         )
     client = OpenAI(base_url=args.judge_api_url, api_key=api_key)
 
+    extra_body = None
+    if args.judge_extra_body.strip():
+        try:
+            extra_body = json.loads(args.judge_extra_body)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--judge-extra-body must be valid JSON: {exc}") from exc
+
     def judge_one(record: dict[str, Any]) -> dict[str, Any]:
         answers = [a.get("extracted_answer", "") for a in record.get("attempts", [])]
         if not answers:
@@ -225,6 +238,7 @@ def judge_records(records: list[dict[str, Any]], args: argparse.Namespace) -> li
                     temperature=0.0,
                     max_tokens=args.judge_max_tokens,
                     timeout=args.judge_timeout,
+                    extra_body=extra_body,
                 )
                 parsed = parse_judge_output(resp.choices[0].message.content)
                 error = None

@@ -49,6 +49,11 @@ JUDGE_WORKERS="${JUDGE_WORKERS:-64}"
 JUDGE_MAX_TOKENS="${JUDGE_MAX_TOKENS:-4096}"
 JUDGE_TIMEOUT="${JUDGE_TIMEOUT:-120}"
 JUDGE_RETRIES="${JUDGE_RETRIES:-2}"
+# Optional JSON merged into each judge request (OpenAI extra_body). For a Qwen3
+# thinking model served by vLLM, disable thinking so the judge returns its JSON
+# verdict (not buried in reasoning):
+#   JUDGE_EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}}'
+JUDGE_EXTRA_BODY="${JUDGE_EXTRA_BODY:-}"
 
 CMD=(
   uv run python baseline/eval/run_opd_eval.py
@@ -78,6 +83,7 @@ CMD=(
   --judge-max-tokens "$JUDGE_MAX_TOKENS"
   --judge-timeout "$JUDGE_TIMEOUT"
   --judge-retries "$JUDGE_RETRIES"
+  --judge-extra-body "$JUDGE_EXTRA_BODY"
 )
 
 if [[ -n "$LIMIT" ]]; then
