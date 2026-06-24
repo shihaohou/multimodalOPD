@@ -19,8 +19,17 @@ Two model lines, both confirmed stable (no NaN, loss finite & trending down):
 | Qwen2.5-VL | 3B-Instruct | 7B-Instruct | 151936 / 152064 → min | ViT stable at batch 32 |
 | Qwen3-VL | 2B-Instruct | 8B-Instruct | shared | redesigned ViT, more bf16-stable |
 
-**Running now:** Qwen3-VL `8B → 2B` OPD, full-FT, ViT unfrozen, 8 GPU
-(effective batch 32), reverse-KL, WandB online. Output → `runs/opd_qwen3_8b_to_2b/`.
+**Running now:** Qwen3-VL `8B → 2B` OPD, full-FT, ViT unfrozen, 8 GPU, reverse-KL,
+WandB online. Output → `runs/opd_qwen3_8b_to_2b/`.
+
+**Config (paper Vision-OPD/VGS Table 4 aligned + throughput-tuned, all script
+defaults):** AdamW lr 1e-6, weight_decay 1e-2, constant schedule (no warmup),
+**global batch 512 = per_device 8 × grad_accum 8 × 8 GPU** (per_device 8 batches
+the vLLM rollout for throughput; `VLLM_GPU_MEMORY_UTILIZATION=0.25` since 0.30 OOMs
+at per_device 8), rollout temp/top_p 1.0 (no top-k), max prompt/response
+16384/2048, SAVE_STEPS 5 (keep all ckpts for the acc curve). WandB metrics:
+`loss_opd` (= reverse KL), `completion_length` (mean response tokens),
+`answer_accuracy`, `completion_token_ratio`.
 
 ## The NaN saga — root cause & resolution
 
