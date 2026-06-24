@@ -51,13 +51,14 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-3}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 4 x
-# grad_accum 16 x 8 GPU. per_device > 1 lets vLLM batch the rollout (throughput
-# win), but per_device 8 OOMs the training forward on heavy multi-image batches
-# (activation spike from 8 sequences x many vision tokens); 4 is the stable sweet
-# spot. Rescale grad_accum to keep batch 512 if you change GPU count or per_device.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
+# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 8 x
+# grad_accum 8 x 8 GPU. per_device 8 keeps the rollout batched (fast: ~2h vs ~3.5h
+# at per_device 4 on the 140GB cards). It OOM'd the training forward at vLLM util
+# 0.25 on a heavy multi-image batch (short by ~1.2G); fixed by lowering vLLM util
+# to 0.18 (colocate shares the memory pool, so that frees ~10G for training).
+# Rescale grad_accum to keep batch 512 if you change GPU count or per_device.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 # Paper (Table 4): AdamW, lr 1e-6, weight_decay 1e-2, constant schedule, no warmup.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
@@ -93,9 +94,10 @@ REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
 MIN_P="${MIN_P:-0.0}"
 USE_VLLM="${USE_VLLM:-true}"
 VLLM_MODE="${VLLM_MODE:-colocate}"
-# Low: leaves room for the frozen teacher replica per GPU AND the per_device 8
-# training forward/backward (0.30 OOM'd by ~300M at per_device 8; 0.25 fits).
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
+# Low: colocate shares the pool with the frozen teacher replica AND the per_device
+# 8 training forward. 0.25 OOM'd training on a heavy multi-image batch; 0.18 frees
+# ~10G for training (a 2B model only needs ~4G weights + a little KV here).
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.18}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_SYNC_FREQUENCY="${VLLM_SYNC_FREQUENCY:-1}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH))}"
