@@ -70,7 +70,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model-name", default=None)
     p.add_argument("--output-dir", required=True)
     # MMVP source
-    p.add_argument("--mmvp-repo", default="MMVP/MMVP", help="HuggingFace dataset repo id.")
+    p.add_argument(
+        "--mmvp-repo",
+        default="MMVP/MMVP",
+        help="HuggingFace dataset repo id, OR a local snapshot dir (for offline boxes).",
+    )
     p.add_argument(
         "--image-dir",
         default=None,
@@ -170,9 +174,16 @@ def load_mmvp_samples(
     image_dir: str | None,
     limit: int | None,
 ) -> list[EvalSample]:
-    from huggingface_hub import snapshot_download
+    # Accept either a HuggingFace dataset id OR a local snapshot dir, so the eval
+    # runs on offline boxes (HF_HUB_OFFLINE=1): pre-fetch once with
+    # `hf download MMVP/MMVP --repo-type dataset --local-dir <dir>` and pass --mmvp-repo <dir>.
+    source = Path(repo_id).expanduser()
+    if source.is_dir():
+        root = source
+    else:
+        from huggingface_hub import snapshot_download
 
-    root = Path(snapshot_download(repo_id, repo_type="dataset"))
+        root = Path(snapshot_download(repo_id, repo_type="dataset"))
     csv_path, image_map = _discover_mmvp_files(root, image_dir)
     rows = _read_csv_rows(csv_path)
 

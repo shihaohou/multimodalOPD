@@ -25,6 +25,8 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/mmvp_${RUN_ID}}"
 MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"
 
+# HF dataset id, OR a local snapshot dir for offline boxes (HF_HUB_OFFLINE=1):
+#   hf download MMVP/MMVP --repo-type dataset --local-dir <dir>; MMVP_REPO=<dir>
 MMVP_REPO="${MMVP_REPO:-MMVP/MMVP}"
 IMAGE_DIR="${IMAGE_DIR:-}"
 PAIR_SIZE="${PAIR_SIZE:-2}"
