@@ -43,18 +43,21 @@ Every number gets a **paired percentile bootstrap CI** over samples.
 ## Pipeline
 
 ```bash
-M=/home/web_server/antispam/project/houshihao/models   # box models dir
+M=/home/web_server/antispam/project/houshihao/models     # box models dir
+D=/home/web_server/antispam/project/houshihao/datasets   # box datasets dir
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
+# NOTE: with offline set, pass the LOCAL dataset dir (not the HF id), or it tries
+# to reach the Hub and fails. saliency-r1-8k is at $D/saliency-r1-8k on the box.
 
 # 0) CPU-only sanity: schema stats + bbox→image overlay montages. LOOK at these:
 #    the red box must sit on the answer evidence before you trust any number.
 uv run python baseline/probe/inspect_saliency.py \
-    --num-sheets 16 --output-dir probe_outputs/inspect
+    --dataset $D/saliency-r1-8k --num-sheets 16 --output-dir probe_outputs/inspect
 
 # 1) One probe run per model (greedy, rule-graded, no API). ~hundreds of samples
 #    × 8 conditions = minutes on one H800. Run candidates on different GPUs.
-CUDA_VISIBLE_DEVICES=0 MODEL_PATH=$M/MMR1-7B-RL  MODEL_NAME=MMR1-7B-RL  bash scripts/probe_stage0.sh
-CUDA_VISIBLE_DEVICES=1 MODEL_PATH=$M/MMR1-3B-SFT MODEL_NAME=MMR1-3B-SFT bash scripts/probe_stage0.sh
+CUDA_VISIBLE_DEVICES=0 DATASET=$D/saliency-r1-8k MODEL_PATH=$M/MMR1-7B-RL  MODEL_NAME=MMR1-7B-RL  bash scripts/probe_stage0.sh
+CUDA_VISIBLE_DEVICES=1 DATASET=$D/saliency-r1-8k MODEL_PATH=$M/MMR1-3B-SFT MODEL_NAME=MMR1-3B-SFT bash scripts/probe_stage0.sh
 
 # Check the printed Acc_full per model is sane (not ~0). If a reasoning model's
 # Acc_full looks suppressed, give it its native prompt: --system-prompt "..." or

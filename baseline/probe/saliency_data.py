@@ -92,19 +92,35 @@ def parse_bbox_norm(raw: Any) -> Optional[BoxNorm]:
 
 
 def _load_hf_split(dataset: str, split: str):
+    """Load a split from a HF id OR a local dir (save_to_disk dump / dataset dir /
+    raw parquet|arrow|json). Local paths work under HF_HUB_OFFLINE=1."""
     from datasets import load_dataset
 
-    if os.path.isdir(dataset):
-        try:
-            return load_dataset(dataset, split=split)
-        except Exception:
-            from datasets import load_from_disk
+    if not os.path.isdir(dataset):
+        return load_dataset(dataset, split=split)
 
-            disk = load_from_disk(dataset)
-            if hasattr(disk, "keys") and split in disk:  # DatasetDict
-                return disk[split]
-            return disk
-    return load_dataset(dataset, split=split)
+    # save_to_disk dump (has dataset_info.json / state.json).
+    if os.path.exists(os.path.join(dataset, "dataset_info.json")) or os.path.exists(
+        os.path.join(dataset, "state.json")
+    ):
+        from datasets import load_from_disk
+
+        disk = load_from_disk(dataset)
+        if hasattr(disk, "keys"):  # DatasetDict
+            return disk[split] if split in disk else disk[next(iter(disk.keys()))]
+        return disk
+
+    # Standard local dataset dir (datasets auto-detects parquet/arrow under data/).
+    try:
+        return load_dataset(dataset, split=split)
+    except Exception:
+        import glob
+
+        for ext, builder in (("parquet", "parquet"), ("arrow", "arrow"), ("jsonl", "json"), ("json", "json")):
+            files = sorted(glob.glob(os.path.join(dataset, "**", f"*.{ext}"), recursive=True))
+            if files:
+                return load_dataset(builder, data_files=files, split="train")
+        raise
 
 
 def load_saliency_samples(
