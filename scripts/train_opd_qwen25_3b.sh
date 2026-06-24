@@ -51,28 +51,31 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-3}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# Full FT needs more memory than LoRA: smaller micro-batch, more accumulation.
+# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 1 x
+# grad_accum 64 x 8 GPU. Rescale grad_accum if you change GPU count to keep 512.
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
-# Vision-OPD uses 2e-6 for full-parameter OPD (vs 5e-6 for ViGOS LoRA).
-LEARNING_RATE="${LEARNING_RATE:-2e-6}"
-# LR warmup: ramps the early steps so the first reverse-KL gradients don't shock
-# the model. 0 = off (HF default).
-WARMUP_RATIO="${WARMUP_RATIO:-0.03}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-64}"
+# Paper (Table 4): AdamW, lr 1e-6, weight_decay 1e-2, constant schedule, no warmup.
+LEARNING_RATE="${LEARNING_RATE:-1e-6}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-constant}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
 # Freeze the vision tower under full FT. Off by default: at a real multi-GPU
 # effective batch (e.g. 8 GPU x grad_accum 4 = 32) the ViT grad spikes average
 # out and full FT incl. ViT is stable (matches Vision-OPD). Turn on as a fallback
 # for small-batch / single-GPU runs where the ViT bf16 grad can overflow -> NaN.
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-32768}"
-MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-4096}"
+# Paper (Table 4): max input prompt 16384, max response 2048.
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-16384}"
+MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
 # Format instruction lives in the unified system prompt (baseline/opd_data_collator
 # OPD_SYSTEM_PROMPT); the user turn is just the question, so no suffix by default.
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
-GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.1}"
-GENERATION_TOP_P="${GENERATION_TOP_P:-0.95}"
-GENERATION_TOP_K="${GENERATION_TOP_K:-20}"
+# Paper (Table 4) rollout: temperature 1.0, top_p 1.0, no top-k (0 -> vLLM -1).
+GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.0}"
+GENERATION_TOP_P="${GENERATION_TOP_P:-1.0}"
+GENERATION_TOP_K="${GENERATION_TOP_K:-0}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
 # Distillation loss. Default = exact reverse KL (canonical OPD); the local teacher
@@ -103,8 +106,10 @@ VLLM_SERVER_REQUEST_BATCH_SIZE="${VLLM_SERVER_REQUEST_BATCH_SIZE:-}"
 COMPLETION_LOG_STEPS="${COMPLETION_LOG_STEPS:-0}"
 COMPLETION_LOG_MAX_SAMPLES="${COMPLETION_LOG_MAX_SAMPLES:-16}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
-SAVE_STEPS="${SAVE_STEPS:-500}"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
+# Paper batch 512 -> ~92 steps/epoch, so save often for an acc curve. Raise
+# SAVE_TOTAL_LIMIT (or override per run) to keep all checkpoints for the curve.
+SAVE_STEPS="${SAVE_STEPS:-5}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-100}"
 SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-true}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
@@ -167,6 +172,8 @@ uv run accelerate launch \
   --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --learning_rate "$LEARNING_RATE" \
+  --weight_decay "$WEIGHT_DECAY" \
+  --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
   --max_grad_norm 0.1 \
   --bf16 \
