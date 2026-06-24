@@ -51,10 +51,13 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-3}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 1 x
-# grad_accum 64 x 8 GPU. Rescale grad_accum if you change GPU count to keep 512.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-64}"
+# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 8 x
+# grad_accum 8 x 8 GPU. per_device 8 (not 1) lets vLLM batch the rollout instead
+# of generating one sequence at a time -> much higher throughput; validated to fit
+# at VLLM_GPU_MEMORY_UTILIZATION=0.25. Rescale grad_accum to keep batch 512 if you
+# change GPU count or per_device.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 # Paper (Table 4): AdamW, lr 1e-6, weight_decay 1e-2, constant schedule, no warmup.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
@@ -90,8 +93,9 @@ REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"
 MIN_P="${MIN_P:-0.0}"
 USE_VLLM="${USE_VLLM:-true}"
 VLLM_MODE="${VLLM_MODE:-colocate}"
-# Lower than ViGOS (0.45) to leave room for the frozen teacher replica per GPU.
-VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.30}"
+# Low: leaves room for the frozen teacher replica per GPU AND the per_device 8
+# training forward/backward (0.30 OOM'd by ~300M at per_device 8; 0.25 fits).
+VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.25}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_SYNC_FREQUENCY="${VLLM_SYNC_FREQUENCY:-1}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_COMPLETION_LENGTH))}"
