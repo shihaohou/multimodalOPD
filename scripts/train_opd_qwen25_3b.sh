@@ -51,13 +51,13 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-3}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 8 x
-# grad_accum 8 x 8 GPU. per_device 8 (not 1) lets vLLM batch the rollout instead
-# of generating one sequence at a time -> much higher throughput; validated to fit
-# at VLLM_GPU_MEMORY_UTILIZATION=0.25. Rescale grad_accum to keep batch 512 if you
-# change GPU count or per_device.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 4 x
+# grad_accum 16 x 8 GPU. per_device > 1 lets vLLM batch the rollout (throughput
+# win), but per_device 8 OOMs the training forward on heavy multi-image batches
+# (activation spike from 8 sequences x many vision tokens); 4 is the stable sweet
+# spot. Rescale grad_accum to keep batch 512 if you change GPU count or per_device.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 # Paper (Table 4): AdamW, lr 1e-6, weight_decay 1e-2, constant schedule, no warmup.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
