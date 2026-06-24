@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--max-model-len", type=int, default=None)
-    p.add_argument("--limit-images", type=int, default=2)
+    p.add_argument("--limit-images", type=int, default=1, help="Images per prompt (probe uses 1).")
     p.add_argument("--dtype", default="auto")
     # grading
     p.add_argument("--grader", default="rule", choices=["rule", "llm"])

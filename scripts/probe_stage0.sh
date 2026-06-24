@@ -52,9 +52,10 @@ MAX_TOKENS="${MAX_TOKENS:-2048}"
 GEN_SEED="${GEN_SEED:-42}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+# If a big model still OOMs after the caps below, drop util to 0.80.
 VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
-VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
-VLLM_LIMIT_IMAGES="${VLLM_LIMIT_IMAGES:-2}"
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-16384}"   # probe needs <<this; caps KV reservation (Qwen3-VL ctx is huge)
+VLLM_LIMIT_IMAGES="${VLLM_LIMIT_IMAGES:-1}"          # exactly 1 image/prompt -> less vision-profiling memory
 DTYPE="${DTYPE:-auto}"
 
 GRADER="${GRADER:-rule}"            # rule (no API) | llm
