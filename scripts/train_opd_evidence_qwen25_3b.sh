@@ -58,6 +58,11 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-16384}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
+# Cap image resolution -> caps #visual tokens -> caps the eager-attention S^2 memory
+# (THE evidence OOM lever). Empty = processor default (can be ~12.8M px / thousands
+# of visual tokens -> OOM). 1003520 ~= 1280 visual tokens; halve if still OOM.
+MAX_PIXELS="${MAX_PIXELS:-}"
+MIN_PIXELS="${MIN_PIXELS:-}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
 GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.0}"
@@ -132,6 +137,14 @@ if [[ -n "$EVIDENCE_LAYERS" ]]; then
   EVIDENCE_LAYERS_ARGS+=(--evidence_layers "$EVIDENCE_LAYERS")
 fi
 
+PIXEL_ARGS=()
+if [[ -n "$MAX_PIXELS" ]]; then
+  PIXEL_ARGS+=(--max_pixels "$MAX_PIXELS")
+fi
+if [[ -n "$MIN_PIXELS" ]]; then
+  PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
+fi
+
 RUN_CONFIG="${RUN_CONFIG:-opd_ev_qwen25_3b_lev${LAMBDA_EVIDENCE}_top${EVIDENCE_TOP_RATIO}_np${NUM_PROCESSES}}"
 
 uv run accelerate launch \
@@ -170,6 +183,7 @@ uv run accelerate launch \
   "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
   --max_prompt_length "$MAX_PROMPT_LENGTH" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
+  "${PIXEL_ARGS[@]}" \
   --generation_temperature "$GENERATION_TEMPERATURE" \
   --generation_top_p "$GENERATION_TOP_P" \
   --generation_top_k "$GENERATION_TOP_K" \

@@ -60,6 +60,11 @@ class OPDEvidenceScriptArguments(OPDScriptArguments):
     evidence_gate_tau: float = 0.1
     evidence_kl_threshold: float = 0.0
     evidence_mass_threshold: float = 0.0
+    # Cap image resolution => caps #visual tokens => caps the eager-attention S^2
+    # memory (the OOM lever for evidence). 0 = use the processor default (which can
+    # be ~12.8M px / thousands of visual tokens -> OOM under output_attentions).
+    max_pixels: int = 0
+    min_pixels: int = 0
 
 
 def main() -> None:
@@ -139,6 +144,25 @@ def main() -> None:
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+
+    # Cap image resolution to bound the eager-attention memory (evidence OOM lever).
+    if script_args.max_pixels > 0 or script_args.min_pixels > 0:
+        image_processor = getattr(processor, "image_processor", None)
+        if image_processor is not None:
+            size = getattr(image_processor, "size", None)
+            if script_args.max_pixels > 0:
+                image_processor.max_pixels = script_args.max_pixels
+                if isinstance(size, dict):
+                    size["longest_edge"] = script_args.max_pixels
+            if script_args.min_pixels > 0:
+                image_processor.min_pixels = script_args.min_pixels
+                if isinstance(size, dict):
+                    size["shortest_edge"] = script_args.min_pixels
+            if os.environ.get("LOCAL_RANK", "0") == "0":
+                print(
+                    f"Capped image_processor: min_pixels={getattr(image_processor, 'min_pixels', None)} "
+                    f"max_pixels={getattr(image_processor, 'max_pixels', None)} size={size}"
+                )
 
     # --- Student ----------------------------------------------------------------
     model_class, _ = _model_class_for_checkpoint(
