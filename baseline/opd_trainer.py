@@ -258,10 +258,19 @@ class OPDTrainer(ViGOSTrainer):
         _, completion_token_count, completion_token_total = self._distributed_rate_stats(
             completion_attention
         )
+        # Mean response length = total active completion tokens / number of rollout
+        # sequences. completion_token_ratio (active/total) sits near 1.0 and is not a
+        # length; this is the actual generated-tokens-per-response curve.
+        seq_indicator = completion_attention.new_ones(
+            (completion_attention.shape[0],), dtype=torch.float32
+        )
+        _, num_sequences, _ = self._distributed_rate_stats(seq_indicator)
         self._record_loss_metrics(
             {
+                # loss_opd is the per-token reverse KL KL(student||teacher) — the KL curve.
                 "loss_opd": (opd_loss_numerator, opd_loss_count),
                 "answer_accuracy": (answer_correct_count, answer_count),
+                "completion_length": (completion_token_count, num_sequences),
                 "completion_token_ratio": (
                     completion_token_count,
                     completion_token_total,
