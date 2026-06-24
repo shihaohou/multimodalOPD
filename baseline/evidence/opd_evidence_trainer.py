@@ -6,23 +6,25 @@ saliency evidence-alignment term:
     loss = lambda_opd * L_opd  +  lambda_evidence * L_evidence
 
 ``L_opd`` is exactly :class:`baseline.opd_trainer.OPDTrainer`'s reverse-KL token
-loss (the rollout is shared). ``L_evidence`` pulls the student's per-token
-saliency map toward the frozen teacher's, on a small subset of high-KL answer
-tokens, via the signed-Pearson divergence (see
-:mod:`baseline.evidence.evidence_loss`).
+loss; ``L_evidence`` pulls the student's per-token saliency map toward the frozen
+teacher's, on a small subset of high-KL answer tokens, via the gated
+signed-Pearson loss (see :mod:`baseline.evidence.evidence_loss`).
 
-Because the saliency engine needs in-graph attention weights, the evidence term
-runs a **second** student forward with ``output_attentions=True`` under the
-**eager** attention implementation (and a no-grad teacher forward). Eager
-``output_attentions`` over thousands of visual tokens is the dominant memory
-cost, so the evidence forward is restricted to ``evidence_max_samples`` rows of
-the batch and, optionally, a subset of decoder layers (``evidence_layers``). Tune
-these on the box after the Step-1 sanity check; if the evidence forward OOMs or
-returns no attentions (e.g. gradient checkpointing swallowing them), the step
-logs a warning and falls back to OPD-only for that step rather than crashing.
+**One forward, not two.** The saliency engine needs in-graph attention weights, so
+the student forward runs with ``output_attentions=True`` under the **eager**
+attention implementation. Crucially it is the SAME forward that produces the OPD
+logits — doing a second grad forward through the (DeepSpeed-wrapped) student would
+make ZeRO reduce each shared parameter's gradient twice in one backward
+("parameter ... has already been reduced"). So the OPD logits and the evidence
+attentions/hidden-states both come from a single forward; ``loss.backward()``
+traverses one graph and each parameter is reduced once.
 
-Only the ``local_hf`` teacher source is supported (the evidence term needs a full
-local teacher forward; the vLLM server returns only top-k logprobs).
+Because that single forward is eager + ``output_attentions`` over the whole
+micro-batch, the **evidence run wants a small ``per_device_train_batch_size``**
+(1-2) with higher grad-accum — eager attention over thousands of visual tokens is
+the dominant memory cost. Steps whose rollouts have no valid ``<reason>``+answer
+span (or when gradient checkpointing swallows the attentions) fall back to a
+cheap OPD-only forward. ``local_hf`` teacher only.
 """
 
 from __future__ import annotations
@@ -129,106 +131,45 @@ class OPDEvidenceTrainer(OPDTrainer):
         self._student_parts = None
         self._teacher_parts = None
 
-    # ------------------------------------------------------------------ helpers
-    def _subset_vision_inputs(
-        self, model_inputs: dict[str, torch.Tensor], sample_indices: list[int]
-    ) -> dict[str, torch.Tensor]:
-        """Slice a Qwen-VL model-input dict to ``sample_indices`` (one image/sample).
-
-        ``pixel_values`` is the per-image patch rows concatenated across the batch
-        (``image_grid_thw.prod(1)`` rows each), so it is sliced by cumulative
-        patch counts; ``input_ids`` / ``attention_mask`` / ``image_grid_thw`` are
-        row-selected.
-        """
-        device = model_inputs["input_ids"].device
-        idx = torch.as_tensor(sample_indices, device=device, dtype=torch.long)
-        out: dict[str, torch.Tensor] = {
-            "input_ids": model_inputs["input_ids"].index_select(0, idx),
-            "attention_mask": model_inputs["attention_mask"].index_select(0, idx),
-        }
-        grid = model_inputs.get("image_grid_thw")
-        if grid is not None:
-            out["image_grid_thw"] = grid.index_select(0, idx)
-            pixel_values = model_inputs.get("pixel_values")
-            if pixel_values is not None:
-                lengths = grid.prod(dim=1).tolist()
-                offsets = [0]
-                for length in lengths:
-                    offsets.append(offsets[-1] + int(length))
-                chunks = [
-                    pixel_values[offsets[b] : offsets[b + 1]] for b in sample_indices
-                ]
-                out["pixel_values"] = torch.cat(chunks, dim=0)
-        return out
-
     def _evidence_loss(
         self,
-        model: nn.Module,
+        unwrapped_student: nn.Module,
         student_prompt: dict[str, torch.Tensor],
         rollout: dict[str, torch.Tensor],
         completion_ids: torch.Tensor,
-        completion_attention: torch.Tensor,
+        spans_list: list,
+        valid_idx: list[int],
+        s_attentions: tuple[torch.Tensor, ...],
+        s_hidden: tuple[torch.Tensor, ...],
+        t_attentions: tuple[torch.Tensor, ...],
+        t_hidden: tuple[torch.Tensor, ...],
         student_logits_det: torch.Tensor,
         teacher_logits_det: torch.Tensor,
     ) -> tuple[torch.Tensor | None, dict[str, float]]:
-        """Saliency evidence-alignment loss over a bounded subset of answer tokens.
-
-        ``student_logits_det`` / ``teacher_logits_det`` are the detached OPD
-        completion logits ``[B, C, vocab]`` (reused for token selection — no extra
-        scoring forward).
-        """
-        tokenizer = getattr(self.processor, "tokenizer", self.processor)
-        spans_list = parse_batch_spans(tokenizer, completion_ids, completion_attention)
-        valid_idx = [b for b, s in enumerate(spans_list) if s.valid][
-            : self.evidence_max_samples
-        ]
-        if not valid_idx:
-            return None, {"ev_valid_samples": 0.0}
-
-        unwrapped = self.accelerator.unwrap_model(model)
+        """Saliency evidence-alignment loss from the ALREADY-computed attentions /
+        hidden states (no forward here — both models were forwarded once in
+        ``compute_loss``). ``*_logits_det`` are the detached OPD completion logits
+        ``[B, C, vocab]`` reused for token selection."""
         if self._student_parts is None:
-            self._student_parts = resolve_model_parts(unwrapped)
+            self._student_parts = resolve_model_parts(unwrapped_student)
         if self._teacher_parts is None:
             self._teacher_parts = resolve_model_parts(self.teacher_model)
         s_parts, t_parts = self._student_parts, self._teacher_parts
 
         prompt_length = int(student_prompt["input_ids"].shape[1])
-        student_full = self._with_completion(
-            student_prompt,
-            full_input_ids=rollout["generated_ids"],
-            full_attention_mask=rollout["generated_attention_mask"],
-        )
-        student_full.pop("logits_to_keep", None)
-        sub = self._subset_vision_inputs(student_full, valid_idx)
-
-        fwd_kwargs = dict(
-            output_attentions=True, output_hidden_states=True, use_cache=False
-        )
-        # student forward WITH grad; teacher forward NO grad — both eager.
-        with force_eager_attention(unwrapped):
-            s_out = model(**sub, **fwd_kwargs)
-        if not getattr(s_out, "attentions", None):
-            print(
-                "[OPD-evidence] student forward returned no attentions "
-                "(eager dispatch or gradient checkpointing?). Skipping evidence "
-                "this step.",
-                flush=True,
-            )
-            return None, {"ev_valid_samples": 0.0}
-        with torch.no_grad(), force_eager_attention(self.teacher_model):
-            t_out = self.teacher_model(**sub, **fwd_kwargs)
-
+        generated_ids = rollout["generated_ids"]
+        image_grid_thw = student_prompt.get("image_grid_thw")
         device = completion_ids.device
+
         loss_terms: list[torch.Tensor] = []
         corr_sum = 0.0
         gate_sum = 0.0
         n_tokens_total = 0
-        for j, b in enumerate(valid_idx):
+        for b in valid_idx:
             spans = spans_list[b]
             rs, re_ = spans.reason
             a_start, a_end = spans.answer
 
-            # rank answer tokens by teacher/student KL, keep the top fraction.
             ans_slice = slice(a_start, a_end + 1)
             kl = per_token_kl(
                 student_logits_det[b, ans_slice],
@@ -244,7 +185,7 @@ class OPDEvidenceTrainer(OPDTrainer):
             )
             if sel.numel() == 0:
                 continue
-            sel_completion = (torch.arange(a_start, a_end + 1, device=device))[sel]
+            sel_completion = torch.arange(a_start, a_end + 1, device=device)[sel]
             answer_q = (prompt_length + sel_completion - 1).clamp_min(0)
             reason_k = prompt_length + torch.arange(rs, re_ + 1, device=device)
             reason_q = (
@@ -252,21 +193,20 @@ class OPDEvidenceTrainer(OPDTrainer):
             ).clamp_min(0)
             direction_ids = completion_ids[b, sel_completion]
 
-            sub_ids = sub["input_ids"][j]
-            visual_positions = (sub_ids == s_parts.image_token_id).nonzero(
+            visual_positions = (generated_ids[b] == s_parts.image_token_id).nonzero(
                 as_tuple=True
             )[0]
-            grid = sub["image_grid_thw"][j]
+            grid = image_grid_thw[b]
             grid_hw = (
                 int(grid[1]) // s_parts.spatial_merge_size,
                 int(grid[2]) // s_parts.spatial_merge_size,
             )
 
             student_maps = compute_token_saliency_maps(
-                unwrapped,
-                s_out.attentions,
-                s_out.hidden_states,
-                batch_index=j,
+                unwrapped_student,
+                s_attentions,
+                s_hidden,
+                batch_index=b,
                 answer_query_positions=answer_q,
                 reason_key_positions=reason_k,
                 reason_query_positions=reason_q,
@@ -280,9 +220,9 @@ class OPDEvidenceTrainer(OPDTrainer):
             with torch.no_grad():
                 teacher_maps = compute_token_saliency_maps(
                     self.teacher_model,
-                    t_out.attentions,
-                    t_out.hidden_states,
-                    batch_index=j,
+                    t_attentions,
+                    t_hidden,
+                    batch_index=b,
                     answer_query_positions=answer_q,
                     reason_key_positions=reason_k,
                     reason_query_positions=reason_q,
@@ -311,7 +251,6 @@ class OPDEvidenceTrainer(OPDTrainer):
 
         if not loss_terms:
             return None, {"ev_valid_samples": float(len(valid_idx))}
-
         loss = torch.stack(loss_terms).mean()
         stats = {
             "ev_valid_samples": float(len(valid_idx)),
@@ -321,7 +260,6 @@ class OPDEvidenceTrainer(OPDTrainer):
         }
         return loss, stats
 
-    # --------------------------------------------------------------- main loss
     def compute_loss(
         self,
         model: nn.Module,
@@ -333,37 +271,79 @@ class OPDEvidenceTrainer(OPDTrainer):
         rollout = self._generate_on_policy(model, student_prompt, inputs)
         completion_ids = rollout["completion_ids"]
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)
+        completion_length = completion_ids.shape[1]
 
-        # --- OPD token loss (mirror OPDTrainer, local_hf path) -----------------
+        # Decide whether evidence runs this step (needs valid <reason>+answer spans).
+        spans_list = None
+        valid_idx: list[int] = []
+        if self.lambda_evidence > 0:
+            tokenizer = getattr(self.processor, "tokenizer", self.processor)
+            spans_list = parse_batch_spans(tokenizer, completion_ids, completion_attention)
+            valid_idx = [b for b, s in enumerate(spans_list) if s.valid][
+                : self.evidence_max_samples
+            ]
+        run_evidence = bool(valid_idx)
+        unwrapped = self.accelerator.unwrap_model(model)
+
+        # --- SINGLE student forward (one grad graph; see module docstring) ------
         student_inputs = self._with_completion(
             student_prompt,
             full_input_ids=rollout["generated_ids"],
             full_attention_mask=rollout["generated_attention_mask"],
         )
-        student_inputs["logits_to_keep"] = completion_ids.shape[1] + 1
-        student_outputs = model(**student_inputs)
+        student_inputs["logits_to_keep"] = completion_length + 1
+        if run_evidence:
+            with force_eager_attention(unwrapped):
+                student_outputs = model(
+                    **student_inputs, output_attentions=True, output_hidden_states=True
+                )
+            if not getattr(student_outputs, "attentions", None):
+                print(
+                    "[OPD-evidence] student forward returned no attentions (gradient "
+                    "checkpointing?); OPD-only this step. Set GRADIENT_CHECKPOINTING=false "
+                    "to enable evidence.",
+                    flush=True,
+                )
+                run_evidence = False
+        else:
+            student_outputs = model(**student_inputs)
         student_logits = self._completion_logits(
-            student_outputs.logits, completion_ids.shape[1]
+            student_outputs.logits, completion_length
         )
-        del student_outputs
+        s_attentions = student_outputs.attentions if run_evidence else None
+        s_hidden = student_outputs.hidden_states if run_evidence else None
 
+        # --- teacher forward (frozen, no grad) ---------------------------------
         teacher_inputs = self._append_completion(
             student_prompt, completion_ids, rollout["completion_attention_mask"]
         )
-        teacher_logits = self._batched_teacher_completion_logits(
-            self.teacher_model,
-            [
-                {
-                    "name": "opd",
-                    "inputs": teacher_inputs,
-                    "completion_length": completion_ids.shape[1],
-                }
-            ],
-        )["opd"]
+        t_attentions = t_hidden = None
+        if run_evidence:
+            teacher_inputs["logits_to_keep"] = completion_length + 1
+            with torch.no_grad(), force_eager_attention(self.teacher_model):
+                t_out = self.teacher_model(
+                    **teacher_inputs,
+                    output_attentions=True,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+            teacher_logits = self._completion_logits(t_out.logits, completion_length)
+            t_attentions, t_hidden = t_out.attentions, t_out.hidden_states
+        else:
+            teacher_logits = self._batched_teacher_completion_logits(
+                self.teacher_model,
+                [
+                    {
+                        "name": "opd",
+                        "inputs": teacher_inputs,
+                        "completion_length": completion_length,
+                    }
+                ],
+            )["opd"]
+
         vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
         student_kl_logits = student_logits[..., :vocab].float()
         teacher_kl_logits = teacher_logits[..., :vocab].float()
-        del teacher_logits
         opd_loss = masked_topk_kl_loss(
             student_kl_logits,
             teacher_kl_logits,
@@ -387,16 +367,21 @@ class OPDEvidenceTrainer(OPDTrainer):
         )
         loss = self.lambda_opd * opd_loss
 
-        # --- evidence alignment loss -------------------------------------------
+        # --- evidence alignment loss (same single forward's attentions) --------
         evidence_loss_value = 0.0
         evidence_stats: dict[str, float] = {}
-        if self.lambda_evidence > 0:
+        if run_evidence:
             ev_loss, evidence_stats = self._evidence_loss(
-                model,
+                unwrapped,
                 student_prompt,
                 rollout,
                 completion_ids,
-                completion_attention,
+                spans_list,
+                valid_idx,
+                s_attentions,
+                s_hidden,
+                t_attentions,
+                t_hidden,
                 student_kl_logits.detach(),
                 teacher_kl_logits.detach(),
             )
@@ -404,7 +389,7 @@ class OPDEvidenceTrainer(OPDTrainer):
                 loss = loss + self.lambda_evidence * ev_loss
                 evidence_loss_value = float(ev_loss.detach())
 
-        # --- metrics (mirror OPDTrainer + evidence) ----------------------------
+        # --- metrics -----------------------------------------------------------
         rollout_answer_correct = self._rollout_answer_correctness(inputs, rollout)
         _, answer_correct_count, answer_count = self._distributed_rate_stats(
             rollout_answer_correct

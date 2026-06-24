@@ -45,7 +45,11 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-3}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
+# The evidence forward is a SINGLE eager output_attentions pass over the whole
+# micro-batch (it also serves the OPD logits — a 2nd grad forward would double-
+# reduce grads under DeepSpeed). Eager attention over thousands of visual tokens
+# is the memory wall, so keep per_device SMALL (1-2) and raise grad_accum.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
@@ -68,8 +72,9 @@ TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 
 # --- evidence-alignment knobs ------------------------------------------------
 LAMBDA_EVIDENCE="${LAMBDA_EVIDENCE:-1.0}"
-# Rows of each micro-batch the eager evidence forward runs on. Keep small —
-# eager output_attentions over thousands of visual tokens is the OOM point.
+# How many rows of the micro-batch get a saliency map (capped by per_device). The
+# eager forward already covers the whole micro-batch; this just bounds the engine
+# work, so keeping per_device small is what bounds memory.
 EVIDENCE_MAX_SAMPLES="${EVIDENCE_MAX_SAMPLES:-1}"
 # Comma list of decoder layers to sum saliency over (empty = all).
 EVIDENCE_LAYERS="${EVIDENCE_LAYERS:-}"
@@ -93,10 +98,11 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_COMPLETION_
 VLLM_MAX_NUM_SEQS="${VLLM_MAX_NUM_SEQS:-$((PER_DEVICE_TRAIN_BATCH_SIZE * VLLM_TENSOR_PARALLEL_SIZE))}"
 COMPLETION_LOG_STEPS="${COMPLETION_LOG_STEPS:-0}"
 COMPLETION_LOG_MAX_SAMPLES="${COMPLETION_LOG_MAX_SAMPLES:-16}"
-# Gradient checkpointing can swallow output_attentions on some stacks (the
-# trainer then logs a warning and skips evidence). If loss_ev never appears,
-# set GRADIENT_CHECKPOINTING=false (costs memory) or lower the batch.
-GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
+# Off by default for evidence: gradient checkpointing can swallow
+# output_attentions (the trainer would then warn + skip evidence). At per_device 1
+# the activation memory is small enough to drop it. Turn back on (and lower the
+# batch) only if you hit OOM and can confirm attentions still flow.
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
 SAVE_STEPS="${SAVE_STEPS:-5}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-100}"
 SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-true}"
