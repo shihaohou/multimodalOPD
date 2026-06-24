@@ -80,8 +80,30 @@ Defaults / cleanup:
 - **Removed the valid-vocab mask** — GPT's hypothesis; a no-op on a trained model.
 - **`WANDB_MODE=online`** default in the launcher.
 
+## Current task: evidence-reliance probe (go/no-go "命门" experiment)
+
+`baseline/probe/` (new) — a **no-train** diagnostic that decides whether OPD is
+worth running, before training. Question: standard OPD transfers the teacher's
+*output behavior*, but does it transfer the teacher's *use of visual evidence*?
+
+Uses `peterant330/saliency-r1-8k` (each sample has a GT evidence bbox, normalized
+`"[x1,y1,x2,y2]"` string; subsets CUB yes/no + DocVQA text). Per model, answers
+each sample under `full` / `mask_evidence` / `mask_random` (equal-shape control) /
+`crop@pad`, then:
+- `Reliance = Acc_mask_random − Acc_mask_evidence` (evidence-causal signal)
+- `Delta_RG = Acc_crop − Acc_full` (region-grounding gap)
+with paired bootstrap CIs, reported **per subset** (CUB's ~50% floor would wash out
+a pooled number). **GO** if teacher Reliance CI-low > 0 (+ teacher Delta_RG <
+student); **STOP** if Reliance ≈ 0 everywhere. Pipeline + run block:
+`baseline/probe/README.md`. Built + analyzer validated on synthetic data;
+**needs the box** to run (Stage 0). Open: confirm MMR1-7B-RL / MMR1-3B-SFT /
+Saliency-R1-7B checkpoint paths on the box.
+
 ## Next / open items (for new planning)
 
+- [ ] **Run Stage 0 probe** on teacher=MMR1-7B-RL vs student-before=MMR1-3B-SFT
+      (then candidates). GO → Stage 1: short vanilla token-KL OPD ckpt, re-probe
+      1a (output convergence) + 1b (re-run this probe on the trained student).
 - [ ] **Finish + eval the Qwen3 8B→2B run** (`baseline/eval/`, `scripts/eval_opd.sh`:
       pass@k / avg@k, LLM judge). Compare vs base 2B (no-train) baseline.
 - [ ] **GRPO teacher**: swap `TEACHER_MODEL` to the GRPO-trained (merged) Qwen3-VL-8B
