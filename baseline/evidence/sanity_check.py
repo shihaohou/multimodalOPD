@@ -44,13 +44,28 @@ from baseline.evidence.saliency_engine import (
 from baseline.evidence.span_utils import parse_completion_spans
 
 
+# Default teacher-forced completion: well-formed OPD output (reasoning + \boxed{}).
+# Used so the engine sanity check does NOT depend on whether the base model
+# happens to emit the format when sampled (it often does not, especially on a
+# synthetic image). Pass --sample to sample on-policy instead.
+DEFAULT_RESPONSE = (
+    "<reason>The image shows a man in a small boat on a river, holding a long "
+    "object in his hands that he uses to move the boat through the water.</reason> "
+    "The object is a \\boxed{paddle}."
+)
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Standalone saliency-engine sanity check.")
     p.add_argument("--student_model", default="Qwen/Qwen2.5-VL-3B-Instruct")
     p.add_argument("--teacher_model", default=None, help="Optional; enables the grid-consistency check.")
     p.add_argument("--attn", default="eager", help="attn_implementation (must support output_attentions).")
     p.add_argument("--dtype", default="bfloat16")
-    p.add_argument("--max_new_tokens", type=int, default=64)
+    p.add_argument("--max_new_tokens", type=int, default=128)
+    p.add_argument("--sample", action="store_true",
+                   help="Sample an on-policy completion instead of teacher-forcing --response.")
+    p.add_argument("--response", default=DEFAULT_RESPONSE,
+                   help="Completion to teacher-force (default has <reason> + \\boxed{}).")
     p.add_argument("--image", default=None, help="Image path; default pulls one from saliency-r1-8k.")
     p.add_argument("--question", default="What is shown in the image? Answer briefly.")
     p.add_argument("--layers", default=None, help="Comma list of decoder layers to sum (default all).")
@@ -129,13 +144,20 @@ def main() -> None:
     inputs = _build_inputs(processor, image, args.question)
     prompt_length = int(inputs["input_ids"].shape[1])
 
-    # --- sample one on-policy completion (no grad) -----------------------------
-    with torch.no_grad():
-        gen = student.generate(
-            **inputs, max_new_tokens=args.max_new_tokens, do_sample=True, temperature=1.0
-        )
-    full_ids = gen[0]
-    completion_ids = full_ids[prompt_length:]
+    # --- get a completion: teacher-forced canned response (default) or sampled --
+    if args.sample:
+        with torch.no_grad():
+            gen = student.generate(
+                **inputs, max_new_tokens=args.max_new_tokens, do_sample=True, temperature=1.0
+            )
+        full_ids = gen[0]
+        completion_ids = full_ids[prompt_length:]
+    else:
+        resp_ids = tokenizer(
+            args.response, add_special_tokens=False, return_tensors="pt"
+        ).input_ids[0].to(inputs["input_ids"].device)
+        completion_ids = resp_ids
+        full_ids = torch.cat([inputs["input_ids"][0], completion_ids], dim=0)
     spans = parse_completion_spans(tokenizer, completion_ids.tolist())
     print(f"[sanity] completion spans valid={spans.valid} reason={spans.reason} answer={spans.answer}")
     print(f"[sanity] completion text:\n{spans.text[:400]}")

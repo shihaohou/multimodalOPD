@@ -45,6 +45,27 @@ def _strip_ws(text: str, start: int, end: int) -> tuple[int, int]:
     return start, end
 
 
+def _find_boxed_span(text: str, marker: str = r"\boxed{") -> tuple[int, int, int] | None:
+    """Locate the final ``\\boxed{...}``; returns ``(marker_start, inner_start,
+    inner_end)`` with balanced-brace matching (``inner_end`` = the matching ``}``
+    or end-of-text if unterminated). None if no ``\\boxed{``."""
+    i = text.rfind(marker)
+    if i == -1:
+        return None
+    inner_start = i + len(marker)
+    depth = 1
+    k = inner_start
+    while k < len(text):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    return i, inner_start, k
+
+
 def find_char_spans(
     text: str,
     *,
@@ -52,24 +73,42 @@ def find_char_spans(
     reason_close: str = REASON_CLOSE,
     turn_end: str = TURN_END,
 ) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-    """(reason_char_span, answer_char_span); either may be None."""
-    ro = text.find(reason_open)
-    rc = text.find(reason_close, ro + len(reason_open) if ro != -1 else 0)
-    reason: tuple[int, int] | None = None
-    answer: tuple[int, int] | None = None
+    """(reason_char_span, answer_char_span); either may be None.
 
+    Robust to the base model not emitting literal ``<reason>`` tags: the **answer**
+    prefers the inner content of the final ``\\boxed{...}`` (which OPD already
+    relies on for answer accuracy); the **reason** prefers ``<reason>...</reason>``
+    but falls back to everything before the ``\\boxed{``. So a free-form
+    "reasoning then \\boxed{ans}" completion (the common case) still yields a
+    reason+answer split, not just tagged ones.
+    """
+    boxed = _find_boxed_span(text)
+    answer: tuple[int, int] | None = None
+    boxed_start: int | None = None
+    if boxed is not None:
+        b_start, inner_start, inner_end = boxed
+        a0, a1 = _strip_ws(text, inner_start, inner_end)
+        if a1 > a0:
+            answer = (a0, a1)
+            boxed_start = b_start
+
+    reason: tuple[int, int] | None = None
+    ro = text.find(reason_open)
+    rc = text.find(reason_close, ro + len(reason_open)) if ro != -1 else -1
     if ro != -1 and rc != -1 and rc > ro:
-        rs, re_ = _strip_ws(text, ro + len(reason_open), rc)
-        if re_ > rs:
-            reason = (rs, re_)
-        a_start = rc + len(reason_close)
-        a_end = len(text)
-        te = text.find(turn_end, a_start)
-        if te != -1:
-            a_end = te
-        a_start, a_end = _strip_ws(text, a_start, a_end)
-        if a_end > a_start:
-            answer = (a_start, a_end)
+        r0, r1 = _strip_ws(text, ro + len(reason_open), rc)
+        if r1 > r0:
+            reason = (r0, r1)
+        if answer is None:  # tagged but no \boxed{}: answer = text after </reason>
+            a_end = text.find(turn_end, rc + len(reason_close))
+            a_end = a_end if a_end != -1 else len(text)
+            a0, a1 = _strip_ws(text, rc + len(reason_close), a_end)
+            if a1 > a0:
+                answer = (a0, a1)
+    elif boxed_start is not None:  # no tags: reason = everything before \boxed{
+        r0, r1 = _strip_ws(text, 0, boxed_start)
+        if r1 > r0:
+            reason = (r0, r1)
     return reason, answer
 
 
