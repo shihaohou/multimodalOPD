@@ -63,27 +63,35 @@ export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 uv run python baseline/probe/inspect_saliency.py \
     --dataset $D/saliency-r1-8k --num-sheets 16 --output-dir probe_outputs/inspect
 
-# 1) One probe run per model (greedy, rule-graded, no API). ~hundreds of samples
-#    × 8 conditions = minutes on one H800. Run candidates on different GPUs.
-#    SUBSETS picks the clean tier; MAX_BBOX_AREA=0.5 (default) drops huge boxes.
-SUB=textvqa,textcap,docvqa,infographicsvqa,gqa,openimages
-CUDA_VISIBLE_DEVICES=0 DATASET=$D/saliency-r1-8k SUBSETS=$SUB MODEL_PATH=$M/MMR1-7B-RL  MODEL_NAME=MMR1-7B-RL  bash scripts/probe_stage0.sh
-CUDA_VISIBLE_DEVICES=1 DATASET=$D/saliency-r1-8k SUBSETS=$SUB MODEL_PATH=$M/MMR1-3B-SFT MODEL_NAME=MMR1-3B-SFT bash scripts/probe_stage0.sh
+# 1) Probe the whole model matrix, one GPU per model, in parallel (greedy,
+#    rule-graded, no API). Defaults to the 7 candidates below; ~20-30 min.
+#    Check the printed Acc_full recap is sane (not ~0); if a model's Acc_full is
+#    suppressed, give it its native format via --system-prompt / --no-system-prompt.
+bash scripts/probe_stage0_all.sh
+#    (or one model: SUBSETS=$SUB MODEL_PATH=$M/MMR1-7B-RL MODEL_NAME=MMR1-7B-RL bash scripts/probe_stage0.sh)
 
-# Check the printed Acc_full per model is sane (not ~0). If a reasoning model's
-# Acc_full looks suppressed, give it its native prompt: --system-prompt "..." or
-# --no-system-prompt (env: pass through the script).
-
-# 2) Aggregate -> Reliance / Delta_RG + bootstrap CIs + GO/STOP verdict.
+# 2) Aggregate ALL models -> per-model tables, then gate one OPD pair (same vocab
+#    family!) for the GO/STOP verdict. Re-run --teacher/--student for other pairs.
+P=probe_outputs/stage0
 uv run python baseline/probe/analyze_stage0.py \
-    --model teacher=probe_outputs/stage0/MMR1-7B-RL \
-    --model student=probe_outputs/stage0/MMR1-3B-SFT \
-    --teacher teacher --student student \
-    --output probe_outputs/stage0/summary.json
+    --model MMR1-7B-RL=$P/MMR1-7B-RL --model Saliency-R1-7B=$P/Saliency-R1-7B \
+    --model Qwen2.5-VL-7B=$P/Qwen2.5-VL-7B --model Qwen3-VL-8B=$P/Qwen3-VL-8B \
+    --model MMR1-3B-SFT=$P/MMR1-3B-SFT --model Qwen2.5-VL-3B=$P/Qwen2.5-VL-3B \
+    --model Qwen3-VL-2B=$P/Qwen3-VL-2B \
+    --teacher MMR1-7B-RL --student MMR1-3B-SFT --output $P/summary.json
 ```
 
-Add more teacher candidates (Saliency-R1-7B, Qwen2.5-VL-7B, Qwen3-VL-8B) as extra
-`--model label=...` inputs to compare the pattern across teachers.
+The model matrix (set in `scripts/probe_stage0_all.sh`, all on the box):
+
+| | Qwen2.5-VL family (interchangeable for OPD) | Qwen3-VL family |
+|---|---|---|
+| **Teacher** | `MMR1-7B-RL` · `Saliency-R1-7B` · `Qwen2.5-VL-7B` | `Qwen3-VL-8B` |
+| **Student** | `MMR1-3B-SFT` · `Qwen2.5-VL-3B` | `Qwen3-VL-2B` |
+
+Stage 0 probes each model independently; OPD pairs must share a vocab family.
+Read `Reliance` next to `Acc_full` — a model with very low `Acc_full` has little
+Reliance dynamic range; the best OPD teacher is the one with the **highest**
+Reliance (most evidence-grounded) paired to a **low-**Reliance student.
 
 ## Files
 | File | Role |
