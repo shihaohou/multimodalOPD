@@ -52,6 +52,10 @@ def parse_args() -> argparse.Namespace:
                    help="Drop samples whose evidence box exceeds this area frac (random-mask "
                    "control needs room). 0 / negative disables.")
     p.add_argument("--min-bbox-area", type=float, default=None, help="Drop boxes smaller than this area frac.")
+    # Data parallel: shard samples across GPUs, one process per shard, then cat the
+    # per_sample.jsonl files. Selection is deterministic so shards tile the full set.
+    p.add_argument("--num-shards", type=int, default=1, help="Split samples across N processes/GPUs.")
+    p.add_argument("--shard-index", type=int, default=0, help="Which shard [0, num_shards) this process runs.")
     # conditions
     p.add_argument("--mask-fill", default="gray", choices=["gray", "black", "mean", "blur"])
     p.add_argument("--n-rand", type=int, default=3, help="Random equal-shape masks to average.")
@@ -235,13 +239,18 @@ def main() -> None:
     out_dir = Path(args.output_dir) / model_name
     (out_dir / "sanity").mkdir(parents=True, exist_ok=True)
 
+    if not (0 <= args.shard_index < args.num_shards):
+        raise SystemExit(f"--shard-index {args.shard_index} out of range [0, {args.num_shards}).")
     max_area = args.max_bbox_area if (args.max_bbox_area and args.max_bbox_area > 0) else None
     samples = load_saliency_samples(
         args.dataset, args.split, limit=args.limit, subsets=subsets,
         max_bbox_area=max_area, min_bbox_area=args.min_bbox_area,
     )
+    if args.num_shards > 1:
+        samples = samples[args.shard_index :: args.num_shards]
+        print(f"[stage0] shard {args.shard_index}/{args.num_shards}: {len(samples)} samples this process")
     if not samples:
-        raise SystemExit("No samples loaded -- check --dataset / --subsets / --limit.")
+        raise SystemExit("No samples loaded -- check --dataset / --subsets / --limit / shard.")
 
     # Sanity montages (cheap; helps catch a bbox-mapping bug before/without GPU).
     rng = np.random.default_rng(args.mask_seed)
@@ -289,6 +298,8 @@ def main() -> None:
         "subsets": subsets,
         "max_bbox_area": max_area,
         "min_bbox_area": args.min_bbox_area,
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
         "n_samples": len(samples),
         "subset_counts": dict(counts),
         "sample_ids": [s.sample_id for s in samples],

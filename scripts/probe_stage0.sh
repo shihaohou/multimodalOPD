@@ -42,6 +42,8 @@ N_RAND="${N_RAND:-3}"
 CROP_PADS="${CROP_PADS:-0,0.1,0.2}"
 MASK_SEED="${MASK_SEED:-1234}"
 SANITY_DUMP="${SANITY_DUMP:-8}"
+NUM_SHARDS="${NUM_SHARDS:-1}"        # data-parallel: split samples across N GPUs
+SHARD_INDEX="${SHARD_INDEX:-0}"
 
 PROMPT_SUFFIX="${PROMPT_SUFFIX:-}"
 SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"          # override the system prompt (else OPD default)
@@ -75,6 +77,8 @@ CMD=(
   --split "$SPLIT"
   --limit "$LIMIT"
   --max-bbox-area "$MAX_BBOX_AREA"
+  --num-shards "$NUM_SHARDS"
+  --shard-index "$SHARD_INDEX"
   --mask-fill "$MASK_FILL"
   --n-rand "$N_RAND"
   --crop-pads "$CROP_PADS"
