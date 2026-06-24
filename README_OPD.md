@@ -55,10 +55,12 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/__init__.py` | Package marker for the `baseline` namespace. |
 | `baseline/eval/opd_eval_prompt.py` | General eval prompt (dataset problem + suffix, no prefill). |
 | `baseline/eval/run_opd_eval.py` | General multi-benchmark eval harness (vLLM gen + LLM judge + pass@k/avg@k). |
+| `baseline/eval/run_mmvp_eval.py` | MMVP pair-metric MCQ eval (vLLM gen + rule MCQ match, **no judge**; single-question + pair accuracy). |
 | `baseline/serve_teacher.py` | vLLM teacher scoring server (`/score_topk`, top-k `prompt_logprobs`). |
 | `baseline/teacher_client.py` | HTTP client the trainer uses for the `vllm_server` teacher. |
 | `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
 | `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
+| `scripts/eval_mmvp.sh` | MMVP eval launcher (runs `baseline/eval/run_mmvp_eval.py`). |
 | `scripts/serve_teacher_vllm.sh` | Launch the teacher scoring server. |
 
 ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
@@ -282,6 +284,29 @@ Caveats: HallusionBench here ≈ aAcc only (not fAcc/qAcc); MMMU-Pro = average t
 `mmmu_pro_10options` + `mmmu-pro-vision` sub-scores; ChartQA + the official
 per-benchmark metrics → use VLMEvalKit / lmms-eval.
 
+### MMVP (pair metric — visual-perception / ViT-unfreeze probe)
+
+MMVP (Tong et al., *Eyes Wide Shut?*, CVPR 2024) = 150 CLIP-blind image **pairs**
+→ 300 binary MCQs. The two images in a pair differ by a single fine visual
+attribute, so the **pair metric** (a pair scores 1 only if *both* questions are
+correct) cannot be gamed by a language prior — a clean check on whether unfreezing
+the ViT during OPD genuinely improved general visual perception or catastrophically
+degraded it. Dedicated, deterministic, **no LLM judge** (option-letter match), run
+under the unified OPD system prompt; separate from the general harness.
+
+```bash
+# greedy single-sample (canonical MMVP); writes summary.json with pair_accuracy
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> bash scripts/eval_mmvp.sh
+# smoke test on 4 questions first:
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> LIMIT=4 bash scripts/eval_mmvp.sh
+```
+
+`summary.json` → `metrics.pair_accuracy` (headline, greedy), plus `pair_pass_at_k`,
+`question_accuracy`, `question_avg_at_k`. Knobs (env): `MMVP_REPO` (default
+`MMVP/MMVP`), `IMAGE_DIR`, `PAIR_SIZE` (2), `LIMIT`, `PASS_K` / `GEN_TEMPERATURE`
+(raise temperature if `PASS_K>1`), `OUTPUT_DIR`. Per-category buckets populate only
+if the source CSV carries a category column.
+
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:
 
@@ -308,6 +333,9 @@ MODEL_PATH=runs/opd_qwen25_3b_merged bash scripts/eval_opd.sh
 - [x] General multi-benchmark evaluation harness (`baseline/eval/`, dataset prompt,
       pass@k/avg@k, LLM judge) — generic-dataset path; bespoke benchmarks reused
       from `vigos.eval_benchmarks`.
+- [x] MMVP pair-metric eval (`baseline/eval/run_mmvp_eval.py`) — deterministic
+      MCQ/pair scorer (no judge); probes whether unfreezing the ViT in OPD helped
+      or hurt general visual perception.
 - [ ] Model/architecture experiments (e.g. attention modifications) on the student.
 - [ ] Optional completion-sample logging for OPD rollouts.
 - [x] Top-k KL loss (`topk_kl`, forward/reverse/jsd) — local HF teacher.
