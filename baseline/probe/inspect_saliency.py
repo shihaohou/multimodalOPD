@@ -30,7 +30,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="peterant330/saliency-r1-8k")
     p.add_argument("--split", default="train")
     p.add_argument("--limit", type=int, default=200, help="Per-subset cap.")
-    p.add_argument("--subsets", default=None, help="Comma list e.g. CUB,DocVQA.")
+    p.add_argument("--subsets", default=None, help="Comma list e.g. textvqa,docvqa.")
+    p.add_argument("--max-bbox-area", type=float, default=None, help="Drop boxes larger than this area frac.")
+    p.add_argument("--min-bbox-area", type=float, default=None, help="Drop boxes smaller than this area frac.")
     p.add_argument("--num-sheets", type=int, default=16, help="Overlay montages to dump.")
     p.add_argument("--mask-fill", default="gray", choices=["gray", "black", "mean", "blur"])
     p.add_argument("--crop-pads", default="0,0.1,0.2")
@@ -45,7 +47,8 @@ def main() -> None:
     pads = tuple(float(x) for x in args.crop_pads.split(",") if x.strip() != "")
 
     samples = load_saliency_samples(
-        args.dataset, args.split, limit=args.limit, subsets=subsets
+        args.dataset, args.split, limit=args.limit, subsets=subsets,
+        max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area,
     )
     if not samples:
         raise SystemExit("No samples loaded -- check --dataset / --subsets.")

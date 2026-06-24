@@ -33,7 +33,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-probe_outputs/stage0}"
 DATASET="${DATASET:-peterant330/saliency-r1-8k}"
 SPLIT="${SPLIT:-train}"
 LIMIT="${LIMIT:-200}"            # per-subset cap
-SUBSETS="${SUBSETS:-}"           # e.g. CUB,DocVQA (default all)
+SUBSETS="${SUBSETS:-}"           # e.g. textvqa,textcap,docvqa (default all)
+MAX_BBOX_AREA="${MAX_BBOX_AREA:-0.5}"   # drop near-whole-image boxes (random control needs room)
+MIN_BBOX_AREA="${MIN_BBOX_AREA:-}"
 
 MASK_FILL="${MASK_FILL:-gray}"   # gray|black|mean|blur
 N_RAND="${N_RAND:-3}"
@@ -69,6 +71,7 @@ CMD=(
   --dataset "$DATASET"
   --split "$SPLIT"
   --limit "$LIMIT"
+  --max-bbox-area "$MAX_BBOX_AREA"
   --mask-fill "$MASK_FILL"
   --n-rand "$N_RAND"
   --crop-pads "$CROP_PADS"
@@ -93,6 +96,7 @@ CMD=(
   --judge-workers "$JUDGE_WORKERS"
 )
 if [[ -n "$SUBSETS" ]]; then CMD+=(--subsets "$SUBSETS"); fi
+if [[ -n "$MIN_BBOX_AREA" ]]; then CMD+=(--min-bbox-area "$MIN_BBOX_AREA"); fi
 if [[ -n "$VLLM_MAX_MODEL_LEN" ]]; then CMD+=(--max-model-len "$VLLM_MAX_MODEL_LEN"); fi
 
 echo "[probe_stage0] model=$MODEL_NAME  gpu=$CUDA_VISIBLE_DEVICES  out=$OUTPUT_DIR/$MODEL_NAME"

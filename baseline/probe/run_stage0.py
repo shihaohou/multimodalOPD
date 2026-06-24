@@ -47,7 +47,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="peterant330/saliency-r1-8k")
     p.add_argument("--split", default="train")
     p.add_argument("--limit", type=int, default=200, help="Per-subset sample cap.")
-    p.add_argument("--subsets", default=None, help="Comma list e.g. CUB,DocVQA (default all).")
+    p.add_argument("--subsets", default=None, help="Comma list e.g. textvqa,docvqa (default all).")
+    p.add_argument("--max-bbox-area", type=float, default=0.5,
+                   help="Drop samples whose evidence box exceeds this area frac (random-mask "
+                   "control needs room). 0 / negative disables.")
+    p.add_argument("--min-bbox-area", type=float, default=None, help="Drop boxes smaller than this area frac.")
     # conditions
     p.add_argument("--mask-fill", default="gray", choices=["gray", "black", "mean", "blur"])
     p.add_argument("--n-rand", type=int, default=3, help="Random equal-shape masks to average.")
@@ -231,7 +235,11 @@ def main() -> None:
     out_dir = Path(args.output_dir) / model_name
     (out_dir / "sanity").mkdir(parents=True, exist_ok=True)
 
-    samples = load_saliency_samples(args.dataset, args.split, limit=args.limit, subsets=subsets)
+    max_area = args.max_bbox_area if (args.max_bbox_area and args.max_bbox_area > 0) else None
+    samples = load_saliency_samples(
+        args.dataset, args.split, limit=args.limit, subsets=subsets,
+        max_bbox_area=max_area, min_bbox_area=args.min_bbox_area,
+    )
     if not samples:
         raise SystemExit("No samples loaded -- check --dataset / --subsets / --limit.")
 
@@ -279,6 +287,8 @@ def main() -> None:
         "split": args.split,
         "limit_per_subset": args.limit,
         "subsets": subsets,
+        "max_bbox_area": max_area,
+        "min_bbox_area": args.min_bbox_area,
         "n_samples": len(samples),
         "subset_counts": dict(counts),
         "sample_ids": [s.sample_id for s in samples],

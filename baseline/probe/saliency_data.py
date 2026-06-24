@@ -123,20 +123,30 @@ def _load_hf_split(dataset: str, split: str):
         raise
 
 
+def bbox_area(bbox: BoxNorm) -> float:
+    x1, y1, x2, y2 = bbox
+    return (x2 - x1) * (y2 - y1)
+
+
 def load_saliency_samples(
     dataset: str = "peterant330/saliency-r1-8k",
     split: str = "train",
     *,
     limit: int | None = None,
     subsets: list[str] | None = None,
+    max_bbox_area: float | None = None,
+    min_bbox_area: float | None = None,
 ) -> list[SaliencySample]:
     """Load probe samples (those with a valid evidence bbox).
 
-    ``limit`` is a **per-subset** cap (so both CUB and DocVQA are covered in one
-    run; CUB has only ~80 samples). ``subsets`` optionally restricts to e.g.
-    ``["CUB"]`` / ``["DocVQA"]``. Selection is deterministic in dataset order, so
-    two model runs with the same args see identical samples (required for the
-    paired analysis).
+    ``limit`` is a **per-subset** cap (so every subset is covered in one run; some
+    have only ~70-80 samples). ``subsets`` optionally restricts to a set of subset
+    names (case-insensitive, e.g. ``["textvqa", "docvqa"]``). ``max_bbox_area`` /
+    ``min_bbox_area`` filter by evidence-box area (fraction of image) -- set
+    ``max_bbox_area`` (e.g. 0.5) to drop near-whole-image boxes where the
+    equal-area random-mask control can't be placed disjointly (which would dilute
+    Reliance toward 0). Selection is deterministic in dataset order, so two model
+    runs with the same args see identical samples (required for the paired analysis).
     """
     data = _load_hf_split(dataset, split)
     subset_filter = {s.strip().lower() for s in subsets} if subsets else None
@@ -144,6 +154,7 @@ def load_saliency_samples(
     samples: list[SaliencySample] = []
     skipped_bbox = 0
     skipped_field = 0
+    skipped_area = 0
     for index in range(len(data)):
         record = data[index]
         subset = str(record.get("dataset", "")).strip() or "unknown"
@@ -154,6 +165,12 @@ def load_saliency_samples(
         bbox = parse_bbox_norm(record.get("bbox"))
         if bbox is None:
             skipped_bbox += 1
+            continue
+        area = bbox_area(bbox)
+        if (max_bbox_area is not None and area > max_bbox_area) or (
+            min_bbox_area is not None and area < min_bbox_area
+        ):
+            skipped_area += 1
             continue
         problem = str(record.get("problem", "")).strip()
         solution = str(record.get("solution", "")).strip()
@@ -166,7 +183,7 @@ def load_saliency_samples(
         counts[subset] += 1
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(none)"
     print(
-        f"[saliency] loaded {len(samples)} samples ({summary}); "
-        f"skipped {skipped_bbox} bad-bbox, {skipped_field} missing-field"
+        f"[saliency] loaded {len(samples)} samples ({summary}); skipped "
+        f"{skipped_bbox} bad-bbox, {skipped_area} out-of-area, {skipped_field} missing-field"
     )
     return samples

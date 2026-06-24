@@ -7,10 +7,19 @@ to the method, and (if STOP) saves the training run.
 
 It uses [`peterant330/saliency-r1-8k`](https://huggingface.co/datasets/peterant330/saliency-r1-8k):
 each sample has a question, an answer (`solution`), and a GT **evidence bbox**
-(field `bbox`, a string `"[x1,y1,x2,y2]"` **normalized 0–1**). Two subsets —
-**CUB** (bird yes/no attribute QA, ~50% floor) and **DocVQA** (text extraction,
-the cleaner signal). Results are reported **per subset** so the yes/no floor never
-washes out the signal.
+(field `bbox`, a string `"[x1,y1,x2,y2]"` **normalized 0–1**). The local copy has
+**10 subsets** (field `dataset`); results are reported **per subset**:
+
+| Tier | Subsets | Why |
+|------|---------|-----|
+| **Clean (headline)** | `textvqa` `textcap` `docvqa` `infographicsvqa` `gqa` `openimages` | answer is a specific token literally inside a **small** box (median area 0.005–0.15) → masking it cleanly removes the answer, floor ≈ 0, random control easy. The strongest Reliance signal. |
+| Secondary | `cub` `vsr` (yes/no, ~50% floor) `flickr30k` `v7w` | yes/no compresses Reliance; `flickr30k` answers are free-form sentences (needs `--grader llm`, rule grading ≈ 0). Report separately. |
+
+Two data hygiene knobs follow from the box-size distribution:
+- **`--max-bbox-area` (default 0.5)** drops near-whole-image boxes (e.g. some
+  `gqa`/`openimages`/`v7w` boxes ≈ 1.0) where an equal-area random mask can't be
+  placed disjointly — those would dilute Reliance toward 0.
+- For `flickr30k` (and phrase answers like v7w "On the table.") use `--grader llm`.
 
 ## Metrics (all pure pixel-space; no model-internal hooks)
 
@@ -56,8 +65,10 @@ uv run python baseline/probe/inspect_saliency.py \
 
 # 1) One probe run per model (greedy, rule-graded, no API). ~hundreds of samples
 #    × 8 conditions = minutes on one H800. Run candidates on different GPUs.
-CUDA_VISIBLE_DEVICES=0 DATASET=$D/saliency-r1-8k MODEL_PATH=$M/MMR1-7B-RL  MODEL_NAME=MMR1-7B-RL  bash scripts/probe_stage0.sh
-CUDA_VISIBLE_DEVICES=1 DATASET=$D/saliency-r1-8k MODEL_PATH=$M/MMR1-3B-SFT MODEL_NAME=MMR1-3B-SFT bash scripts/probe_stage0.sh
+#    SUBSETS picks the clean tier; MAX_BBOX_AREA=0.5 (default) drops huge boxes.
+SUB=textvqa,textcap,docvqa,infographicsvqa,gqa,openimages
+CUDA_VISIBLE_DEVICES=0 DATASET=$D/saliency-r1-8k SUBSETS=$SUB MODEL_PATH=$M/MMR1-7B-RL  MODEL_NAME=MMR1-7B-RL  bash scripts/probe_stage0.sh
+CUDA_VISIBLE_DEVICES=1 DATASET=$D/saliency-r1-8k SUBSETS=$SUB MODEL_PATH=$M/MMR1-3B-SFT MODEL_NAME=MMR1-3B-SFT bash scripts/probe_stage0.sh
 
 # Check the printed Acc_full per model is sane (not ~0). If a reasoning model's
 # Acc_full looks suppressed, give it its native prompt: --system-prompt "..." or
