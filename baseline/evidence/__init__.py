@@ -25,8 +25,11 @@ eager-attention memory caveat.
 from baseline.evidence.evidence_loss import (
     concentration_gate_abs,
     evidence_alignment_loss,
-    select_evidence_tokens,
+    normalized_abs_entropy,
+    per_token_kl,
     signed_corr_loss,
+    signed_pearson_corr,
+    top_indices_by_score,
 )
 from baseline.evidence.saliency_engine import (
     SaliencyModelParts,
@@ -39,7 +42,10 @@ __all__ = [
     "resolve_model_parts",
     "compute_token_saliency_maps",
     "signed_corr_loss",
+    "signed_pearson_corr",
+    "normalized_abs_entropy",
     "concentration_gate_abs",
-    "select_evidence_tokens",
+    "per_token_kl",
+    "top_indices_by_score",
     "evidence_alignment_loss",
 ]
