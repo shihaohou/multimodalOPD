@@ -44,6 +44,8 @@ MASK_SEED="${MASK_SEED:-1234}"
 SANITY_DUMP="${SANITY_DUMP:-8}"
 
 PROMPT_SUFFIX="${PROMPT_SUFFIX:-}"
+SYSTEM_PROMPT="${SYSTEM_PROMPT:-}"          # override the system prompt (else OPD default)
+NO_SYSTEM_PROMPT="${NO_SYSTEM_PROMPT:-}"    # set true/1 to send no system prompt (native format)
 TEMPERATURE="${TEMPERATURE:-0.0}"   # 0 => greedy (clean, reproducible probe)
 TOP_P="${TOP_P:-1.0}"
 TOP_K="${TOP_K:--1}"
@@ -97,6 +99,8 @@ CMD=(
   --judge-workers "$JUDGE_WORKERS"
 )
 if [[ -n "$SUBSETS" ]]; then CMD+=(--subsets "$SUBSETS"); fi
+if [[ -n "$SYSTEM_PROMPT" ]]; then CMD+=(--system-prompt "$SYSTEM_PROMPT"); fi
+if [[ "$NO_SYSTEM_PROMPT" == "true" || "$NO_SYSTEM_PROMPT" == "1" ]]; then CMD+=(--no-system-prompt); fi
 if [[ -n "$MIN_BBOX_AREA" ]]; then CMD+=(--min-bbox-area "$MIN_BBOX_AREA"); fi
 if [[ -n "$VLLM_MAX_MODEL_LEN" ]]; then CMD+=(--max-model-len "$VLLM_MAX_MODEL_LEN"); fi
 
