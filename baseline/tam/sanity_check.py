@@ -50,8 +50,10 @@ DEFAULT_RESPONSE = (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Standalone TAM-engine sanity check.")
-    p.add_argument("--student_model", default="Qwen/Qwen3-VL-2B-Instruct")
-    p.add_argument("--teacher_model", default=None, help="Optional; enables the grid-consistency check.")
+    # Default to None so they can be resolved from $M (the launcher's offline
+    # models dir) in main(); explicit flags still win.
+    p.add_argument("--student_model", default=None, help="Student ckpt (default: $M/Qwen3-VL-2B-Instruct or the HF id).")
+    p.add_argument("--teacher_model", default=None, help="Teacher ckpt; enables the grid-consistency check (default: $M/Qwen3-VL-8B-Instruct if $M is set).")
     p.add_argument("--attn", default="sdpa", help="attn_implementation (TAM needs NO attention weights, so sdpa/flash are fine).")
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--max_new_tokens", type=int, default=128)
@@ -114,6 +116,17 @@ def _build_positions(full_ids, prompt_length, completion_ids, image_token_id):
 
 def main() -> None:
     args = parse_args()
+    # Resolve student/teacher from $M (offline models dir, same convention as
+    # scripts/train_opd_tam_qwen3_8b_to_2b.sh) when not given explicitly.
+    models_dir = os.environ.get("M", "").rstrip("/")
+    if args.student_model is None:
+        args.student_model = (
+            f"{models_dir}/Qwen3-VL-2B-Instruct" if models_dir else "Qwen/Qwen3-VL-2B-Instruct"
+        )
+    if args.teacher_model is None and models_dir:
+        args.teacher_model = f"{models_dir}/Qwen3-VL-8B-Instruct"
+    print(f"[sanity] student_model={args.student_model}")
+    print(f"[sanity] teacher_model={args.teacher_model}")
     dtype = getattr(torch, args.dtype)
 
     from transformers import AutoProcessor
