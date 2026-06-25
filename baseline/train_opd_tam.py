@@ -60,7 +60,7 @@ class OPDTAMScriptArguments(OPDScriptArguments):
     # Read the map along a detached lm_head row so the gradient lands on the visual
     # representation F^v, not the unembedding (migration doc §3). Keep True.
     tam_detach_lm_head: bool = True
-    tam_divergence: str = "cosine"  # "cosine" | "js" | "l1"
+    tam_divergence: str = "cosine"  # "cosine" | "js" | "l1" | "mse"
     tam_blur: bool = True
     tam_blur_kernel: int = 3
     tam_blur_sigma: float = 1.0

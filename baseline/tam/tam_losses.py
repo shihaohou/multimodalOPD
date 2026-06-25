@@ -9,12 +9,14 @@ per-token TAM maps from :mod:`baseline.tam.tam_engine`, gated to the
 * **Gaussian blur** ``g(.)`` (the differentiable stand-in for TAM's rank-Gaussian
   filter — migration doc §1) is applied to **both** maps so the student is not
   penalized for noise the teacher map was denoised out of.
-* **normalization**: sum-to-1 (a spatial distribution) for ``js`` / ``l1``; L2 for
-  ``cosine``. Never min-max (migration doc §2/§3 — non-smooth and breaks
+* **normalization**: sum-to-1 (a spatial distribution) for ``js`` / ``l1`` / ``mse``;
+  L2 for ``cosine``. Never min-max (migration doc §2/§3 — non-smooth and breaks
   cross-model comparability).
 * **divergence** ``d``: ``cosine`` (``1 - cos``, the MVP default — simplest and
   most robust on the non-negative TAM maps), ``js`` (Jensen-Shannon, the doc's
-  theoretical default — symmetric, bounded), or ``l1`` (total variation).
+  theoretical default — symmetric, bounded), ``l1`` (total variation), or ``mse``
+  (normalized heatmap-regression — squared L2 between the two spatial
+  distributions; the most direct "match the teacher's map" objective).
 * **concentration gate** ``g_i`` on the **teacher** map (migration doc §2, gate 1):
   down-weights tokens whose teacher map is spatially diffuse (high normalized
   entropy) — function words point nowhere, so the loss only pulls on tokens where
@@ -130,6 +132,20 @@ def l1_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return 0.5 * (p - q).abs().sum(dim=-1)
 
 
+def mse_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+    """Squared L2 ``sum_j (p - q)^2`` of two sum-normalized maps. ``[n, P] -> [n]`` in [0,2].
+
+    The **normalized MSE** (migration doc / user note): both maps are first turned
+    into spatial distributions (sum-to-1) so the loss pulls the student toward the
+    teacher's *spatial shape* (where the evidence is) and **not** its raw activation
+    *scale* — teacher/student differ in hidden dim and ``lm_head`` norm, so a raw-map
+    MSE would chase that scale gap instead of "look here". Summed (not meaned) over
+    patches, so the value lands in the same ``[0, 2]`` band as ``cosine``/``js``/``l1``
+    rather than the ~``1/n_v`` of a per-patch mean — i.e. ``n_v * mean_j (p-q)^2``.
+    The teacher is detached by the caller (``sg``)."""
+    return (p - q).pow(2).sum(dim=-1)
+
+
 def _sum_normalize(maps: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
     return maps / (maps.sum(dim=-1, keepdim=True) + eps)
 
@@ -185,9 +201,11 @@ def tam_alignment_loss(
         divergence_per_token = js_divergence(_sum_normalize(s), _sum_normalize(t))
     elif divergence == "l1":
         divergence_per_token = l1_divergence(_sum_normalize(s), _sum_normalize(t))
+    elif divergence == "mse":
+        divergence_per_token = mse_divergence(_sum_normalize(s), _sum_normalize(t))
     else:
         raise ValueError(
-            f"Unknown divergence {divergence!r}; use 'cosine', 'js', or 'l1'."
+            f"Unknown divergence {divergence!r}; use 'cosine', 'js', 'l1', or 'mse'."
         )
 
     gate_sum = gate.sum().clamp_min(eps)

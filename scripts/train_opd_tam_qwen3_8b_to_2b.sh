@@ -125,7 +125,7 @@ LAMBDA_TAM="${LAMBDA_TAM:-1.0}"
 TAM_ALIGN_SPAN="${TAM_ALIGN_SPAN:-completion}"
 TAM_USE_ECI="${TAM_USE_ECI:-true}"
 TAM_DETACH_LM_HEAD="${TAM_DETACH_LM_HEAD:-true}"
-TAM_DIVERGENCE="${TAM_DIVERGENCE:-cosine}"      # cosine | js | l1
+TAM_DIVERGENCE="${TAM_DIVERGENCE:-cosine}"      # cosine | js | l1 | mse  (mse = normalized heatmap-regression)
 TAM_BLUR="${TAM_BLUR:-true}"
 TAM_BLUR_KERNEL="${TAM_BLUR_KERNEL:-3}"
 TAM_BLUR_SIGMA="${TAM_BLUR_SIGMA:-1.0}"
@@ -186,12 +186,13 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
-# Auto-name encodes lambda_tam + ViT mode (fullft vs freezevit) + a RUN_ID date
-# stamp, so OPD (ltam0) / OPD+TAM / full-FT / frozen-ViT runs are distinguishable
-# AND re-runs never overwrite each other. The date is appended even to a
-# user-supplied RUN_CONFIG; pass OUTPUT_DIR explicitly only to opt out.
+# Auto-name encodes lambda_tam + divergence (cosine/mse/...) + ViT mode (fullft vs
+# freezevit) + a RUN_ID date stamp, so OPD (ltam0) / OPD+TAM / cosine-vs-mse /
+# full-FT / frozen-ViT runs are distinguishable AND re-runs never overwrite each
+# other. The date is appended even to a user-supplied RUN_CONFIG; pass OUTPUT_DIR
+# explicitly only to opt out.
 VIT_TAG=$([[ "$FREEZE_VISION_TOWER" == "true" ]] && echo freezevit || echo fullft)
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${VIT_TAG}}_${RUN_ID}"
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${VIT_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \

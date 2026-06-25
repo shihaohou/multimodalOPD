@@ -74,9 +74,9 @@ class TAMTrainer(OPDTrainer):
                 f"Unknown tam_align_span {tam_align_span!r}; use 'completion', "
                 "'answer', or 'reason_answer'."
             )
-        if tam_divergence not in {"cosine", "js", "l1"}:
+        if tam_divergence not in {"cosine", "js", "l1", "mse"}:
             raise ValueError(
-                f"Unknown tam_divergence {tam_divergence!r}; use 'cosine', 'js', or 'l1'."
+                f"Unknown tam_divergence {tam_divergence!r}; use 'cosine', 'js', 'l1', or 'mse'."
             )
         self.lambda_tam = float(lambda_tam)
         self.tam_align_span = tam_align_span
