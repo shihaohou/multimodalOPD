@@ -132,7 +132,10 @@ TAM_BLUR_SIGMA="${TAM_BLUR_SIGMA:-1.0}"
 TAM_GATE_TEMP="${TAM_GATE_TEMP:-1.0}"
 TAM_GATE_H0="${TAM_GATE_H0:-0.9}"
 TAM_GATE_TAU="${TAM_GATE_TAU:-0.1}"
-TAM_MASS_THRESHOLD="${TAM_MASS_THRESHOLD:-0.0}"
+# Drop near-empty-teacher tokens before aligning. 0<val<1 = RELATIVE to the mean
+# teacher mass per sample (portable); >=1 = absolute; 0 = off. 0.1 = drop tokens
+# below 10% of mean mass (function words / non-visual). W&B tam_mass_kept = surviving frac.
+TAM_MASS_THRESHOLD="${TAM_MASS_THRESHOLD:-0.1}"
 TAM_MAX_TOKENS="${TAM_MAX_TOKENS:-0}"
 
 USE_VLLM="${USE_VLLM:-true}"

@@ -67,8 +67,10 @@ class OPDTAMScriptArguments(OPDScriptArguments):
     tam_gate_temp: float = 1.0
     tam_gate_h0: float = 0.9
     tam_gate_tau: float = 0.1
-    # Drop tokens whose (blurred) teacher map sums below this — teacher grounds
-    # nowhere, nothing to align to. 0 = keep all (the soft gate still down-weights).
+    # Hard-drop tokens whose (blurred) teacher map barely responds (teacher grounds
+    # nowhere → under Laplace smoothing it is ~uniform, aligning to it is noise). In
+    # (0,1) = RELATIVE to the sample's mean teacher mass (portable); >=1 = absolute
+    # sum; 0 = keep all (soft gate still down-weights). W&B `tam_mass_kept` = surviving frac.
     tam_mass_threshold: float = 0.0
     # Hard cap on aligned tokens per sample (keep the most concentrated teacher
     # tokens). 0 = no cap (TAM is cheap; the soft gate handles diffuse tokens).

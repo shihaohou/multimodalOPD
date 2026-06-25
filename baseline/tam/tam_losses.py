@@ -133,7 +133,7 @@ def l1_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
 
 
 def mse_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """Squared L2 ``sum_j (p - q)^2`` of two sum-normalized maps. ``[n, P] -> [n]`` in [0,2].
+    """Squared L2 ``sum_j (p - q)^2`` of two (Laplace-smoothed) sum-to-1 maps. ``[n, P] -> [n]`` in [0,2].
 
     The **normalized MSE** (migration doc / user note): both maps are first turned
     into spatial distributions (sum-to-1) so the loss pulls the student toward the
@@ -146,8 +146,17 @@ def mse_divergence(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return (p - q).pow(2).sum(dim=-1)
 
 
-def _sum_normalize(maps: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
-    return maps / (maps.sum(dim=-1, keepdim=True) + eps)
+def _prob_normalize(maps: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Laplace-smoothed sum-to-1 over patches: ``(a + eps) / (sum_j a_j + n_v*eps)``.
+
+    A *true* spatial distribution (``sum_j p_j == 1`` exactly) even for a near-empty
+    map: an all-zero teacher map normalizes to **uniform** ``1/n_v`` instead of a
+    near-zero vector, so a distribution MSE/JS against it pulls the student toward
+    "look everywhere / neutral" rather than the wrong "look nowhere" target. Matches
+    the migration-doc normalizer; ``eps`` is tiny so a responsive map is unchanged.
+    """
+    n_v = maps.shape[-1]
+    return (maps + eps) / (maps.sum(dim=-1, keepdim=True) + n_v * eps)
 
 
 def tam_alignment_loss(
@@ -171,11 +180,15 @@ def tam_alignment_loss(
         student_maps: ``[n, n_v]`` student TAM maps (grad).
         teacher_maps: ``[n, n_v]`` teacher TAM maps (detached inside).
         grid_thw: ``(t, H, W)`` patch grid for the blur (``t*H*W == n_v``).
-        divergence: ``cosine`` | ``js`` | ``l1``.
+        divergence: ``cosine`` | ``js`` | ``l1`` | ``mse``. The distribution family
+            (``js`` / ``l1`` / ``mse``) runs on Laplace-smoothed sum-to-1 maps;
+            ``cosine`` runs on L2-normalized maps.
         blur / blur_kernel / blur_sigma: fixed Gaussian blur applied to both maps.
         gate_*: teacher-map concentration gate parameters.
-        mass_threshold: drop tokens whose (blurred) teacher map sums below this —
-            the teacher grounds nowhere, so there is nothing to align to.
+        mass_threshold: hard-drop tokens whose (blurred) teacher map barely responds.
+            In ``(0, 1)`` it is RELATIVE to the sample's mean teacher mass (portable);
+            ``>= 1`` is an absolute sum threshold. ``0`` disables it (the soft gate
+            still down-weights diffuse tokens).
 
     Returns ``(loss, stats)``; ``loss`` is normalized by the gate sum (floored by
     ``eps`` so a batch of weakly-gated tokens is not washed out).
@@ -184,7 +197,9 @@ def tam_alignment_loss(
     if n == 0:
         zero = student_maps.sum() * 0.0
         z = zero.detach()
-        return zero, {"tam_div": z, "tam_js": z, "tam_gate_mean": z, "tam_n": 0}
+        return zero, {
+            "tam_div": z, "tam_js": z, "tam_gate_mean": z, "tam_mass_kept": z, "tam_n": 0
+        }
 
     s = student_maps.float()
     t = teacher_maps.detach().float()
@@ -193,17 +208,33 @@ def tam_alignment_loss(
         t = gaussian_blur_maps(t, grid_thw, kernel_size=blur_kernel, sigma=blur_sigma)
 
     gate = concentration_gate(t, temp=gate_temp, h0=gate_h0, tau=gate_tau)  # [n], no grad
+    # Mass filter: hard-drop tokens whose (blurred) teacher map barely responds
+    # anywhere — function words / non-visual tokens have nothing to ground to, and
+    # under Laplace smoothing their teacher map is ~uniform, so aligning to it just
+    # pushes the student toward uniform (noise). The raw map-sum scale is model-
+    # dependent (teacher d != student d), so a value in (0, 1) is read as RELATIVE
+    # to this sample's mean teacher mass (a portable "small" cutoff); a value >= 1
+    # is an absolute sum threshold (back-compat). `tam_mass_kept` logs the surviving
+    # fraction so the drop is never silent.
+    teacher_mass = t.sum(dim=-1)  # [n] raw blurred teacher response strength, no grad
+    mass_kept = torch.ones_like(teacher_mass)
     if mass_threshold > 0:
-        gate = gate * (t.sum(dim=-1) > mass_threshold).to(gate.dtype)
+        cutoff = (
+            mass_threshold * teacher_mass.mean()
+            if mass_threshold < 1.0
+            else mass_threshold
+        )
+        mass_kept = (teacher_mass > cutoff).to(gate.dtype)
+        gate = gate * mass_kept
 
     if divergence == "cosine":
         divergence_per_token = cosine_divergence(s, t, eps)
     elif divergence == "js":
-        divergence_per_token = js_divergence(_sum_normalize(s), _sum_normalize(t))
+        divergence_per_token = js_divergence(_prob_normalize(s), _prob_normalize(t))
     elif divergence == "l1":
-        divergence_per_token = l1_divergence(_sum_normalize(s), _sum_normalize(t))
+        divergence_per_token = l1_divergence(_prob_normalize(s), _prob_normalize(t))
     elif divergence == "mse":
-        divergence_per_token = mse_divergence(_sum_normalize(s), _sum_normalize(t))
+        divergence_per_token = mse_divergence(_prob_normalize(s), _prob_normalize(t))
     else:
         raise ValueError(
             f"Unknown divergence {divergence!r}; use 'cosine', 'js', 'l1', or 'mse'."
@@ -217,12 +248,13 @@ def tam_alignment_loss(
     # cleanly as "are the student & teacher maps actually agreeing on WHERE", even
     # while the loss optimizes cosine / mse / l1. Never affects training.
     with torch.no_grad():
-        js_per_token = js_divergence(_sum_normalize(s), _sum_normalize(t))
+        js_per_token = js_divergence(_prob_normalize(s), _prob_normalize(t))
         js_monitor = (gate * js_per_token).sum() / gate_sum
     stats = {
         "tam_div": divergence_per_token.detach().mean(),
         "tam_js": js_monitor.detach(),
         "tam_gate_mean": gate.detach().mean(),
+        "tam_mass_kept": mass_kept.detach().mean(),
         "tam_n": n,
     }
     return loss, stats

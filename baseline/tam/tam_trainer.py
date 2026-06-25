@@ -157,6 +157,7 @@ class TAMTrainer(OPDTrainer):
         div_sum = 0.0
         js_sum = 0.0
         gate_sum = 0.0
+        kept_sum = 0.0
         n_total = 0
         valid_samples = 0
         for b in range(generated_ids.shape[0]):
@@ -249,6 +250,7 @@ class TAMTrainer(OPDTrainer):
             div_sum += float(stats_b["tam_div"]) * n_b
             js_sum += float(stats_b["tam_js"]) * n_b
             gate_sum += float(stats_b["tam_gate_mean"]) * n_b
+            kept_sum += float(stats_b["tam_mass_kept"]) * n_b
             n_total += n_b
             valid_samples += 1
 
@@ -261,6 +263,7 @@ class TAMTrainer(OPDTrainer):
             "tam_div_sum": div_sum,
             "tam_js_sum": js_sum,
             "tam_gate_sum": gate_sum,
+            "tam_mass_kept_sum": kept_sum,
         }
 
     def _assert_shared_grid(self) -> None:
@@ -435,6 +438,7 @@ class TAMTrainer(OPDTrainer):
             metrics["tam_div"] = (tam_stats.get("tam_div_sum", 0.0), n_sel)
             metrics["tam_js"] = (tam_stats.get("tam_js_sum", 0.0), n_sel)
             metrics["tam_gate_mean"] = (tam_stats.get("tam_gate_sum", 0.0), n_sel)
+            metrics["tam_mass_kept"] = (tam_stats.get("tam_mass_kept_sum", 0.0), n_sel)
             metrics["tam_n_selected"] = (
                 n_sel,
                 max(tam_stats.get("tam_valid_samples", 1.0), 1.0),
