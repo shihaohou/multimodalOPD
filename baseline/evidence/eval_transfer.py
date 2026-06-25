@@ -62,6 +62,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--num-layers", type=int, default=4, help="Last-N decoder layers (match training).")
     p.add_argument("--layers", default=None, help="Explicit comma layer list (overrides --num-layers).")
+    p.add_argument(
+        "--teacher-force-gt",
+        action="store_true",
+        help="Skip generation; teacher-force a <reason> stub + \\boxed{GT}. Removes the "
+        "autoregressive bottleneck (one forward/sample, ~10-50x faster) and is a CLEANER "
+        "teacher comparison (identical tokens across models). Use for teacher selection; "
+        "use on-policy (default) for final claims about a trained student.",
+    )
+    p.add_argument(
+        "--reason-stub",
+        default="Based on the relevant region of the image, the answer can be determined.",
+    )
     return p.parse_args()
 
 
@@ -189,15 +201,24 @@ def main() -> None:
         st["n"] += 1
         inputs = _build_inputs(processor, s.image, s.problem)
         prompt_len = int(inputs["input_ids"].shape[1])
-        with torch.no_grad():
-            gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
-        full_ids = gen[0]
-        completion_ids = full_ids[prompt_len:]
+        if args.teacher_force_gt:
+            # No generation: force "<reason>stub</reason> \boxed{GT}". One forward.
+            resp = f"<reason>{args.reason_stub}</reason>\n\\boxed{{{s.solution}}}"
+            completion_ids = tokenizer(
+                resp, add_special_tokens=False, return_tensors="pt"
+            ).input_ids[0].to(inputs["input_ids"].device)
+            full_ids = torch.cat([inputs["input_ids"][0], completion_ids], dim=0)
+        else:
+            with torch.no_grad():
+                gen = model.generate(**inputs, max_new_tokens=args.max_new_tokens, do_sample=False)
+            full_ids = gen[0]
+            completion_ids = full_ids[prompt_len:]
         spans = parse_completion_spans(tokenizer, completion_ids.tolist())
         if not spans.valid:
             continue
         st["valid"] += 1
-        st["correct"].append(float(_correct(spans.text, s.solution)))
+        if not args.teacher_force_gt:  # forced GT is trivially "correct" -> not meaningful
+            st["correct"].append(float(_correct(spans.text, s.solution)))
 
         pos = _spans_to_positions(spans, prompt_len, completion_ids, full_ids.device)
         smap = _saliency_map(model, parts, layers, full_ids, inputs, pos)
