@@ -28,13 +28,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
 
-: "${DATASET_NAME:?Set DATASET_NAME (HF id or local path to the training set).}"
+# Resolve the dataset from $D (datasets dir) when DATASET_NAME isn't passed.
+D="${D:-}"
+if [[ -n "$D" ]]; then
+  DATASET_NAME="${DATASET_NAME:-${D%/}/Vision-SR1-47K}"
+fi
+: "${DATASET_NAME:?Set DATASET_NAME (HF id / local path) or D=<datasets dir>.}"
 
-# Resolve the student/teacher checkpoints. Prefer a local models dir ($M).
+# Resolve the student/teacher checkpoints. Prefer a local models dir ($M). The
+# default local teacher is Vero (GRPO-trained from Qwen3-VL-8B, our standard
+# teacher) — set TEACHER_MODEL to use a stock-8B / different teacher.
 M="${M:-}"
 if [[ -n "$M" ]]; then
   MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${M%/}/Qwen3-VL-2B-Instruct}"
-  TEACHER_MODEL="${TEACHER_MODEL:-${M%/}/Qwen3-VL-8B-Instruct}"
+  TEACHER_MODEL="${TEACHER_MODEL:-${M%/}/Vero-Qwen3I-8B}"
 else
   MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-VL-2B-Instruct}"
   TEACHER_MODEL="${TEACHER_MODEL:-Qwen/Qwen3-VL-8B-Instruct}"
@@ -75,10 +82,11 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# TAM adds two output_hidden_states forwards (student grad + teacher no-grad) on
-# top of vanilla OPD. Start conservative (per_device 2); raise toward 4 to match
-# vanilla OPD's effective batch if memory allows. eff_batch = pd*ga*world.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
+# Default eff_batch = pd(4)*ga(16)*world(8) = 512 (matches the OPD baseline). TAM
+# adds two output_hidden_states forwards, so pd only affects memory, not the
+# gradient: if OOM, PER_DEVICE_TRAIN_BATCH_SIZE=2 GRADIENT_ACCUMULATION_STEPS=32
+# (still 512); if memory is plentiful, pd=8 ga=8. eff_batch = pd*ga*world.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
@@ -178,7 +186,10 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_np${NUM_PROCESSES}}"
+# Auto-name encodes lambda_tam + ViT mode (fullft vs freezevit) so OPD (ltam0) /
+# OPD+TAM / full-FT / frozen-ViT runs are distinguishable without passing RUN_CONFIG.
+VIT_TAG=$([[ "$FREEZE_VISION_TOWER" == "true" ]] && echo freezevit || echo fullft)
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${VIT_TAG}}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \

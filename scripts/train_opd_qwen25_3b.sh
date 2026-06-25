@@ -67,6 +67,10 @@ LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-constant}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
+# Gradient-norm clip; 1.0 = OPD field standard (Uni-OPD/miles --clip-grad=1.0,
+# OPD-main verl actor.grad_clip=1.0 / LlamaFactory max_grad_norm=1.0). Was a
+# hardcoded 0.1 (10x tighter, throttled updates at lr=1e-6); now env-configurable.
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 # Freeze the vision tower under full FT. Off by default: at a real multi-GPU
 # effective batch (e.g. 8 GPU x grad_accum 4 = 32) the ViT grad spikes average
 # out and full FT incl. ViT is stable (matches Vision-OPD). Turn on as a fallback
@@ -188,7 +192,7 @@ uv run accelerate launch \
   --weight_decay "$WEIGHT_DECAY" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
-  --max_grad_norm 0.1 \
+  --max_grad_norm "$MAX_GRAD_NORM" \
   --bf16 \
   --freeze_vision_tower "$FREEZE_VISION_TOWER" \
   "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
