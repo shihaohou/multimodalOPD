@@ -82,6 +82,12 @@ LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-constant}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.0}"
+# Gradient-norm clip. 1.0 = the OPD field standard (Uni-OPD/miles --clip-grad=1.0,
+# OPD-main LlamaFactory max_grad_norm=1.0 and verl actor.grad_clip=1.0); the ViGOS
+# repo's old hardcoded 0.1 was 10x tighter and (with lr=1e-6) throttled updates.
+# Keep this identical between the OPD baseline (LAMBDA_TAM=0) and OPD+TAM so the
+# comparison stays clean.
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-16384}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
 # Cap image resolution -> caps #visual tokens -> caps the per-layer hidden-state
@@ -201,7 +207,7 @@ uv run accelerate launch \
   --weight_decay "$WEIGHT_DECAY" \
   --lr_scheduler_type "$LR_SCHEDULER_TYPE" \
   --warmup_ratio "$WARMUP_RATIO" \
-  --max_grad_norm 0.1 \
+  --max_grad_norm "$MAX_GRAD_NORM" \
   --bf16 \
   --freeze_vision_tower "$FREEZE_VISION_TOWER" \
   "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
