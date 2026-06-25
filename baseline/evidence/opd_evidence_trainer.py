@@ -351,6 +351,31 @@ class OPDEvidenceTrainer(OPDTrainer):
             s_layer_ids = self._resolve_evidence_layers(self._student_parts)
             t_layer_ids = self._resolve_evidence_layers(self._teacher_parts)
 
+            # Grid consistency: the SAME pixel_values + image_grid_thw are fed to
+            # both models, so the per-patch maps are comparable iff the merge size
+            # (and image token) match. Assert it explicitly (don't infer from "it
+            # didn't crash") — a cross-size ViT mismatch would silently confound the
+            # evidence maps.
+            if not getattr(self, "_grid_checked", False):
+                self._grid_checked = True
+                sp, tp = self._student_parts, self._teacher_parts
+                if (sp.spatial_merge_size != tp.spatial_merge_size
+                        or sp.image_token_id != tp.image_token_id):
+                    raise ValueError(
+                        "Teacher/student visual grids differ "
+                        f"(spatial_merge {sp.spatial_merge_size} vs {tp.spatial_merge_size}, "
+                        f"image_token_id {sp.image_token_id} vs {tp.image_token_id}); the "
+                        "per-patch evidence maps would be incomparable. Use a shared-ViT "
+                        "line (e.g. Qwen2.5-VL 3B<-7B)."
+                    )
+                if self.accelerator.is_main_process:
+                    print(
+                        f"[OPD-evidence] grid check OK: spatial_merge={sp.spatial_merge_size} "
+                        f"image_token_id={sp.image_token_id} — student & teacher share the "
+                        "patch grid (same pixel_values fed to both).",
+                        flush=True,
+                    )
+
         # --- SINGLE student forward (one grad graph; see module docstring). The
         #     evidence-layer attention weights are captured via forward hooks, NOT
         #     output_attentions=True (which retains every layer's [H,S,S] -> OOM). -
