@@ -56,14 +56,13 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 4 x
-# eff_batch = per_device(8) x grad_accum(8) x 8 GPU = 512. per_device 8 is the fast
-# default now that flash_attention_2 + topk_kl cut the training-forward memory (it
-# was OOM-prone under the old sdpa + full_kl, hence the previous per_device-4
-# default). If you still OOM on heavy multi-image batches, drop to per_device 4
-# grad_accum 16 (also 512). Rescale grad_accum to keep eff_batch 512 if GPUs change.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+# Full FT, global batch 512 (Vision-OPD/VGS Table 4). Default per_device 4 x
+# grad_accum 16 x 8 GPU = 512. per_device 8 (grad_accum 8, also 512) is faster but
+# OOM-prone on long rollouts even with flash + topk_kl (the full-vocab loss/diag
+# softmax scales with per_device), so 4 is the safe default; try 8 only with
+# headroom. Rescale grad_accum to keep eff_batch 512 if the GPU count changes.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 # Paper (Table 4): AdamW, lr 1e-6, weight_decay 1e-2, constant schedule, no warmup.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"

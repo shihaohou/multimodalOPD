@@ -345,34 +345,52 @@ class OPDTrainer(ViGOSTrainer):
         if completion_token_count <= 0:
             return metrics
 
-        student_logits = student_logits.float()
-        # clamp() (not in-place) so we never mutate the shared rollout tensor.
-        ids = completion_ids.clamp(0, student_logits.shape[-1] - 1).unsqueeze(-1)
+        # The per-token curves below need a full-vocab log_softmax, but the loss is
+        # top-k — so materializing the whole [B, C, V] softmax here (just for
+        # logging) is the memory wall (it OOM'd at per_device 8 on long rollouts).
+        # Compute everything CHUNKED over the completion length: the transient is
+        # bounded to [B, CHUNK, V] no matter how long the rollout is. Metrics are
+        # exact (chunking only splits the reduction). clamp() (not in-place) so we
+        # never mutate the shared rollout tensor.
+        chunk = int(getattr(self, "rollout_diag_chunk", 256))
+        batch_size, completion_length = completion_attention.shape
+        have_teacher = teacher_logits is not None
+        student_ids = completion_ids.clamp(0, student_logits.shape[-1] - 1).unsqueeze(-1)
+        student_tok_logp = mask.new_zeros((batch_size, completion_length))
+        entropy = mask.new_zeros((batch_size, completion_length))
+        if have_teacher:
+            vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
+            teacher_ids = completion_ids.clamp(0, teacher_logits.shape[-1] - 1).unsqueeze(-1)
+            teacher_tok_logp = mask.new_zeros((batch_size, completion_length))
+            agree = mask.new_zeros((batch_size, completion_length))
+
+        for c0 in range(0, completion_length, chunk):
+            c1 = min(c0 + chunk, completion_length)
+            s_lp = torch.log_softmax(student_logits[:, c0:c1].float(), dim=-1)
+            student_tok_logp[:, c0:c1] = s_lp.gather(-1, student_ids[:, c0:c1]).squeeze(-1)
+            entropy[:, c0:c1] = -(s_lp.exp() * s_lp).sum(dim=-1)
+            del s_lp
+            if have_teacher:
+                t_lp = torch.log_softmax(teacher_logits[:, c0:c1].float(), dim=-1)
+                teacher_tok_logp[:, c0:c1] = t_lp.gather(-1, teacher_ids[:, c0:c1]).squeeze(-1)
+                agree[:, c0:c1] = (
+                    student_logits[:, c0:c1, :vocab].argmax(dim=-1)
+                    == teacher_logits[:, c0:c1, :vocab].argmax(dim=-1)
+                ).to(dtype=torch.float32)
+                del t_lp
 
         # --- student policy curves (available for every teacher source) -------
-        student_logp = torch.log_softmax(student_logits, dim=-1)
-        # log p the student assigns to its own sampled tokens — policy confidence.
-        student_tok_logp = student_logp.gather(-1, ids).squeeze(-1) * mask
-        _, student_logp_sum, _ = self._distributed_rate_stats(student_tok_logp)
+        # log p the student assigns to its own sampled tokens (policy confidence)
+        # and token-level entropy on its own samples (exploration signal).
+        _, student_logp_sum, _ = self._distributed_rate_stats(student_tok_logp * mask)
         metrics["rollout/student_logprob"] = (student_logp_sum, completion_token_count)
-        # Token-level entropy of the policy on its own samples — exploration signal.
-        entropy = -(student_logp.exp() * student_logp).sum(dim=-1) * mask
-        _, entropy_sum, _ = self._distributed_rate_stats(entropy)
+        _, entropy_sum, _ = self._distributed_rate_stats(entropy * mask)
         metrics["rollout/entropy"] = (entropy_sum, completion_token_count)
-        del student_logp, entropy
 
         # --- teacher-vs-student curves (local full-logit teacher only) --------
-        if teacher_logits is not None:
-            teacher_logits = teacher_logits.float()
-            t_ids = completion_ids.clamp(0, teacher_logits.shape[-1] - 1).unsqueeze(-1)
-            teacher_logp = torch.log_softmax(teacher_logits, dim=-1)
-            teacher_tok_logp = teacher_logp.gather(-1, t_ids).squeeze(-1) * mask
-            _, teacher_logp_sum, _ = self._distributed_rate_stats(teacher_tok_logp)
-            metrics["rollout/teacher_logprob"] = (
-                teacher_logp_sum,
-                completion_token_count,
-            )
-            del teacher_logp
+        if have_teacher:
+            _, teacher_logp_sum, _ = self._distributed_rate_stats(teacher_tok_logp * mask)
+            metrics["rollout/teacher_logprob"] = (teacher_logp_sum, completion_token_count)
             # teacher - student log p on the student's own samples: the core OPD
             # signal. >0 ⇒ the teacher would rather have drawn what the student drew
             # (it shrinks as the student converges toward the teacher).
@@ -382,15 +400,7 @@ class OPDTrainer(ViGOSTrainer):
             )
             # Fraction of completion tokens where the argmax token agrees — a
             # coarse distillation-progress curve, robust to vocab-size mismatch.
-            vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
-            agree = (
-                student_logits[..., :vocab].argmax(dim=-1)
-                == teacher_logits[..., :vocab].argmax(dim=-1)
-            ).to(dtype=torch.float32) * mask
-            _, agree_sum, _ = self._distributed_rate_stats(agree)
-            metrics["rollout/teacher_top1_agreement"] = (
-                agree_sum,
-                completion_token_count,
-            )
+            _, agree_sum, _ = self._distributed_rate_stats(agree * mask)
+            metrics["rollout/teacher_top1_agreement"] = (agree_sum, completion_token_count)
 
         return metrics
