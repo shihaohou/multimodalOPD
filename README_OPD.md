@@ -58,12 +58,14 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/eval/run_mmvp_eval.py` | MMVP pair-metric MCQ eval (vLLM gen + rule MCQ match, **no judge**; single-question + pair accuracy). |
 | `baseline/eval/run_vqa_eval.py` | POPE / ChartQA / VQAv2 short-answer eval (vLLM gen + official per-benchmark metric, **no judge**; one engine load, all three). |
 | `baseline/eval/vqa_metrics.py` | Pure metric primitives for the above (POPE F1, ChartQA relaxed accuracy, VQAv2 soft accuracy). |
+| `baseline/eval/aggregate_suite.py` | Merge the judged + deterministic group summaries into one suite table (POPE per-category +avg, MMMU-Pro per-subscore +avg). |
 | `baseline/serve_teacher.py` | vLLM teacher scoring server (`/score_topk`, top-k `prompt_logprobs`). |
 | `baseline/teacher_client.py` | HTTP client the trainer uses for the `vllm_server` teacher. |
 | `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
 | `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
 | `scripts/eval_mmvp.sh` | MMVP eval launcher (runs `baseline/eval/run_mmvp_eval.py`). |
 | `scripts/eval_vqa.sh` | POPE/ChartQA/VQAv2 eval launcher (runs `baseline/eval/run_vqa_eval.py`). |
+| `scripts/eval_suite.sh` | One-command full suite: judged + deterministic groups → merged `suite_summary.json` table. |
 | `scripts/serve_teacher_vllm.sh` | Launch the teacher scoring server. |
 
 ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
@@ -354,7 +356,40 @@ CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> POPE_REPO=$D/POPE CHARTQA_REPO=$D/Char
 `BENCHMARKS` (`pope,chartqa,vqav2`), `POPE_REPO` / `POPE_CATEGORY`, `CHARTQA_REPO`,
 `VQAV2_REPO` / `VQAV2_SPLIT`, `LIMIT`, `PROMPT_SUFFIX`, `PASS_K` / `GEN_TEMPERATURE`
 (raise temperature if `PASS_K>1`), `OUTPUT_DIR`. VQAv2 validation is large — set
-`LIMIT` for a quick read, or drop it from `BENCHMARKS`.
+`VQAV2_LIMIT` (caps VQAv2 only, leaving POPE/ChartQA full) for a quick read, or
+drop `vqav2` from `BENCHMARKS`.
+
+### Full suite in one command (`scripts/eval_suite.sh`)
+
+Runs **everything** and merges it into one table: MathVista, MathVerse,
+MathVision, MMMU, MMMU-Pro, MMStar, HallusionBench, POPE, ChartQA, VQAv2 — with
+**POPE split into its 3 categories + average** and **MMMU-Pro split into its 2
+sub-scores + average**. Internally it dispatches by grading philosophy (you do
+*not* LLM-judge a benchmark that has an official deterministic metric):
+
+* **judged group** (`eval_opd.sh`, your LLM judge): MathVista / MathVerse /
+  MathVision (free-form math — judge needed), MMMU / MMMU-Pro / MMStar (MCQ —
+  judge or `GRADER=rule`), HallusionBench (yes/no).
+* **deterministic group** (`eval_vqa.sh`, no judge): POPE (F1), ChartQA (relaxed
+  accuracy), VQAv2 (soft accuracy).
+
+`baseline/eval/aggregate_suite.py` then stitches both `summary.json`s into
+`suite_summary.json` + a printed table (scores as 0–1 plus a `%` column).
+
+```bash
+# point the judged group at your 32B judge (OpenAI-compatible), then one command:
+export JUDGE_API_URL=http://<your-32b-host>:<port>/v1 JUDGE_MODEL=<served-name> OPENAI_API_KEY=<key>
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> bash scripts/eval_suite.sh
+# quick read (cap VQAv2's ~214k val; greedy Acc@1):
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> VQAV2_LIMIT=2000 bash scripts/eval_suite.sh
+# no judge available -> rule-grade the MCQ/yes-no ones (free-form math will be approximate):
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> GRADER=rule bash scripts/eval_suite.sh
+```
+
+Knobs (env): `JUDGED_DATASETS`, `DET_BENCHMARKS`, `GRADER` (`llm`/`rule`),
+`SKIP_JUDGE`, `PASS_K` / `GEN_TEMPERATURE` (default greedy Acc@1), `VQAV2_LIMIT`,
+`TENSOR_PARALLEL_SIZE`, `OUTPUT_ROOT`. Default greedy Acc@1 is the canonical
+single-number setting; raise `PASS_K`+`GEN_TEMPERATURE` for a pass@k read.
 
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:

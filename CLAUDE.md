@@ -128,6 +128,12 @@ Difference from what this repo does today:
   `baseline/eval/run_vqa_eval.py` + `baseline/eval/vqa_metrics.py` +
   `scripts/eval_vqa.sh` (POPE F1 / ChartQA relaxed accuracy / VQAv2 soft accuracy —
   `BENCHMARKS=pope,chartqa,vqav2`, one engine load for all three).
+- `scripts/eval_suite.sh` + `baseline/eval/aggregate_suite.py` — **one-command full
+  suite**: runs the LLM-judged group (`eval_opd.sh`: MathVista/MathVerse/MathVision/
+  MMMU/MMMU-Pro×2/MMStar/HallusionBench) and the deterministic group (`eval_vqa.sh`:
+  POPE/ChartQA/VQAv2), then merges both `summary.json`s into one table (POPE split by
+  category +avg, MMMU-Pro split by sub-score +avg). Deterministic metrics are NOT
+  judged; only the math/MCQ group uses the judge.
 - `baseline/teacher_grpo/` — recipe to GRPO-train a stronger **Qwen3-VL** teacher
   on Vision-SR1 via **ms-swift** (separate venv `/root/shihao_project/swift-env`,
   not the OPD env). `prepare_vision_sr1.py` (HF→ms-swift JSONL+images),

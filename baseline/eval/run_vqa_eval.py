@@ -91,6 +91,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vqav2-split", default="validation")
     p.add_argument("--limit", type=int, default=None, help="Max samples per benchmark.")
     p.add_argument(
+        "--vqav2-limit",
+        type=int,
+        default=None,
+        help="Max VQAv2 samples (overrides --limit for VQAv2 only; its val set is "
+        "~214k, vs a few-k for POPE/ChartQA).",
+    )
+    p.add_argument(
         "--prompt-suffix",
         default=None,
         help="Override the per-benchmark answer-format suffix (default: per-benchmark).",
@@ -265,6 +272,7 @@ def _extract_vqa_answers(raw: Any) -> list[str]:
 def load_vqav2_samples(args: argparse.Namespace) -> list[EvalSample]:
     data = _open_dataset(args.vqav2_repo, args.vqav2_split)
     columns = list(getattr(data, "column_names", []) or [])
+    limit = args.vqav2_limit if args.vqav2_limit is not None else args.limit
     samples: list[EvalSample] = []
     for index in range(len(data)):
         row = dict(data[index])
@@ -289,7 +297,7 @@ def load_vqav2_samples(args: argparse.Namespace) -> list[EvalSample]:
                 raw={"benchmark_meta": meta},
             )
         )
-        if args.limit is not None and len(samples) >= args.limit:
+        if limit is not None and len(samples) >= limit:
             break
     _require_samples(samples, "vqav2", columns)
     return samples

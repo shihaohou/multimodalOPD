@@ -42,6 +42,9 @@ CHARTQA_SPLIT="${CHARTQA_SPLIT:-test}"
 VQAV2_REPO="${VQAV2_REPO:-lmms-lab/VQAv2}"
 VQAV2_SPLIT="${VQAV2_SPLIT:-validation}"
 LIMIT="${LIMIT:-}"
+# VQAv2-only cap (its val set is ~214k vs a few-k for POPE/ChartQA); overrides
+# LIMIT for VQAv2 only, so you can keep POPE/ChartQA full while sampling VQAv2.
+VQAV2_LIMIT="${VQAV2_LIMIT:-}"
 # Answer-format suffix appended to each question (the system prompt already forces
 # \boxed{}). Unset -> the script's per-benchmark default (yes/no for POPE, "single
 # word or phrase" for ChartQA/VQAv2). Set PROMPT_SUFFIX="" to force the bare
@@ -94,6 +97,9 @@ if [[ "$PROMPT_SUFFIX" != "__DEFAULT__" ]]; then
 fi
 if [[ -n "$LIMIT" ]]; then
   CMD+=(--limit "$LIMIT")
+fi
+if [[ -n "$VQAV2_LIMIT" ]]; then
+  CMD+=(--vqav2-limit "$VQAV2_LIMIT")
 fi
 if [[ -n "$VLLM_MAX_MODEL_LEN" ]]; then
   CMD+=(--max-model-len "$VLLM_MAX_MODEL_LEN")
