@@ -8,7 +8,11 @@ deepspeed_config:
   overlap_comm: true
   contiguous_gradients: true
   gradient_clip: 1
-  gradient_accumulation_steps: 1
+  # Integer, MUST equal the launcher's GRADIENT_ACCUMULATION_STEPS (default 8) —
+  # accelerate's native deepspeed config rejects `auto`. Do NOT also pass
+  # `--gradient_accumulation_steps` to `accelerate launch` (compounds -> inflated
+  # eff_batch). See accelerate_zero2_gpu_8.yaml.
+  gradient_accumulation_steps: 8
 distributed_type: DEEPSPEED
 downcast_bf16: 'auto'
 machine_rank: 0
