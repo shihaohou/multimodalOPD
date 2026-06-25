@@ -48,6 +48,18 @@ JUDGE_KEY_ENV="${JUDGE_KEY_ENV:-DEEPSEEK_API_KEY}"
 DET_BENCHMARKS="${DET_BENCHMARKS:-pope,chartqa,vqav2}"
 VQAV2_LIMIT="${VQAV2_LIMIT:-}"
 
+# Optional: ALSO report pass@k / avg@k for the judged (math/MCQ) group. Adds a
+# second, sampled generation pass (PASS_K=SAMPLED_K, temperature>0) over the judged
+# datasets; pass@8 and pass@16 are estimated from the SAME N samples (unbiased
+# estimator), so it costs ~N x the greedy generation, not N x per k. OFF by default.
+# Not applied to POPE/ChartQA/VQAv2 — pass@k on yes/no / short-answer is not a
+# standard metric there (their official greedy metric is the headline).
+MULTI_K="${MULTI_K:-false}"
+SAMPLED_K="${SAMPLED_K:-16}"               # N samples generated = max usable k
+PASSK_KS="${PASSK_KS:-1,8,16}"            # which k to report pass@k for
+SAMPLED_TEMPERATURE="${SAMPLED_TEMPERATURE:-1.0}"
+SAMPLED_TOP_P="${SAMPLED_TOP_P:-0.9}"
+
 # Fail early with a helpful message if the judged group has no judge configured.
 if [[ "$GRADER" == "llm" && "$SKIP_JUDGE" != "true" ]]; then
   if [[ -z "${!JUDGE_KEY_ENV:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
@@ -59,7 +71,7 @@ if [[ "$GRADER" == "llm" && "$SKIP_JUDGE" != "true" ]]; then
   fi
 fi
 
-echo "== [1/3] judged group (grader=$GRADER) -> $OUTPUT_ROOT/judged =="
+echo "== judged group (grader=$GRADER, greedy Acc@1) -> $OUTPUT_ROOT/judged =="
 OUTPUT_DIR="$OUTPUT_ROOT/judged" MODEL_NAME="$MODEL_NAME" \
   EVAL_DATASETS="$JUDGED_DATASETS" EVAL_BENCHMARKS="" \
   PASS_K="$PASS_K" GEN_TEMPERATURE="$GEN_TEMPERATURE" \
@@ -67,7 +79,7 @@ OUTPUT_DIR="$OUTPUT_ROOT/judged" MODEL_NAME="$MODEL_NAME" \
   GRADER="$GRADER" SKIP_JUDGE="$SKIP_JUDGE" JUDGE_KEY_ENV="$JUDGE_KEY_ENV" \
   bash scripts/eval_opd.sh
 
-echo "== [2/3] deterministic group (no judge) -> $OUTPUT_ROOT/vqa =="
+echo "== deterministic group (no judge, greedy official metric) -> $OUTPUT_ROOT/vqa =="
 OUTPUT_DIR="$OUTPUT_ROOT/vqa" MODEL_NAME="$MODEL_NAME" \
   BENCHMARKS="$DET_BENCHMARKS" \
   PASS_K="$PASS_K" GEN_TEMPERATURE="$GEN_TEMPERATURE" \
@@ -75,9 +87,26 @@ OUTPUT_DIR="$OUTPUT_ROOT/vqa" MODEL_NAME="$MODEL_NAME" \
   VQAV2_LIMIT="$VQAV2_LIMIT" \
   bash scripts/eval_vqa.sh
 
-echo "== [3/3] aggregate -> $OUTPUT_ROOT/suite_summary.json =="
-uv run python baseline/eval/aggregate_suite.py \
-  --judged-summary "$OUTPUT_ROOT/judged/summary.json" \
-  --vqa-summary "$OUTPUT_ROOT/vqa/summary.json" \
-  --model-name "$MODEL_NAME" \
+if [[ "$MULTI_K" == "true" ]]; then
+  echo "== sampled pass for pass@k/avg@k (judged group, N=$SAMPLED_K temp=$SAMPLED_TEMPERATURE) -> $OUTPUT_ROOT/judged_sampled =="
+  OUTPUT_DIR="$OUTPUT_ROOT/judged_sampled" MODEL_NAME="$MODEL_NAME" \
+    EVAL_DATASETS="$JUDGED_DATASETS" EVAL_BENCHMARKS="" \
+    PASS_K="$SAMPLED_K" GEN_TEMPERATURE="$SAMPLED_TEMPERATURE" GEN_TOP_P="$SAMPLED_TOP_P" \
+    TENSOR_PARALLEL_SIZE="$TENSOR_PARALLEL_SIZE" \
+    GRADER="$GRADER" SKIP_JUDGE="$SKIP_JUDGE" JUDGE_KEY_ENV="$JUDGE_KEY_ENV" \
+    bash scripts/eval_opd.sh
+fi
+
+echo "== aggregate -> $OUTPUT_ROOT/suite_summary.json =="
+AGG=(
+  uv run python baseline/eval/aggregate_suite.py
+  --judged-summary "$OUTPUT_ROOT/judged/summary.json"
+  --vqa-summary "$OUTPUT_ROOT/vqa/summary.json"
+  --ks "$PASSK_KS"
+  --model-name "$MODEL_NAME"
   --output "$OUTPUT_ROOT/suite_summary.json"
+)
+if [[ "$MULTI_K" == "true" ]]; then
+  AGG+=(--sampled-summary "$OUTPUT_ROOT/judged_sampled/summary.json")
+fi
+"${AGG[@]}"

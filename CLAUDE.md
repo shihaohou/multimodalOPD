@@ -133,7 +133,11 @@ Difference from what this repo does today:
   MMMU/MMMU-Pro×2/MMStar/HallusionBench) and the deterministic group (`eval_vqa.sh`:
   POPE/ChartQA/VQAv2), then merges both `summary.json`s into one table (POPE split by
   category +avg, MMMU-Pro split by sub-score +avg). Deterministic metrics are NOT
-  judged; only the math/MCQ group uses the judge.
+  judged; only the math/MCQ group uses the judge. `MULTI_K=true` adds a sampled pass
+  for `pass@k`/`avg@k` on the judged group (`baseline/eval/passk.py`, unbiased Codex
+  estimator — pass@8/16 from the same N samples). Note: greedy Acc@1 is the
+  lmms-eval-comparable number; we prompt with the OPD training prompt (not lmms-eval's
+  per-task templates), so absolute numbers differ — the harness is for relative compare.
 - `baseline/teacher_grpo/` — recipe to GRPO-train a stronger **Qwen3-VL** teacher
   on Vision-SR1 via **ms-swift** (separate venv `/root/shihao_project/swift-env`,
   not the OPD env). `prepare_vision_sr1.py` (HF→ms-swift JSONL+images),

@@ -58,7 +58,8 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/eval/run_mmvp_eval.py` | MMVP pair-metric MCQ eval (vLLM gen + rule MCQ match, **no judge**; single-question + pair accuracy). |
 | `baseline/eval/run_vqa_eval.py` | POPE / ChartQA / VQAv2 short-answer eval (vLLM gen + official per-benchmark metric, **no judge**; one engine load, all three). |
 | `baseline/eval/vqa_metrics.py` | Pure metric primitives for the above (POPE F1, ChartQA relaxed accuracy, VQAv2 soft accuracy). |
-| `baseline/eval/aggregate_suite.py` | Merge the judged + deterministic group summaries into one suite table (POPE per-category +avg, MMMU-Pro per-subscore +avg). |
+| `baseline/eval/aggregate_suite.py` | Merge the judged + deterministic group summaries into one suite table (POPE per-category +avg, MMMU-Pro per-subscore +avg; optional pass@k/avg@k). |
+| `baseline/eval/passk.py` | Unbiased pass@k / avg@k estimator over N samples (Codex estimator), from the per-attempt judge verdicts. |
 | `baseline/serve_teacher.py` | vLLM teacher scoring server (`/score_topk`, top-k `prompt_logprobs`). |
 | `baseline/teacher_client.py` | HTTP client the trainer uses for the `vllm_server` teacher. |
 | `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
@@ -388,8 +389,47 @@ CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> GRADER=rule bash scripts/eval_suite.sh
 
 Knobs (env): `JUDGED_DATASETS`, `DET_BENCHMARKS`, `GRADER` (`llm`/`rule`),
 `SKIP_JUDGE`, `PASS_K` / `GEN_TEMPERATURE` (default greedy Acc@1), `VQAV2_LIMIT`,
-`TENSOR_PARALLEL_SIZE`, `OUTPUT_ROOT`. Default greedy Acc@1 is the canonical
-single-number setting; raise `PASS_K`+`GEN_TEMPERATURE` for a pass@k read.
+`TENSOR_PARALLEL_SIZE`, `OUTPUT_ROOT`.
+
+#### Also report pass@k / avg@k (`MULTI_K=true`)
+
+By default the suite reports **greedy Acc@1** (one sample). Set `MULTI_K=true` to
+*additionally* report `avg@N` and `pass@8` / `pass@16` for the judged (math/MCQ)
+group. It runs one extra **sampled** pass over those datasets (`PASS_K=SAMPLED_K`,
+`SAMPLED_TEMPERATURE>0`) and estimates pass@k for every k from the *same* N samples
+(unbiased Codex estimator, `baseline/eval/passk.py`) — so pass@8 and pass@16 cost
+~N× the greedy generation, **not** N× per k. POPE/ChartQA/VQAv2 stay greedy-only
+(pass@k on yes/no / short-answer is not a standard metric; their official greedy
+metric is the headline).
+
+```bash
+MODEL_PATH=<model> MULTI_K=true SAMPLED_K=16 PASSK_KS=1,8,16 VQAV2_LIMIT=2000 \
+  bash scripts/eval_suite.sh
+```
+
+Extra knobs: `MULTI_K`, `SAMPLED_K` (N samples = max k, default 16), `PASSK_KS`
+(default `1,8,16`), `SAMPLED_TEMPERATURE` (1.0), `SAMPLED_TOP_P` (0.9). Note
+`avg@k = c/N` is the per-sample mean (k-independent, so avg@8 ≈ avg@16); the
+k-dependent signal lives in `pass@k`. `pass@1 == avg`.
+
+#### Metrics & lmms-eval parity
+
+`lmms-eval` (the de-facto VLM eval) decodes **greedy, single-sample** and reports
+each benchmark's official metric — so the number to compare against it is our
+**greedy Acc@1**; `pass@k`/`avg@k` is an extra sampling-robustness view, not an
+lmms-eval metric. On the metric *math* we match it where it is deterministic:
+**POPE** (accuracy/precision/recall/F1/yes-ratio per category), **ChartQA**
+(relaxed accuracy), **VQAv2** (official `VQAEval` normalization + soft accuracy)
+are ported from the same reference implementations. For **MathVista / MathVerse /
+MathVision** lmms-eval uses a GPT model for answer *extraction*; we use an LLM
+*judge* for correctness — aligned in spirit, not bit-identical. For **MMMU /
+MMMU-Pro / MMStar** lmms-eval uses a rule-based option parser; we default to the
+judge (set `GRADER=rule` to get closer). **HallusionBench** here is aAcc-style
+only. The biggest intentional difference: we prompt every benchmark with the **OPD
+training prompt** (unified system + `\boxed{}`), not lmms-eval's per-task
+templates — so absolute numbers differ from the public leaderboard; this harness is
+built for *consistent relative* comparison (before/after OPD, student vs teacher),
+not for reproducing leaderboard values.
 
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:
