@@ -147,6 +147,7 @@ def main() -> None:
             f"max_tokens={script_args.tam_max_tokens}"
         )
         print(f"Output directory: {training_args.output_dir}")
+        print(f"Dataset name: {script_args.dataset_name}  (split={script_args.dataset_split})")
         print("=" * 80 + "\n")
 
     set_seed(training_args.seed)
@@ -241,8 +242,22 @@ def main() -> None:
     if script_args.max_train_samples is not None:
         dataset = dataset.select(range(min(script_args.max_train_samples, len(dataset))))
     if script_args.filter_tiny_images:
+        pre = len(dataset)
         dataset = dataset_utils.filter_tiny_image_samples(
             dataset, min_image_size=script_args.min_image_size
+        )
+        if os.environ.get("LOCAL_RANK", "0") == "0":
+            print(f"Dataset filtering removed {pre - len(dataset)}/{pre} samples.")
+    if os.environ.get("LOCAL_RANK", "0") == "0":
+        cap = (
+            f"  (capped by max_train_samples={script_args.max_train_samples})"
+            if script_args.max_train_samples is not None
+            else ""
+        )
+        print(
+            f"[OPD-TAM] dataset={script_args.dataset_name} split={script_args.dataset_split} "
+            f"-> {len(dataset)} training examples{cap}",
+            flush=True,
         )
 
     data_collator = OPDDataCollator(
