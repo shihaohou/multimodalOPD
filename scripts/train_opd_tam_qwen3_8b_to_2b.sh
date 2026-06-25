@@ -55,10 +55,21 @@ ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_gpu_8.yaml}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH}"
 TEACHER_MODEL="${TEACHER_MODEL}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
-# sdpa so the HF training forward runs without flash-attn built (TAM does NOT need
-# eager — it uses output_hidden_states, not attention weights).
-ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
-TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-sdpa}"
+# Default to flash_attention_2 when flash-attn is actually built in the env, else
+# fall back to sdpa so the launcher never crashes on a box without flash-attn. TAM
+# is flash-compatible — it reads output_hidden_states, not attention weights.
+# Override either var explicitly to force a choice (the import probe is then skipped).
+if [[ -z "${ATTN_IMPLEMENTATION:-}" || -z "${TEACHER_ATTN_IMPLEMENTATION:-}" ]]; then
+  if uv run python -c "import flash_attn" >/dev/null 2>&1; then
+    _ATTN_DEFAULT=flash_attention_2
+    echo "[opd-tam-qwen3] flash-attn detected -> attn_implementation=flash_attention_2."
+  else
+    _ATTN_DEFAULT=sdpa
+    echo "[opd-tam-qwen3] flash-attn not importable -> attn_implementation=sdpa (set ATTN_IMPLEMENTATION=flash_attention_2 to force)."
+  fi
+fi
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-${_ATTN_DEFAULT:-sdpa}}"
+TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-${_ATTN_DEFAULT:-sdpa}}"
 FINETUNING_MODE="${FINETUNING_MODE:-full}"
 # Train the vision tower (matches the vanilla full-FT OPD baseline for a clean
 # OPD-vs-OPD+TAM comparison; the migration doc's MVP "freeze ViT" is overridden
