@@ -150,7 +150,7 @@ COMPLETION_LOG_MAX_SAMPLES="${COMPLETION_LOG_MAX_SAMPLES:-16}"
 # forward returns regardless of gradient checkpointing — no attention capture to
 # be swallowed, unlike the evidence path).
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
-SAVE_STEPS="${SAVE_STEPS:-200}"
+SAVE_STEPS="${SAVE_STEPS:-5}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-100}"
 SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-true}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
