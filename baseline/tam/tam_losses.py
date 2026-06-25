@@ -183,7 +183,8 @@ def tam_alignment_loss(
     n = int(student_maps.shape[0])
     if n == 0:
         zero = student_maps.sum() * 0.0
-        return zero, {"tam_div": zero.detach(), "tam_gate_mean": zero.detach(), "tam_n": 0}
+        z = zero.detach()
+        return zero, {"tam_div": z, "tam_js": z, "tam_gate_mean": z, "tam_n": 0}
 
     s = student_maps.float()
     t = teacher_maps.detach().float()
@@ -210,8 +211,17 @@ def tam_alignment_loss(
 
     gate_sum = gate.sum().clamp_min(eps)
     loss = (gate * divergence_per_token).sum() / gate_sum
+    # Monitor-only (no grad): gate-weighted JS over the same blurred/gated tokens —
+    # a divergence-agnostic convergence signal logged to W&B no matter which
+    # `divergence` drives the loss. JS is symmetric + bounded ([0, ln2]) so it reads
+    # cleanly as "are the student & teacher maps actually agreeing on WHERE", even
+    # while the loss optimizes cosine / mse / l1. Never affects training.
+    with torch.no_grad():
+        js_per_token = js_divergence(_sum_normalize(s), _sum_normalize(t))
+        js_monitor = (gate * js_per_token).sum() / gate_sum
     stats = {
         "tam_div": divergence_per_token.detach().mean(),
+        "tam_js": js_monitor.detach(),
         "tam_gate_mean": gate.detach().mean(),
         "tam_n": n,
     }

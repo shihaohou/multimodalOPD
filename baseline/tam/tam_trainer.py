@@ -155,6 +155,7 @@ class TAMTrainer(OPDTrainer):
 
         loss_terms: list[torch.Tensor] = []
         div_sum = 0.0
+        js_sum = 0.0
         gate_sum = 0.0
         n_total = 0
         valid_samples = 0
@@ -246,6 +247,7 @@ class TAMTrainer(OPDTrainer):
             loss_terms.append(loss_b)
             n_b = int(stats_b["tam_n"])
             div_sum += float(stats_b["tam_div"]) * n_b
+            js_sum += float(stats_b["tam_js"]) * n_b
             gate_sum += float(stats_b["tam_gate_mean"]) * n_b
             n_total += n_b
             valid_samples += 1
@@ -257,6 +259,7 @@ class TAMTrainer(OPDTrainer):
             "tam_valid_samples": float(valid_samples),
             "tam_n_selected": float(n_total),
             "tam_div_sum": div_sum,
+            "tam_js_sum": js_sum,
             "tam_gate_sum": gate_sum,
         }
 
@@ -430,6 +433,7 @@ class TAMTrainer(OPDTrainer):
         if n_sel > 0:
             metrics["loss_tam"] = (tam_loss_value, 1.0)
             metrics["tam_div"] = (tam_stats.get("tam_div_sum", 0.0), n_sel)
+            metrics["tam_js"] = (tam_stats.get("tam_js_sum", 0.0), n_sel)
             metrics["tam_gate_mean"] = (tam_stats.get("tam_gate_sum", 0.0), n_sel)
             metrics["tam_n_selected"] = (
                 n_sel,
