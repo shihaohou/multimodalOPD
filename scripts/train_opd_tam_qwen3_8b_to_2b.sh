@@ -102,9 +102,11 @@ GENERATION_TOP_P="${GENERATION_TOP_P:-1.0}"
 GENERATION_TOP_K="${GENERATION_TOP_K:-0}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
-OPD_LOSS_MODE="${OPD_LOSS_MODE:-full_kl}"
+# Default top-k reverse KL (top-100): OPD-ecosystem standard, ~99% mass, and avoids
+# the full-vocab exp/diff OOM at mb8. OPD_LOSS_MODE=full_kl for exact full-vocab KL.
+OPD_LOSS_MODE="${OPD_LOSS_MODE:-topk_kl}"
 OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-reverse}"
-OPD_TOP_K="${OPD_TOP_K:-32}"
+OPD_TOP_K="${OPD_TOP_K:-100}"
 TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 
 # --- TAM visual-evidence alignment knobs (migration doc §2 / MVP) -------------

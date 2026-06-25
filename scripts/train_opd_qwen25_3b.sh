@@ -85,12 +85,15 @@ GENERATION_TOP_P="${GENERATION_TOP_P:-1.0}"
 GENERATION_TOP_K="${GENERATION_TOP_K:-0}"
 DISTILL_TEMPERATURE="${DISTILL_TEMPERATURE:-1.0}"
 LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
-# Distillation loss. Default = exact reverse KL (canonical OPD); the local teacher
-# has full logits so full-vocab is free. Use topk_kl + forward for the vllm_server
-# teacher (it returns only the teacher's top-k logprobs).
-OPD_LOSS_MODE="${OPD_LOSS_MODE:-full_kl}"          # full_kl | topk_kl
+# Distillation loss. Default = top-k reverse KL (top-100): the OPD-ecosystem
+# standard (verl/Uni-OPD/thunlp-OPD), ~99% of the probability mass, and it avoids
+# the full-vocab exp/diff that OOMs at micro-batch 8 on long completions (so it also
+# frees memory to run mb8). Set OPD_LOSS_MODE=full_kl for exact full-vocab KL via
+# vigos masked_kl_loss (canonical but heavier). vllm_server teacher must use
+# topk_kl + forward (it returns only the teacher's top-k logprobs).
+OPD_LOSS_MODE="${OPD_LOSS_MODE:-topk_kl}"          # topk_kl | full_kl
 OPD_KL_DIRECTION="${OPD_KL_DIRECTION:-reverse}"    # reverse | forward | jsd
-OPD_TOP_K="${OPD_TOP_K:-32}"
+OPD_TOP_K="${OPD_TOP_K:-100}"
 TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 PRESENCE_PENALTY="${PRESENCE_PENALTY:-0.0}"
 REPETITION_PENALTY="${REPETITION_PENALTY:-1.0}"

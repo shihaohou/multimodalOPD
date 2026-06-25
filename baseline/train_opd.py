@@ -88,12 +88,13 @@ class OPDScriptArguments:
     generation_top_k: int = 20
     distill_temperature: float = 1.0
     lambda_opd: float = 1.0
-    # Distillation divergence. Default = exact reverse KL (canonical OPD); the
-    # local teacher has full logits so full-vocab costs nothing. Use topk_kl +
-    # forward for the vllm_server teacher (it returns only the teacher's top-k).
-    opd_loss_mode: str = "full_kl"  # "full_kl" | "topk_kl"
+    # Distillation divergence. Default = top-k reverse KL (top-100): the OPD-ecosystem
+    # standard (verl/Uni-OPD/thunlp-OPD), ~99% of the mass, and it avoids the
+    # full-vocab exp/diff that OOMs at micro-batch 8 on long completions. Set
+    # full_kl for exact full-vocab KL (canonical but heavier).
+    opd_loss_mode: str = "topk_kl"  # "topk_kl" | "full_kl"
     opd_kl_direction: str = "reverse"  # "reverse" | "forward" | "jsd"
-    opd_top_k: int = 32
+    opd_top_k: int = 100
     # Freeze the Qwen-VL vision tower under full FT. Off by default: at a real
     # multi-GPU effective batch (e.g. 32) the ViT gradient spikes average out and
     # full FT incl. ViT is stable (matches Vision-OPD). Turn on only as a fallback
