@@ -79,6 +79,8 @@ class OPDScriptArguments:
     lora_r: int = 64
     lora_alpha: int = 128
     lora_dropout: float = 0.05
+    # Comma-separated module list (LLM only by default), or "all-linear" to also
+    # cover the vision tower + merger (ViT+LLM LoRA).
     lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
     answer_field: str = "answer"
     # Format instruction now lives in the unified system prompt; user = raw question.
@@ -284,11 +286,19 @@ def main() -> None:
                 f"{total / 1e9:.2f}B total parameters."
             )
     elif script_args.finetuning_mode == "lora":
-        target_modules = [
-            module.strip()
-            for module in script_args.lora_target_modules.split(",")
-            if module.strip()
-        ]
+        # "all-linear" is a PEFT sentinel: attach LoRA to every nn.Linear except
+        # the output head — i.e. the vision tower + multimodal merger + LLM all
+        # get adapters (the only robust way to cover the ViT without hardcoding
+        # its module names). Anything else is an explicit comma-separated list.
+        raw_targets = script_args.lora_target_modules.strip()
+        if raw_targets == "all-linear":
+            target_modules = "all-linear"
+        else:
+            target_modules = [
+                module.strip()
+                for module in raw_targets.split(",")
+                if module.strip()
+            ]
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
             r=script_args.lora_r,
