@@ -38,10 +38,11 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/opd_qwen25_3b_${RUN_ID}}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
 # Attention impl for the HF training forward (student + local_hf teacher). Default
-# sdpa so training runs without flash-attn installed; set flash_attention_2 once
-# it is built. (eval + vllm_server teacher use vLLM and never need flash-attn.)
-ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
-TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-sdpa}"
+# flash_attention_2 (faster + lower memory); if flash-attn isn't built the model
+# load errors loudly — set ATTN_IMPLEMENTATION=sdpa TEACHER_ATTN_IMPLEMENTATION=sdpa
+# to fall back. (eval + vllm_server teacher use vLLM and never need flash-attn.)
+ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
+TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-flash_attention_2}"
 # Full-parameter training by default (like Vision-OPD); set to "lora" for a
 # cheap memory-constrained run.
 FINETUNING_MODE="${FINETUNING_MODE:-full}"
@@ -55,13 +56,13 @@ MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 # Full FT. Paper (Vision-OPD/VGS Table 4) global batch 512 = per_device 4 x
-# grad_accum 16 x 8 GPU. per_device 4 is the stable max on the 140GB cards (~3.5h).
-# per_device 8 is faster (~2h) BUT OOMs the training forward on heavy multi-image
-# batches and lowering vLLM util does NOT help: vLLM is small here (~129G is the
-# per_device-8 training activation itself, not the KV cache). Only fewer sequences
-# per micro-step fixes it. Rescale grad_accum to keep batch 512 if you change GPUs.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
+# eff_batch = per_device(8) x grad_accum(8) x 8 GPU = 512. per_device 8 is the fast
+# default now that flash_attention_2 + topk_kl cut the training-forward memory (it
+# was OOM-prone under the old sdpa + full_kl, hence the previous per_device-4
+# default). If you still OOM on heavy multi-image batches, drop to per_device 4
+# grad_accum 16 (also 512). Rescale grad_accum to keep eff_batch 512 if GPUs change.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 # Paper (Table 4): AdamW, lr 1e-6, weight_decay 1e-2, constant schedule, no warmup.
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
