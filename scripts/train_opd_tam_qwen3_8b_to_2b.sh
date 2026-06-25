@@ -82,12 +82,12 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# Default eff_batch = pd(4)*ga(16)*world(8) = 512 (matches the OPD baseline). TAM
+# Default eff_batch = pd(8)*ga(8)*world(8) = 512 (matches the OPD baseline). TAM
 # adds two output_hidden_states forwards, so pd only affects memory, not the
-# gradient: if OOM, PER_DEVICE_TRAIN_BATCH_SIZE=2 GRADIENT_ACCUMULATION_STEPS=32
-# (still 512); if memory is plentiful, pd=8 ga=8. eff_batch = pd*ga*world.
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
+# gradient: if OOM, drop to PER_DEVICE_TRAIN_BATCH_SIZE=4 GRADIENT_ACCUMULATION_STEPS=16
+# (or pd=2 ga=32; still 512). eff_batch = pd*ga*world.
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 LR_SCHEDULER_TYPE="${LR_SCHEDULER_TYPE:-constant}"
