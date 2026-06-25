@@ -62,6 +62,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--divergence", default="cosine", choices=["cosine", "js", "l1"])
     p.add_argument("--no_eci", dest="use_eci", action="store_false", default=True)
     p.add_argument("--no_blur", dest="blur", action="store_false", default=True)
+    p.add_argument(
+        "--allow_no_vision_grad",
+        action="store_true",
+        help="Downgrade the 'gradient reached the vision tower' assertion to a "
+        "warning (use when the ViT is frozen, or no text precedes the image).",
+    )
     return p.parse_args()
 
 
@@ -240,14 +246,23 @@ def main() -> None:
         if "visual." in name and g > 0:
             vis_probe = (name, g)
             break
+    assert any_probe is not None, "zero gradient everywhere — the TAM path is detached!"
     if vis_probe is not None:
         print(f"[sanity] vision-tower grad: {vis_probe[0]} |grad|.mean = {vis_probe[1]:.3e} (want > 0) ✅")
-    elif any_probe is not None:
-        print(
-            f"[sanity] NO vision-tower grad found, but {any_probe[0]} has |grad|.mean = "
-            f"{any_probe[1]:.3e}. (Vision tower may be frozen, or no text precedes the image.)"
+    else:
+        msg = (
+            "NO gradient reached the student vision tower (no `visual.*` param has "
+            f"grad; e.g. {any_probe[0]} |grad|.mean={any_probe[1]:.3e} got grad instead). "
+            "The TAM term is moving the LLM/projector but NOT the visual representation "
+            "— the core TAM claim is unverified."
         )
-    assert any_probe is not None, "zero gradient everywhere — the TAM path is detached!"
+        if args.allow_no_vision_grad:
+            print(f"[sanity] {msg}  (allowed via --allow_no_vision_grad)")
+        else:
+            raise AssertionError(
+                msg + " Re-run with --allow_no_vision_grad if this is expected "
+                "(frozen ViT)."
+            )
 
     peak_gb = torch.cuda.max_memory_allocated() / 1e9
     print(f"\npeak CUDA memory = {peak_gb:.2f} GB")
