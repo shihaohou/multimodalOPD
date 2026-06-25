@@ -23,26 +23,35 @@ from vigos.data_collator import (
     _message_with_optional_image,
 )
 
-# Qwen2.5-VL / Qwen3-VL group pixels into 28-px spatial patches, and the HF image
-# processor *infers* the channel axis from the array shape. A degenerate side of
-# 1 or 3 px (e.g. a 1-px-tall sliver) is mistaken for the channel dimension, so a
-# 3-element mean/std is applied to a "1-channel" image and preprocessing dies with
-#   ValueError: mean must have 1 elements if it is an iterable, got 3
-# Pad any too-small side up to the patch factor so the (H, W, 3) layout stays
-# unambiguous (both spatial dims >= 28, never in {1, 3}) and smart_resize is happy.
+# Qwen2.5-VL / Qwen3-VL share the SAME HF image processor, which *infers* the
+# channel axis from the raw array shape (before any resize) and which aborts on
+# extreme aspect ratios. Two degenerate geometries crash it regardless of model:
+#   * a side of 1 or 3 px (e.g. a 1-px-tall sliver): the size-1/3 spatial axis is
+#     mistaken for the channel axis, so a 3-element mean/std hits a "1-channel"
+#     image -> "ValueError: mean must have 1 elements if it is an iterable, got 3";
+#   * aspect ratio > 200: smart_resize raises "absolute aspect ratio must be < 200".
+# Center-pad the offending image so both sides are >= one patch and the ratio stays
+# in range. Only pathological images are touched; normal ones pass through as-is.
 _MIN_IMAGE_SIDE = 28
+_MAX_ASPECT_RATIO = 180  # safely under the processor's hard limit of 200
 
 
 def _safe_rgb_image(value: Any) -> Image.Image:
-    """RGB-convert (via vigos) and pad away degenerate, channel-ambiguous sizes."""
+    """RGB-convert (via vigos) and center-pad away geometries the processor rejects."""
     image = _as_rgb_image(value)
     width, height = image.size
-    if width >= _MIN_IMAGE_SIDE and height >= _MIN_IMAGE_SIDE:
+    target_w = max(width, _MIN_IMAGE_SIDE)
+    target_h = max(height, _MIN_IMAGE_SIDE)
+    # Grow the short side so max/min ratio stays within smart_resize's allowed range.
+    if max(target_w, target_h) > _MAX_ASPECT_RATIO * min(target_w, target_h):
+        if target_w < target_h:
+            target_w = -(-target_h // _MAX_ASPECT_RATIO)  # ceil division
+        else:
+            target_h = -(-target_w // _MAX_ASPECT_RATIO)
+    if target_w == width and target_h == height:
         return image
-    new_width = max(width, _MIN_IMAGE_SIDE)
-    new_height = max(height, _MIN_IMAGE_SIDE)
-    canvas = Image.new("RGB", (new_width, new_height))
-    canvas.paste(image, ((new_width - width) // 2, (new_height - height) // 2))
+    canvas = Image.new("RGB", (target_w, target_h))
+    canvas.paste(image, ((target_w - width) // 2, (target_h - height) // 2))
     return canvas
 
 # Dataset-agnostic instruction appended to the raw problem so the rollout still
