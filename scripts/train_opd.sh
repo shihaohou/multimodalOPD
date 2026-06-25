@@ -34,7 +34,8 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost,0.0.0.0"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_gpu_8.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-runs/opd_qwen25_3b_${RUN_ID}}"
+# OUTPUT_DIR is derived from the (date-stamped) RUN_CONFIG below unless set here.
+OUTPUT_DIR="${OUTPUT_DIR:-}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
 # Attention impl for the HF training forward (student + local_hf teacher). Default
@@ -160,7 +161,10 @@ if [[ -n "$VLLM_SERVER_REQUEST_BATCH_SIZE" ]]; then
   VLLM_SERVER_ARGS+=(--vllm_server_request_batch_size "$VLLM_SERVER_REQUEST_BATCH_SIZE")
 fi
 
-RUN_CONFIG="${RUN_CONFIG:-opd_qwen25_3b_gen${MAX_COMPLETION_LENGTH}_mb${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_np${NUM_PROCESSES}}"
+# Date-stamp RUN_CONFIG (and thus the derived OUTPUT_DIR + wandb run_name) so
+# re-runs never overwrite. Appended even to a user-supplied RUN_CONFIG.
+RUN_CONFIG="${RUN_CONFIG:-opd_gen${MAX_COMPLETION_LENGTH}_mb${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_np${NUM_PROCESSES}}_${RUN_ID}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
   --config_file "$ACCELERATE_CONFIG" \

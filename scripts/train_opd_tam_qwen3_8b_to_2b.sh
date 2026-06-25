@@ -186,10 +186,12 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
-# Auto-name encodes lambda_tam + ViT mode (fullft vs freezevit) so OPD (ltam0) /
-# OPD+TAM / full-FT / frozen-ViT runs are distinguishable without passing RUN_CONFIG.
+# Auto-name encodes lambda_tam + ViT mode (fullft vs freezevit) + a RUN_ID date
+# stamp, so OPD (ltam0) / OPD+TAM / full-FT / frozen-ViT runs are distinguishable
+# AND re-runs never overwrite each other. The date is appended even to a
+# user-supplied RUN_CONFIG; pass OUTPUT_DIR explicitly only to opt out.
 VIT_TAG=$([[ "$FREEZE_VISION_TOWER" == "true" ]] && echo freezevit || echo fullft)
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${VIT_TAG}}"
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${VIT_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
