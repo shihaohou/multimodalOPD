@@ -122,6 +122,12 @@ Difference from what this repo does today:
   Pipeline: vLLM gen pass@k → `\boxed` extract → OpenAI-compatible judge →
   pass@k/avg@k → `responses/`,`judgments/`,`summary.json`. Full-FT writes a full
   checkpoint, so eval points straight at the run dir (no merge).
+- Dedicated **deterministic** evals (no LLM judge; official per-benchmark metric;
+  reuse `run_opd_eval`'s `generate_records`/`make_engine` under the same OPD prompt):
+  `baseline/eval/run_mmvp_eval.py` + `scripts/eval_mmvp.sh` (MMVP pair accuracy);
+  `baseline/eval/run_vqa_eval.py` + `baseline/eval/vqa_metrics.py` +
+  `scripts/eval_vqa.sh` (POPE F1 / ChartQA relaxed accuracy / VQAv2 soft accuracy —
+  `BENCHMARKS=pope,chartqa,vqav2`, one engine load for all three).
 - `baseline/teacher_grpo/` — recipe to GRPO-train a stronger **Qwen3-VL** teacher
   on Vision-SR1 via **ms-swift** (separate venv `/root/shihao_project/swift-env`,
   not the OPD env). `prepare_vision_sr1.py` (HF→ms-swift JSONL+images),

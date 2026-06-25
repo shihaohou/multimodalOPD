@@ -56,11 +56,14 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/eval/opd_eval_prompt.py` | General eval prompt (dataset problem + suffix, no prefill). |
 | `baseline/eval/run_opd_eval.py` | General multi-benchmark eval harness (vLLM gen + LLM judge + pass@k/avg@k). |
 | `baseline/eval/run_mmvp_eval.py` | MMVP pair-metric MCQ eval (vLLM gen + rule MCQ match, **no judge**; single-question + pair accuracy). |
+| `baseline/eval/run_vqa_eval.py` | POPE / ChartQA / VQAv2 short-answer eval (vLLM gen + official per-benchmark metric, **no judge**; one engine load, all three). |
+| `baseline/eval/vqa_metrics.py` | Pure metric primitives for the above (POPE F1, ChartQA relaxed accuracy, VQAv2 soft accuracy). |
 | `baseline/serve_teacher.py` | vLLM teacher scoring server (`/score_topk`, top-k `prompt_logprobs`). |
 | `baseline/teacher_client.py` | HTTP client the trainer uses for the `vllm_server` teacher. |
 | `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
 | `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
 | `scripts/eval_mmvp.sh` | MMVP eval launcher (runs `baseline/eval/run_mmvp_eval.py`). |
+| `scripts/eval_vqa.sh` | POPE/ChartQA/VQAv2 eval launcher (runs `baseline/eval/run_vqa_eval.py`). |
 | `scripts/serve_teacher_vllm.sh` | Launch the teacher scoring server. |
 
 ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
@@ -281,8 +284,8 @@ CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> EVAL_DATASETS="$DS" \
 ```
 
 Caveats: HallusionBench here ≈ aAcc only (not fAcc/qAcc); MMMU-Pro = average the
-`mmmu_pro_10options` + `mmmu-pro-vision` sub-scores; ChartQA + the official
-per-benchmark metrics → use VLMEvalKit / lmms-eval.
+`mmmu_pro_10options` + `mmmu-pro-vision` sub-scores. POPE / ChartQA / VQAv2 have
+their own official metrics — use the dedicated `scripts/eval_vqa.sh` below.
 
 ### MMVP (pair metric — visual-perception / ViT-unfreeze probe)
 
@@ -306,6 +309,52 @@ CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> LIMIT=4 bash scripts/eval_mmvp.sh
 `MMVP/MMVP`), `IMAGE_DIR`, `PAIR_SIZE` (2), `LIMIT`, `PASS_K` / `GEN_TEMPERATURE`
 (raise temperature if `PASS_K>1`), `OUTPUT_DIR`. Per-category buckets populate only
 if the source CSV carries a category column.
+
+### POPE / ChartQA / VQAv2 (short-answer, official per-benchmark metrics)
+
+Three classic single-image benchmarks, each scored by its **own canonical official
+metric**, deterministically and with **no LLM judge** (no API key). Run under the
+unified OPD system prompt; one `scripts/eval_vqa.sh` invocation loads the vLLM
+engine once and evaluates each requested benchmark in turn.
+
+| Benchmark | Headline metric | Also reported |
+|-----------|-----------------|---------------|
+| **POPE** (hallucination, yes/no) | **F1** | accuracy / precision / recall / yes-ratio, per category (random/popular/adversarial) |
+| **ChartQA** (chart QA) | **relaxed accuracy** (numeric within 5 %, else exact) | human vs augmented split + their mean |
+| **VQAv2** (open-ended VQA) | **VQA soft accuracy** (`min(1, agreement/3)` over the 10 human answers, official normalization) | per answer-type (yes/no, number, other) |
+
+Sources default to the canonical **lmms-lab** HF datasets and are auto-downloaded
+& cached on first use (the box can connect to HF directly). To pre-fetch (or for an
+offline box, then point `*_REPO` at the local dir):
+
+```bash
+# POPE — all 3 categories incl. adversarial (~9k yes/no questions, images embedded)
+hf download lmms-lab/POPE    --repo-type dataset --local-dir $D/POPE
+# ChartQA — test split, human + augmented (~2.5k, images embedded)
+hf download lmms-lab/ChartQA --repo-type dataset --local-dir $D/ChartQA
+# VQAv2 — validation split (the one you don't have yet; large, ~214k Q + images)
+hf download lmms-lab/VQAv2   --repo-type dataset --local-dir $D/VQAv2
+```
+
+```bash
+# all three, greedy single-sample (canonical); writes summary.json with all metrics
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> bash scripts/eval_vqa.sh
+# smoke test (8 questions each) first:
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> LIMIT=8 bash scripts/eval_vqa.sh
+# skip VQAv2 (large) / run just POPE adversarial like your local split:
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> BENCHMARKS=pope POPE_CATEGORY=adversarial bash scripts/eval_vqa.sh
+# use locally-downloaded copies instead of HF:
+CUDA_VISIBLE_DEVICES=0 MODEL_PATH=<model> POPE_REPO=$D/POPE CHARTQA_REPO=$D/ChartQA VQAV2_REPO=$D/VQAv2 \
+  bash scripts/eval_vqa.sh
+```
+
+`summary.json` → `benchmarks.{pope,chartqa,vqav2}.metrics` (e.g.
+`benchmarks.pope.metrics.f1`, `…chartqa.metrics.relaxed_accuracy`,
+`…vqav2.metrics.vqa_accuracy`; all reported as 0–1 fractions). Knobs (env):
+`BENCHMARKS` (`pope,chartqa,vqav2`), `POPE_REPO` / `POPE_CATEGORY`, `CHARTQA_REPO`,
+`VQAV2_REPO` / `VQAV2_SPLIT`, `LIMIT`, `PROMPT_SUFFIX`, `PASS_K` / `GEN_TEMPERATURE`
+(raise temperature if `PASS_K>1`), `OUTPUT_DIR`. VQAv2 validation is large — set
+`LIMIT` for a quick read, or drop it from `BENCHMARKS`.
 
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:
@@ -336,6 +385,9 @@ MODEL_PATH=runs/opd_qwen25_3b_merged bash scripts/eval_opd.sh
 - [x] MMVP pair-metric eval (`baseline/eval/run_mmvp_eval.py`) — deterministic
       MCQ/pair scorer (no judge); probes whether unfreezing the ViT in OPD helped
       or hurt general visual perception.
+- [x] POPE / ChartQA / VQAv2 eval (`baseline/eval/run_vqa_eval.py`) — official
+      per-benchmark metrics (F1 / relaxed accuracy / VQA soft accuracy), deterministic
+      (no judge), one engine load for all three.
 - [ ] Model/architecture experiments (e.g. attention modifications) on the student.
 - [ ] Optional completion-sample logging for OPD rollouts.
 - [x] Top-k KL loss (`topk_kl`, forward/reverse/jsd) — local HF teacher.
