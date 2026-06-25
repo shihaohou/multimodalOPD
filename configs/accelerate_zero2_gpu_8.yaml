@@ -8,7 +8,11 @@ deepspeed_config:
   overlap_comm: true
   contiguous_gradients: true
   gradient_clip: 1
-  gradient_accumulation_steps: 1
+  # `auto` -> filled from TrainingArguments.gradient_accumulation_steps (single
+  # source of truth). A hardcoded value here triple-specifies ga (config + the
+  # `accelerate launch --gradient_accumulation_steps` flag + the script arg) and
+  # inflates the effective batch (e.g. 512 -> 2048). Do NOT set a number here.
+  gradient_accumulation_steps: auto
 distributed_type: DEEPSPEED
 downcast_bf16: 'auto'
 machine_rank: 0

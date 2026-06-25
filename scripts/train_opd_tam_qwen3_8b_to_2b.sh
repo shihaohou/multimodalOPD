@@ -201,7 +201,6 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 uv run accelerate launch \
   --config_file "$ACCELERATE_CONFIG" \
   --num_processes "$NUM_PROCESSES" \
-  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --main_process_port "${MAIN_PROCESS_PORT:-13391}" \
   baseline/train_opd_tam.py \
   --model_name_or_path "$MODEL_NAME_OR_PATH" \
