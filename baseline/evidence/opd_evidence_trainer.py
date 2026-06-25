@@ -511,6 +511,16 @@ class OPDEvidenceTrainer(OPDTrainer):
             "completion_length": (completion_token_count, num_sequences),
             "completion_token_ratio": (completion_token_count, completion_token_total),
         }
+        metrics.update(
+            self._rollout_diagnostic_metrics(
+                completion_ids,
+                completion_attention,
+                student_kl_logits,
+                teacher_kl_logits,
+                completion_token_count,
+                num_sequences,
+            )
+        )
         n_sel = evidence_stats.get("ev_n_selected", 0.0)
         if n_sel > 0:
             metrics["loss_ev"] = (evidence_loss_value, 1.0)

@@ -195,6 +195,10 @@ class OPDTrainer(ViGOSTrainer):
                 temperature=self.distill_temperature,
                 token_clip=self.token_loss_clip,
             )
+            # The server returns only top-k teacher logprobs, not full logits, so
+            # the teacher-vs-student rollout curves are unavailable here.
+            student_diag_logits = student_logits
+            teacher_diag_logits = None
         else:
             # Local frozen teacher forward (full logits). full_kl+reverse uses the
             # exact full-vocab path (vigos.losses.masked_kl_loss); everything else
@@ -246,6 +250,8 @@ class OPDTrainer(ViGOSTrainer):
                     completion_attention,
                     completion_ids,
                 )
+            student_diag_logits = student_kl_logits
+            teacher_diag_logits = teacher_kl_logits
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
@@ -265,19 +271,126 @@ class OPDTrainer(ViGOSTrainer):
             (completion_attention.shape[0],), dtype=torch.float32
         )
         _, num_sequences, _ = self._distributed_rate_stats(seq_indicator)
-        self._record_loss_metrics(
-            {
-                # loss_opd is the per-token reverse KL KL(student||teacher) — the KL curve.
-                "loss_opd": (opd_loss_numerator, opd_loss_count),
-                "answer_accuracy": (answer_correct_count, answer_count),
-                "completion_length": (completion_token_count, num_sequences),
-                "completion_token_ratio": (
-                    completion_token_count,
-                    completion_token_total,
-                ),
-            }
+        metrics: dict[str, tuple[float, float]] = {
+            # loss_opd is the per-token reverse KL KL(student||teacher) — the KL curve.
+            "loss_opd": (opd_loss_numerator, opd_loss_count),
+            "answer_accuracy": (answer_correct_count, answer_count),
+            "completion_length": (completion_token_count, num_sequences),
+            "completion_token_ratio": (
+                completion_token_count,
+                completion_token_total,
+            ),
+        }
+        metrics.update(
+            self._rollout_diagnostic_metrics(
+                completion_ids,
+                completion_attention,
+                student_diag_logits,
+                teacher_diag_logits,
+                completion_token_count,
+                num_sequences,
+            )
         )
+        self._record_loss_metrics(metrics)
 
         if return_outputs:
             return loss, {"logits": student_logits.detach()}
         return loss
+
+    @torch.no_grad()
+    def _rollout_diagnostic_metrics(
+        self,
+        completion_ids: torch.Tensor,
+        completion_attention: torch.Tensor,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor | None,
+        completion_token_count: float,
+        num_sequences: float,
+    ) -> dict[str, tuple[float, float]]:
+        """Per-step rollout health curves under the ``rollout/`` W&B namespace.
+
+        Mirrors the rich rollout logging in the Uni-OPD / miles RL stack: instead
+        of only the mean loss we surface what the policy is actually *doing* each
+        step — how long and how often-truncated its samples are, how confident vs.
+        exploratory it is, and how far the frozen teacher disagrees with the tokens
+        the student actually drew.
+
+        Cheap and grad-free: one extra ``log_softmax`` over the completion logits
+        we already hold (no second forward). Every value is reduced to a
+        ``(global_numerator, global_denominator)`` pair through the same DDP path
+        as the loss metrics (:meth:`_distributed_rate_stats`), so sparse masks stay
+        correctly weighted. The returned dict is ready to merge into the
+        ``_record_loss_metrics`` call.
+
+        ``teacher_logits=None`` (the ``vllm_server`` top-k path, which has no full
+        teacher logits) records the student-only curves and skips the teacher ones.
+        """
+        mask = completion_attention.to(dtype=torch.float32)
+        metrics: dict[str, tuple[float, float]] = {}
+
+        # --- response length / truncation ------------------------------------
+        # "clipped" = the rollout never emitted EOS inside its active span, i.e.
+        # generation stopped on max_new_tokens rather than finishing cleanly. A
+        # rising clip ratio means the length budget is throttling the policy.
+        eos_ids = self._normalize_eos_token_ids(self._eos_token_id())
+        if eos_ids and num_sequences > 0:
+            is_eos = torch.zeros_like(completion_attention, dtype=torch.bool)
+            for token_id in eos_ids:
+                is_eos = is_eos | (completion_ids == token_id)
+            finished = (is_eos & completion_attention.to(dtype=torch.bool)).any(dim=1)
+            clipped = (~finished).to(dtype=torch.float32)
+            _, clipped_sum, _ = self._distributed_rate_stats(clipped)
+            metrics["rollout/response_clip_ratio"] = (clipped_sum, num_sequences)
+
+        if completion_token_count <= 0:
+            return metrics
+
+        student_logits = student_logits.float()
+        # clamp() (not in-place) so we never mutate the shared rollout tensor.
+        ids = completion_ids.clamp(0, student_logits.shape[-1] - 1).unsqueeze(-1)
+
+        # --- student policy curves (available for every teacher source) -------
+        student_logp = torch.log_softmax(student_logits, dim=-1)
+        # log p the student assigns to its own sampled tokens — policy confidence.
+        student_tok_logp = student_logp.gather(-1, ids).squeeze(-1) * mask
+        _, student_logp_sum, _ = self._distributed_rate_stats(student_tok_logp)
+        metrics["rollout/student_logprob"] = (student_logp_sum, completion_token_count)
+        # Token-level entropy of the policy on its own samples — exploration signal.
+        entropy = -(student_logp.exp() * student_logp).sum(dim=-1) * mask
+        _, entropy_sum, _ = self._distributed_rate_stats(entropy)
+        metrics["rollout/entropy"] = (entropy_sum, completion_token_count)
+        del student_logp, entropy
+
+        # --- teacher-vs-student curves (local full-logit teacher only) --------
+        if teacher_logits is not None:
+            teacher_logits = teacher_logits.float()
+            t_ids = completion_ids.clamp(0, teacher_logits.shape[-1] - 1).unsqueeze(-1)
+            teacher_logp = torch.log_softmax(teacher_logits, dim=-1)
+            teacher_tok_logp = teacher_logp.gather(-1, t_ids).squeeze(-1) * mask
+            _, teacher_logp_sum, _ = self._distributed_rate_stats(teacher_tok_logp)
+            metrics["rollout/teacher_logprob"] = (
+                teacher_logp_sum,
+                completion_token_count,
+            )
+            del teacher_logp
+            # teacher - student log p on the student's own samples: the core OPD
+            # signal. >0 ⇒ the teacher would rather have drawn what the student drew
+            # (it shrinks as the student converges toward the teacher).
+            metrics["rollout/teacher_minus_student_logprob"] = (
+                teacher_logp_sum - student_logp_sum,
+                completion_token_count,
+            )
+            # Fraction of completion tokens where the argmax token agrees — a
+            # coarse distillation-progress curve, robust to vocab-size mismatch.
+            vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
+            agree = (
+                student_logits[..., :vocab].argmax(dim=-1)
+                == teacher_logits[..., :vocab].argmax(dim=-1)
+            ).to(dtype=torch.float32) * mask
+            _, agree_sum, _ = self._distributed_rate_stats(agree)
+            metrics["rollout/teacher_top1_agreement"] = (
+                agree_sum,
+                completion_token_count,
+            )
+
+        return metrics
