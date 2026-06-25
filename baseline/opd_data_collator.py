@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+from PIL import Image
 
 from vigos.answer_utils import normalize_reference_answer
 from vigos.data_collator import (
@@ -21,6 +22,28 @@ from vigos.data_collator import (
     _format_reasoning_reference,
     _message_with_optional_image,
 )
+
+# Qwen2.5-VL / Qwen3-VL group pixels into 28-px spatial patches, and the HF image
+# processor *infers* the channel axis from the array shape. A degenerate side of
+# 1 or 3 px (e.g. a 1-px-tall sliver) is mistaken for the channel dimension, so a
+# 3-element mean/std is applied to a "1-channel" image and preprocessing dies with
+#   ValueError: mean must have 1 elements if it is an iterable, got 3
+# Pad any too-small side up to the patch factor so the (H, W, 3) layout stays
+# unambiguous (both spatial dims >= 28, never in {1, 3}) and smart_resize is happy.
+_MIN_IMAGE_SIDE = 28
+
+
+def _safe_rgb_image(value: Any) -> Image.Image:
+    """RGB-convert (via vigos) and pad away degenerate, channel-ambiguous sizes."""
+    image = _as_rgb_image(value)
+    width, height = image.size
+    if width >= _MIN_IMAGE_SIDE and height >= _MIN_IMAGE_SIDE:
+        return image
+    new_width = max(width, _MIN_IMAGE_SIDE)
+    new_height = max(height, _MIN_IMAGE_SIDE)
+    canvas = Image.new("RGB", (new_width, new_height))
+    canvas.paste(image, ((new_width - width) // 2, (new_height - height) // 2))
+    return canvas
 
 # Dataset-agnostic instruction appended to the raw problem so the rollout still
 # emits a parseable final answer for the answer-accuracy metric / downstream eval.
@@ -92,7 +115,7 @@ class OPDDataCollator(ViGOSDataCollator):
         sample_ids: list[int] = []
 
         for local_idx, feature in enumerate(features):
-            image = _as_rgb_image(feature.get("images", feature.get("image")))
+            image = _safe_rgb_image(feature.get("images", feature.get("image")))
             problem = str(feature["problem"]).strip()
             reference = _format_reasoning_reference(feature, self.answer_field)
             answer = normalize_reference_answer(feature.get(self.answer_field))
