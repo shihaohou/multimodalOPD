@@ -167,5 +167,5 @@ custom autograd (recompute just the selected query rows) reduces it further.
 
 - Usage / knobs: `README_OPD.md`
 - Architecture / method: `CLAUDE.md`, `docs/OPD_BASELINE_PLAN.md`
-- Launcher: `scripts/train_opd_qwen25_3b.sh` (generic; set model paths per line)
+- Launcher: `scripts/train_opd.sh` (generic; set model paths per line)
 - Box paths / run commands: see agent memory `opd-run-paths-h800`

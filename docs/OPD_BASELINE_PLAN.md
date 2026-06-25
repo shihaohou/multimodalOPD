@@ -7,7 +7,7 @@
 > **实现状态（已落地，设计微调）**：最终采用**独立入口文件**而非在 `train_vigos.py`/`trainer.py` 内分流，
 > 以保证 ViGOS 原文件零改动。实际代码位于独立的 `baseline/` 包（`vigos/` 仅作为库被复用）：
 > `baseline/opd_data_collator.py`（`OPDDataCollator`）、`baseline/opd_trainer.py`（`OPDTrainer(ViGOSTrainer)` 仅覆写 `compute_loss`）、
-> `baseline/train_opd.py`（入口）、`scripts/train_opd_qwen25_3b.sh`、`README_OPD.md`。
+> `baseline/train_opd.py`（入口）、`scripts/train_opd.sh`、`README_OPD.md`。
 > 下面第 2、3 节描述的"改 `train_vigos.py`/`trainer.py`"为早期方案，逻辑等价、仅作参考；以独立文件为准。
 > data_collator 也**未改动**——OPD 的 prompt 逻辑放在新的 `OPDDataCollator` 里（子类复用 `_encode`）。
 
@@ -154,7 +154,7 @@ def _compute_opd_loss(self, model, inputs, return_outputs=False):
 - `masked_kl_loss(source, target, mask)` = `KL(source‖target)`（现有 ref 项已是 `masked_kl_loss(student, ref, ...)` 这种反向 KL 用法）
 - `_distributed_masked_loss_with_stats`（DDP 全局归一化，**必须保留**）
 
-## 4. 新增 `scripts/train_opd_qwen25_3b.sh`
+## 4. 新增 `scripts/train_opd.sh`
 基于 `scripts/train_vigos_qwen25_3b.sh` 复制，改动：
 - 新增（必填）`TEACHER_MODEL="${TEACHER_MODEL:?Set TEACHER_MODEL ...}"`
 - 传 `--training_mode opd --teacher_model_name_or_path "$TEACHER_MODEL" --student_prompt_style cot --lambda_opd "${LAMBDA_OPD:-1.0}"`
@@ -177,7 +177,7 @@ DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \
 TEACHER_MODEL=Qwen/Qwen2.5-VL-7B-Instruct \
 MAX_STEPS=5 SAVE_STEPS=5 REPORT_TO=none \
 VLLM_GPU_MEMORY_UTILIZATION=0.30 \
-bash scripts/train_opd_qwen25_3b.sh
+bash scripts/train_opd.sh
 ```
 检查：能跑通；`loss_opd` 为正且下降趋势；`answer_accuracy` 有输出；显存不 OOM。
 

@@ -62,7 +62,7 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `baseline/eval/passk.py` | Unbiased pass@k / avg@k estimator over N samples (Codex estimator), from the per-attempt judge verdicts. |
 | `baseline/serve_teacher.py` | vLLM teacher scoring server (`/score_topk`, top-k `prompt_logprobs`). |
 | `baseline/teacher_client.py` | HTTP client the trainer uses for the `vllm_server` teacher. |
-| `scripts/train_opd_qwen25_3b.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
+| `scripts/train_opd.sh` | Train launcher (runs `baseline/train_opd.py`); env-var overrides. |
 | `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
 | `scripts/eval_mmvp.sh` | MMVP eval launcher (runs `baseline/eval/run_mmvp_eval.py`). |
 | `scripts/eval_vqa.sh` | POPE/ChartQA/VQAv2 eval launcher (runs `baseline/eval/run_vqa_eval.py`). |
@@ -104,7 +104,7 @@ launcher's `--system`); switching datasets needs no prompt changes.
 ```bash
 DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \
 TEACHER_MODEL=Qwen/Qwen2.5-VL-7B-Instruct \
-bash scripts/train_opd_qwen25_3b.sh
+bash scripts/train_opd.sh
 ```
 
 `TEACHER_MODEL` may be a base checkpoint or an RL/SFT-tuned one; it must be the
@@ -125,7 +125,7 @@ M=/path/to/models
 MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct TEACHER_MODEL=$M/Qwen3-VL-8B-Instruct \
 DATASET_NAME=.../Vision-SR1-47K \
 RUN_CONFIG=opd_qwen3_8b_to_2b OUTPUT_DIR=runs/opd_qwen3_8b_to_2b \
-bash scripts/train_opd_qwen25_3b.sh
+bash scripts/train_opd.sh
 ```
 
 At startup the run prints its real world size — **confirm it before trusting a run**:
@@ -204,7 +204,7 @@ TENSOR_PARALLEL_SIZE=2 PORT=8200 bash scripts/serve_teacher_vllm.sh
 CUDA_VISIBLE_DEVICES=2,3,4,5,6,7 \
 DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \
 TEACHER_SOURCE=vllm_server TEACHER_SERVER_URL=http://127.0.0.1:8200 \
-bash scripts/train_opd_qwen25_3b.sh
+bash scripts/train_opd.sh
 ```
 
 > Query the teacher at temperature 1.0 (the server does); `DISTILL_TEMPERATURE`
@@ -215,7 +215,7 @@ bash scripts/train_opd_qwen25_3b.sh
 
 Full-FT is heavy: it co-locates a full-parameter student (params + grads +
 Adam state, ZeRO-2-sharded), a **replicated frozen teacher** on every GPU, and
-the colocate vLLM engine. The default `scripts/train_opd_qwen25_3b.sh` uses
+the colocate vLLM engine. The default `scripts/train_opd.sh` uses
 `per_device_train_batch_size=1`, `gradient_accumulation_steps=4`, and
 `VLLM_GPU_MEMORY_UTILIZATION=0.30`.
 

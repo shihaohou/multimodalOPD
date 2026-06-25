@@ -113,7 +113,7 @@ Difference from what this repo does today:
   `topk_kl`+`forward`, since the server returns only the teacher's top-k logprobs.
 - `baseline/train_opd.py` — standalone entry point (`OPDScriptArguments`,
   `--teacher_model_name_or_path` required). Imports `vigos.*` as a library.
-- `scripts/train_opd_qwen25_3b.sh` — launcher (runs `baseline/train_opd.py`;
+- `scripts/train_opd.sh` — launcher (runs `baseline/train_opd.py`;
   `TEACHER_MODEL` env required).
 - `README_OPD.md` — the project README for this OPD work.
 - `baseline/eval/` + `scripts/eval_opd.sh` — **general** multi-benchmark eval
@@ -170,7 +170,7 @@ teacher must run a **local HF forward** (vLLM logprob is top-k only); the frozen
 teacher is replicated per GPU, so budget memory (3B/4B student + 7B teacher fits
 on 8×A100-80G under ZeRO-2; 7B full-FT student needs ZeRO-3 offload + an
 unpartitioned-teacher fix; ≥32B teacher needs TP/top-k KL).
-Run: `DATASET_NAME=... TEACHER_MODEL=... bash scripts/train_opd_qwen25_3b.sh`.
+Run: `DATASET_NAME=... TEACHER_MODEL=... bash scripts/train_opd.sh`.
 
 Roadmap (per user): general multi-benchmark eval framework, and model/attention
 architecture changes on the student — keep new work in OPD-specific files.

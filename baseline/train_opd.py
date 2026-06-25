@@ -10,7 +10,7 @@ Example
 -------
     DATASET_NAME=LMMs-Lab-Turtle/Vision-SR1-47K \\
     TEACHER_MODEL=Qwen/Qwen2.5-VL-7B-Instruct \\
-    bash scripts/train_opd_qwen25_3b.sh
+    bash scripts/train_opd.sh
 """
 
 from __future__ import annotations

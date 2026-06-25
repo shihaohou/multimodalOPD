@@ -57,7 +57,7 @@ bash baseline/teacher_grpo/train_teacher_grpo.sh 2>&1 | tee grpo.log
   # -> <...>-merged ; use that as TEACHER_MODEL in OPD
   ```
 
-Then in OPD: `TEACHER_MODEL=<merged-or-full-ckpt> bash scripts/train_opd_qwen25_3b.sh`
+Then in OPD: `TEACHER_MODEL=<merged-or-full-ckpt> bash scripts/train_opd.sh`
 (student = Qwen3-VL-2B; both qwen3_vl, same vocab).
 
 ## Verified working setup (8×H800, driver 560.35.03 / CUDA 12.9, 2026-06-23)

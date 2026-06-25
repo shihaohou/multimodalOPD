@@ -3,7 +3,7 @@ set -euo pipefail
 
 # OPD preset: Qwen3-VL-8B (frozen teacher) -> Qwen3-VL-2B (student), ViT FROZEN.
 #
-# Thin wrapper over the generic launcher scripts/train_opd_qwen25_3b.sh: it only
+# Thin wrapper over the generic launcher scripts/train_opd.sh: it only
 # pins the Qwen3-VL student/teacher pair and turns on FREEZE_VISION_TOWER. Every
 # other knob keeps the generic script's paper-aligned (Vision-OPD/VGS Table 4)
 # defaults and stays env-overridable. Freezing the vision tower (visual.*) only
@@ -63,4 +63,4 @@ echo "[opd-qwen3-freezevit] student=$MODEL_NAME_OR_PATH"
 echo "[opd-qwen3-freezevit] teacher=$TEACHER_MODEL  (frozen)"
 echo "[opd-qwen3-freezevit] freeze_vision_tower=$FREEZE_VISION_TOWER  output_dir=$OUTPUT_DIR"
 
-exec bash "$ROOT_DIR/scripts/train_opd_qwen25_3b.sh"
+exec bash "$ROOT_DIR/scripts/train_opd.sh"
