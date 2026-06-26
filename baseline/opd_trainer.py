@@ -27,6 +27,7 @@ from baseline.opd_losses import (
     masked_topk_kl_loss,
     masked_topk_kl_loss_from_teacher_topk,
 )
+from vigos.answer_utils import extract_boxed_content
 from vigos.losses import masked_kl_loss
 from vigos.trainer import ViGOSTrainer
 
@@ -377,21 +378,60 @@ class OPDTrainer(ViGOSTrainer):
         rollout: dict[str, Any],
         step: int,
     ) -> list[dict[str, Any]]:
-        """Augment the inherited rollout snapshot with the full student prompt.
+        """Self-contained rollout snapshot for the OPD family.
 
-        OPD has no privileged teacher prompt, so the only prompt worth logging is
-        the non-privileged student prompt actually fed to the rollout: the
-        ``OPD_SYSTEM_PROMPT`` + user(image placeholder + raw question), exactly as
-        rendered for vLLM/HF generation. The base record only carries the raw
-        ``problem`` text; we add the rendered ``prompt`` so each snapshot row is a
-        self-contained (prompt -> completion) pair.
+        The OPD / TAM / evidence rollout comes straight from
+        ``_generate_on_policy`` and therefore lacks the ViGOS span masks
+        (``valid_mask`` / ``description_available_mask`` /
+        ``reasoning_available_mask`` / ``description_texts``) that the base
+        ``ViGOSTrainer._completion_snapshot_records`` reads — delegating to
+        ``super()`` here KeyErrors and crashes the rank. Build the records
+        directly from the keys the OPD rollout does have, and record the full
+        student prompt (the model's entire input: ``OPD_SYSTEM_PROMPT`` +
+        user(image placeholder + raw question)) alongside each completion so each
+        row is a self-contained prompt -> completion pair.
         """
-        records = super()._completion_snapshot_records(raw_inputs, rollout, step)
-        prompts = self._metadata_values(
-            raw_inputs.get("student_prompt_texts"), len(records)
+        completion_ids = rollout["completion_ids"]
+        completion_attention = rollout["completion_attention_mask"]
+        batch_size = completion_ids.shape[0]
+        accelerator = getattr(self, "accelerator", None)
+        rank = int(getattr(accelerator, "process_index", 0) or 0)
+        epoch = getattr(getattr(self, "state", None), "epoch", None)
+        sample_ids = self._metadata_values(raw_inputs.get("sample_ids"), batch_size)
+        problems = self._metadata_values(raw_inputs.get("vigos_problems"), batch_size)
+        references = self._metadata_values(
+            raw_inputs.get("vigos_references"), batch_size
         )
-        for idx, record in enumerate(records):
-            record["prompt"] = prompts[idx]
+        answers = self._metadata_values(raw_inputs.get("vigos_answers"), batch_size)
+        prompts = self._metadata_values(
+            raw_inputs.get("student_prompt_texts"), batch_size
+        )
+
+        records = []
+        for row_idx in range(batch_size):
+            valid_length = int(completion_attention[row_idx].sum().item())
+            completion_text = self._decode_token_ids(
+                completion_ids[row_idx, :valid_length],
+                skip_special_tokens=True,
+            )
+            answer_correct = self._answers_match(
+                extract_boxed_content(completion_text),
+                answers[row_idx],
+            )
+            records.append(
+                {
+                    "global_step": step,
+                    "epoch": epoch,
+                    "rank": rank,
+                    "local_row": row_idx,
+                    "sample_id": sample_ids[row_idx],
+                    "problem": problems[row_idx],
+                    "reference": references[row_idx],
+                    "prompt": prompts[row_idx],
+                    "completion": completion_text,
+                    "answer_correct": answer_correct,
+                }
+            )
         return records
 
     @torch.no_grad()
