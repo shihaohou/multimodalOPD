@@ -47,7 +47,8 @@ set -euo pipefail
 #       judged names join as DSROOT/name (missing skipped); pope/chartqa/vqav2 route
 #       to eval_vqa.sh regardless of DSROOT.
 #   DATASET_DIRS="/abs/d1,/abs/d2,..."   explicit JUDGED dirs only (no det routing).
-# Optional: NGPU (8), GPUS="0,1,2,..." (overrides NGPU), OUTPUT_ROOT, RUN_ID, DRYRUN=1.
+# Optional: NGPU (8), GPUS="0,1,2,..." (overrides NGPU), OUTPUT_ROOT, RUN_ID, DRYRUN=1,
+#   RESUME=1 (rerun the same command -> only the failed/missing jobs are redone).
 #
 # Two-phase example (saturate 8 cards on everything, judge with a model you deploy later):
 #   # 1) generate judged + fully score the deterministic group, across all 8 GPUs:
@@ -84,6 +85,13 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-eval_outputs/bench_${RUN_ID}}"
 DRYRUN="${DRYRUN:-0}"
 PHASE="${PHASE:-all}"   # generate | judge | all
+# RESUME -> skip jobs whose output is already complete, so rerunning the SAME command
+# only redoes the failed/missing ones (generate/all: needs summary.json; judge: needs
+# judgments/*.jsonl). Accept 1/true/yes/on.
+case "$(printf '%s' "${RESUME:-}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) RESUME=true ;;
+  *) RESUME=false ;;
+esac
 
 # Default benchmark set (override DATASETS to run a subset). Judged group + the three
 # deterministic benchmarks (matched by name and routed to eval_vqa.sh).
@@ -184,26 +192,44 @@ fi
 DET_N=0; [[ -n "$DET_CSV" ]] && DET_N=$(( ${#_models[@]} ))
 echo "Planned ${#SPECS[@]} jobs (${JUDGED_N} judged + ${DET_N} deterministic) over ${NGPU} GPU(s) [${CARDS[*]}] -> ${OUTPUT_ROOT}"
 [[ -n "$DET_CSV" ]] && echo "  deterministic group: ${DET_CSV} (eval_vqa.sh, no judge)"
+[[ "$RESUME" == "true" ]] && echo "  RESUME=true: jobs already complete will be skipped"
 mkdir -p "$OUTPUT_ROOT"
+
+# A job's output dir. det -> <id>/_vqa; judged -> <id>/<sanitized-dataset>.
+job_out() {  # kind tag payload
+  if [[ "$1" == "det" ]]; then
+    printf '%s/%s/_vqa' "$OUTPUT_ROOT" "$2"
+  else
+    local s; s="$(basename "$3")"; s="${s//[^A-Za-z0-9_.-]/_}"
+    printf '%s/%s/%s' "$OUTPUT_ROOT" "$2" "$s"
+  fi
+}
+
+# Is this job's output already complete? generate/all finish with summary.json; the
+# judge phase finishes with judgments/*.jsonl (generate leaves that dir empty).
+job_done() {  # kind out
+  local kind="$1" out="$2" f
+  if [[ "$PHASE" == "judge" ]]; then
+    for f in "$out"/judgments/*.jsonl; do [[ -e "$f" ]] && return 0; done
+    return 1
+  fi
+  [[ -f "$out/summary.json" ]]
+}
 
 run_job() {  # kind card tag model payload
   local kind="$1" card="$2" tag="$3" model="$4" payload="$5"
-  local out logf safe
+  local out logf
   # Each job's log lives INSIDE its own output folder (no central logs/ dir), named
   # by phase so generate.log and judge.log sit next to that job's responses/summary.
+  out="$(job_out "$kind" "$tag" "$payload")"
+  mkdir -p "$out"
+  logf="$out/${PHASE}.log"
   if [[ "$kind" == "det" ]]; then
-    out="$OUTPUT_ROOT/$tag/_vqa"
-    mkdir -p "$out"
-    logf="$out/${PHASE}.log"
     CUDA_VISIBLE_DEVICES="$card" MODEL_PATH="$model" MODEL_NAME="$tag" \
       BENCHMARKS="$payload" OUTPUT_DIR="$out" \
       bash scripts/eval_vqa.sh > "$logf" 2>&1
     return
   fi
-  safe="$(basename "$payload")"; safe="${safe//[^A-Za-z0-9_.-]/_}"  # sanitize (no trailing _)
-  out="$OUTPUT_ROOT/$tag/$safe"
-  mkdir -p "$out"
-  logf="$out/${PHASE}.log"
   local -a job_env=(MODEL_PATH="$model" MODEL_NAME="$tag" EVAL_DATASETS="$payload" OUTPUT_DIR="$out")
   case "$PHASE" in
     generate) job_env+=(CUDA_VISIBLE_DEVICES="$card" SKIP_JUDGE=true) ;;
@@ -224,7 +250,10 @@ if [[ "$DRYRUN" == "1" ]]; then
   for spec in "${SPECS[@]}"; do
     IFS='|' read -r kind tag model payload <<< "$spec"
     label="$(spec_label "$kind" "$tag" "$payload")"
-    if [[ "$PHASE" == "judge" && "$kind" == "det" ]]; then
+    if [[ "$RESUME" == "true" && ! ( "$PHASE" == "judge" && "$kind" == "det" ) ]] \
+       && job_done "$kind" "$(job_out "$kind" "$tag" "$payload")"; then
+      echo "skip done (RESUME) | ${tag} | ${label}"
+    elif [[ "$PHASE" == "judge" && "$kind" == "det" ]]; then
       echo "skip (det scored in generate) | ${tag} | ${label}"
     elif [[ "$PHASE" == "judge" ]]; then
       echo "judge (no GPU) | ${tag} | ${label} | $model"
@@ -244,6 +273,10 @@ if [[ "$PHASE" == "judge" ]]; then
     IFS='|' read -r kind tag model payload <<< "$spec"
     [[ "$kind" == "det" ]] && continue   # deterministic already scored in generate
     i=$((i + 1))
+    if [[ "$RESUME" == "true" ]] && job_done "$kind" "$(job_out "$kind" "$tag" "$payload")"; then
+      echo "[judge ${i}/${total}] ${tag} | $(basename "$payload") -> skip done (RESUME)"
+      continue
+    fi
     echo "[judge ${i}/${total}] ${tag} | $(basename "$payload")"
     run_job "$kind" "" "$tag" "$model" "$payload" || echo "  (job exited non-zero; see log)"
   done
@@ -253,6 +286,11 @@ else
   # ---- generate / all: <=NGPU concurrent, one job pinned per free card ----
   declare -A SLOT  # SLOT[card]=pid of the job currently on that card
   for spec in "${SPECS[@]}"; do
+    IFS='|' read -r kind tag model payload <<< "$spec"
+    if [[ "$RESUME" == "true" ]] && job_done "$kind" "$(job_out "$kind" "$tag" "$payload")"; then
+      echo "[skip done] ${tag} | $(spec_label "$kind" "$tag" "$payload")  (RESUME)"
+      continue
+    fi
     card=""
     while [[ -z "$card" ]]; do
       for c in "${CARDS[@]}"; do
@@ -265,7 +303,6 @@ else
       # All cards busy: block until any job exits (tolerate its exit code).
       [[ -z "$card" ]] && { wait -n 2>/dev/null || sleep 3; }
     done
-    IFS='|' read -r kind tag model payload <<< "$spec"
     echo "[launch] card ${card} | ${tag} | $(spec_label "$kind" "$tag" "$payload")"
     run_job "$kind" "$card" "$tag" "$model" "$payload" &
     SLOT[$card]=$!
