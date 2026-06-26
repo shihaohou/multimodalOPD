@@ -34,6 +34,7 @@ from baseline.evidence.evidence_loss import (
 from baseline.evidence.saliency_engine import (
     SaliencyModelParts,
     compute_token_saliency_maps,
+    compute_token_saliency_maps_from_qkv,
     resolve_model_parts,
 )
 
@@ -41,6 +42,7 @@ __all__ = [
     "SaliencyModelParts",
     "resolve_model_parts",
     "compute_token_saliency_maps",
+    "compute_token_saliency_maps_from_qkv",
     "signed_corr_loss",
     "signed_pearson_corr",
     "normalized_abs_entropy",

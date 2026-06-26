@@ -48,7 +48,9 @@ shares a patch grid (required by the evidence loss) is an empirical check — se
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -69,6 +71,84 @@ def repeat_kv_heads(value: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(n_kv, n_rep, seq, dim)
         .reshape(n_kv * n_rep, seq, dim)
     )
+
+
+@contextlib.contextmanager
+def capture_qkv_attention(model: nn.Module, text_model: nn.Module, layer_ids):
+    """Capture the post-RoPE / post-QK-norm ``q,k,v`` (+ mask + scale) for a SUBSET
+    of decoder layers WITHOUT forcing eager — the forward stays on the model's
+    configured fast kernel (SDPA/Flash). This is the recompute path's replacement
+    for the legacy forced-eager ``output_attentions`` capture.
+
+    Mechanism: ``transformers`` selects each attention module's kernel per-forward
+    via ``ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]`` and hands it
+    the already-RoPE'd / QK-normed / pre-``repeat_kv`` ``query,key,value`` plus the
+    prepared ``attention_mask`` and ``scaling`` (exactly what ``eager_attention_forward``
+    consumes). We **temporarily override that kernel's registry entry** with a
+    wrapper that delegates to the real kernel (so the attention output — and thus
+    the OPD logits — are byte-for-byte unchanged) and, for the target layers only,
+    stashes those tensors. They stay in the autograd graph, so the saliency engine
+    can redo just the rows it needs and gradients still flow into ``q/k/v`` -> the
+    projections.
+
+    Crucially we do **not** touch ``config._attn_implementation``: a custom impl
+    string would make ``create_causal_mask`` (which checks the mask registry's
+    global mapping) early-exit and return ``None``, silently dropping the
+    causal+padding mask. Leaving the config on its real kernel keeps mask
+    construction correct (left-padding, sliding window, …); the override only swaps
+    the attention *function*, so the captured mask is exactly the one the model
+    used. Returns ``{layer_idx: {"q","k","v","mask","scaling"}}``.
+
+    ``model`` is accepted for call-site symmetry with ``force_eager_attention`` but
+    only ``text_model`` (the ``.layers`` stack) is used.
+    """
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    targets = {id(text_model.layers[l].self_attn): l for l in layer_ids}
+    stash: dict[int, dict[str, Any]] = {}
+
+    attn_cfg = getattr(text_model.layers[layer_ids[0]].self_attn, "config", None)
+    orig_impl = getattr(attn_cfg, "_attn_implementation", None) if attn_cfg is not None else None
+    if orig_impl is None or orig_impl == "eager":
+        raise RuntimeError(
+            "capture_qkv_attention needs a non-eager fast kernel (sdpa/flash) whose "
+            f"attention function it can override; got _attn_implementation={orig_impl!r}. "
+            "Run the student/teacher with attn_implementation=sdpa, or use "
+            "evidence_attn_mode='eager'."
+        )
+    # The genuine kernel to delegate to (read from the global mapping so a stray
+    # pre-existing local override can't make us delegate to ourselves).
+    real_fn = ALL_ATTENTION_FUNCTIONS._global_mapping[orig_impl]
+
+    def capture_fn(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+        out = real_fn(
+            module, query, key, value, attention_mask,
+            scaling=scaling, dropout=dropout, **kwargs,
+        )
+        lid = targets.get(id(module))
+        if lid is not None:
+            stash[lid] = {
+                "q": query,
+                "k": key,
+                "v": value,
+                "mask": attention_mask,
+                "scaling": getattr(module, "scaling", None) if scaling is None else scaling,
+            }
+        return out
+
+    # Override the kernel entry locally (getitem checks _local_mapping first), then
+    # restore whatever was there before — config is untouched throughout.
+    local = ALL_ATTENTION_FUNCTIONS._local_mapping
+    had_prev = orig_impl in local
+    prev = local.get(orig_impl)
+    local[orig_impl] = capture_fn
+    try:
+        yield stash
+    finally:
+        if had_prev:
+            local[orig_impl] = prev
+        else:
+            local.pop(orig_impl, None)
 
 
 @dataclass
@@ -216,6 +296,117 @@ def resolve_model_parts(
     return parts
 
 
+def _ov_contrib(
+    o_proj: nn.Module,
+    think_attn: torch.Tensor,
+    token_attn: torch.Tensor,
+    v_vis: torch.Tensor,
+    n_ans: int,
+    n_patch: int,
+    n_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """One layer's OV contribution: compose the two attention hops, weight the
+    visual value states, fold heads, project. Shared by the eager and the
+    recompute engines so the OV circuit is byte-identical between them.
+
+    ``think_attn`` ``[n_ans, H, T]`` (answer->reason), ``token_attn`` ``[H, T, P]``
+    (reason->visual), ``v_vis`` ``[H, P, d]`` -> ``[n_ans, P, hidden]``.
+    """
+    agg_attn = torch.einsum("aht,htp->ahp", think_attn, token_attn)  # [n_ans, H, P]
+    sv = agg_attn.unsqueeze(-1) * v_vis.unsqueeze(0)                 # [n_ans, H, P, d]
+    sv = sv.permute(0, 2, 1, 3).reshape(n_ans, n_patch, n_heads * head_dim)
+    return o_proj(sv)                                               # [n_ans, P, hidden]
+
+
+def _finalize_saliency(
+    parts: SaliencyModelParts,
+    logits_accum: torch.Tensor,
+    hidden_last_b: torch.Tensor,
+    answer_query_positions: torch.Tensor,
+    direction_ids: torch.Tensor,
+    grid_hw: tuple[int, int],
+    signed: bool,
+) -> torch.Tensor:
+    """Saliency_R1 normalization + direction-only unembed (grpo_trainer.py
+    1835-1847). Shared tail of both engines.
+
+    Applies the final RMSNorm *direction* but restores the pre-norm magnitude,
+    divides by the answer token's last-hidden norm, then contracts the lm_head
+    weight row for each generated direction id (never materializing the full
+    ``[n_ans, P, vocab]`` logits). ``[n_ans, P, hidden] -> [n_ans, H_grid, W_grid]``.
+    """
+    tm = parts.text_model
+    normed = tm.norm(logits_accum)                                 # [n_ans, P, hidden]
+    logits_accum = normed * logits_accum.norm(dim=-1, keepdim=True)
+    h_ans = hidden_last_b.index_select(0, answer_query_positions)  # [n_ans, hidden]
+    n_ans = int(h_ans.shape[0])
+    n_patch = int(logits_accum.shape[1])
+    hidden_norm = h_ans.norm(dim=-1).reshape(n_ans, 1, 1).clamp_min(1e-6)
+    logits_accum = logits_accum / hidden_norm
+
+    device = logits_accum.device
+    direction_ids = direction_ids.to(device=device, dtype=torch.long)
+    head_weight = getattr(parts.lm_head, "weight", None)
+    if head_weight is not None:
+        w_sel = head_weight.index_select(0, direction_ids).to(logits_accum.dtype)  # [n_ans, hidden]
+        sel = torch.einsum("aph,ah->ap", logits_accum, w_sel)      # [n_ans, P]
+        bias = getattr(parts.lm_head, "bias", None)
+        if bias is not None:
+            sel = sel + bias.index_select(0, direction_ids).to(sel.dtype).unsqueeze(1)
+    else:  # exotic head without .weight — fall back to the dense projection
+        out = parts.lm_head(logits_accum)                          # [n_ans, P, vocab]
+        sel = out[torch.arange(n_ans, device=device), :, direction_ids]
+    if not signed:
+        sel = torch.relu(sel)
+
+    h_grid, w_grid = grid_hw
+    if h_grid * w_grid != n_patch:
+        raise ValueError(
+            f"grid {h_grid}x{w_grid} = {h_grid * w_grid} != #visual tokens {n_patch}; "
+            "the visual-token -> patch-grid mapping is inconsistent (check "
+            "spatial_merge_size / image_grid_thw)."
+        )
+    return sel.reshape(n_ans, h_grid, w_grid)
+
+
+def _recompute_attention_rows(
+    q_b: torch.Tensor,
+    k_full: torch.Tensor,
+    scaling: float,
+    attention_mask_b: torch.Tensor | None,
+    query_positions: torch.Tensor,
+) -> torch.Tensor:
+    """Post-softmax attention weights for a SUBSET of query rows, matching
+    ``transformers`` ``eager_attention_forward`` exactly but only for the rows we
+    need (the whole point of the recompute path — never materialize ``[H,S,S]``).
+
+    ``q_b`` ``[H, S, d]`` and ``k_full`` ``[H, S, d]`` are the model's own
+    post-RoPE / post-QK-norm query & (group-expanded) key states, captured from the
+    attention interface; ``scaling`` and ``attention_mask_b`` are the same values
+    the model passed to that interface. Returns ``[H, n_q, S]``.
+    """
+    q_sel = q_b.index_select(1, query_positions)                   # [H, n_q, d]
+    scores = torch.matmul(q_sel, k_full.transpose(-1, -2)) * scaling  # [H, n_q, S]
+    key_len = k_full.shape[-2]
+    if attention_mask_b is not None:
+        # Additive (or boolean) mask the model built (causal + left-padding, and
+        # any sliding window). Slice the selected query rows; eager uses
+        # attention_mask[..., :key_len]. Broadcasts over heads if mask has 1 head.
+        m = attention_mask_b
+        if m.dtype == torch.bool:
+            m = torch.zeros_like(m, dtype=scores.dtype).masked_fill(~m, float("-inf"))
+        m_rows = m.index_select(-2, query_positions)[..., :key_len]  # [mh, n_q, S]
+        scores = scores + m_rows
+    else:
+        # No mask passed (pure causal, no padding — e.g. the CPU equivalence test):
+        # disallow keys strictly after each query's absolute position.
+        key_pos = torch.arange(key_len, device=scores.device)
+        causal = key_pos.unsqueeze(0) > query_positions.unsqueeze(-1)  # [n_q, S]
+        scores = scores.masked_fill(causal.unsqueeze(0), float("-inf"))
+    return torch.softmax(scores, dim=-1, dtype=torch.float32).to(q_b.dtype)
+
+
 def compute_token_saliency_maps(
     model: nn.Module,
     attentions: tuple[torch.Tensor, ...],
@@ -312,51 +503,112 @@ def compute_token_saliency_maps(
         token_attn = a.index_select(1, reason_query_positions).index_select(
             2, visual_positions
         )                                                          # [H, T, P]
-        # compose: answer -> (reason) -> visual : [n_ans, H, P]
-        agg_attn = torch.einsum("aht,htp->ahp", think_attn, token_attn)
 
-        # --- OV circuit: weight value states, fold heads, output projection ----
-        sv = agg_attn.unsqueeze(-1) * v_vis.unsqueeze(0)           # [n_ans, H, P, d]
-        sv = sv.permute(0, 2, 1, 3).reshape(n_ans, n_patch, n_heads * head_dim)
-        contrib = attn.o_proj(sv)                                  # [n_ans, P, hidden]
+        contrib = _ov_contrib(
+            attn.o_proj, think_attn, token_attn, v_vis, n_ans, n_patch, n_heads, head_dim
+        )
         logits_accum = contrib if logits_accum is None else logits_accum + contrib
 
     assert logits_accum is not None, "no layers selected for saliency"
+    return _finalize_saliency(
+        parts,
+        logits_accum,
+        hidden_states[-1][b],
+        answer_query_positions,
+        direction_ids,
+        grid_hw,
+        signed,
+    )
 
-    # --- Saliency_R1 normalization (grpo_trainer.py 1835-1838) -----------------
-    # Apply the final RMSNorm *direction* but restore the pre-norm magnitude,
-    # then divide by the answer token's last-hidden norm so the lm_head logits
-    # are on the same scale as the model's real ones.
-    normed = tm.norm(logits_accum)                                 # [n_ans, P, hidden]
-    logits_accum = normed * logits_accum.norm(dim=-1, keepdim=True)
-    h_ans = hidden_states[-1][b].index_select(0, answer_query_positions)  # [n_ans, hidden]
-    hidden_norm = h_ans.norm(dim=-1).reshape(n_ans, 1, 1).clamp_min(1e-6)
-    logits_accum = logits_accum / hidden_norm
 
-    # --- unembed onto ONLY the generated answer-token direction ----------------
-    # Mathematically lm_head(logits)[a, :, direction_ids[a]], but we never need
-    # the other vocab logits — materializing [n_ans, P, ~150k] under grad would be
-    # the real memory blow-up. Gather the lm_head weight rows for the directions
-    # and contract over hidden instead.
-    direction_ids = direction_ids.to(device=device, dtype=torch.long)
-    head_weight = getattr(parts.lm_head, "weight", None)
-    if head_weight is not None:
-        w_sel = head_weight.index_select(0, direction_ids).to(logits_accum.dtype)  # [n_ans, hidden]
-        sel = torch.einsum("aph,ah->ap", logits_accum, w_sel)      # [n_ans, P]
-        bias = getattr(parts.lm_head, "bias", None)
-        if bias is not None:
-            sel = sel + bias.index_select(0, direction_ids).to(sel.dtype).unsqueeze(1)
-    else:  # exotic head without .weight — fall back to the dense projection
-        out = parts.lm_head(logits_accum)                          # [n_ans, P, vocab]
-        sel = out[torch.arange(n_ans, device=device), :, direction_ids]
-    if not signed:
-        sel = torch.relu(sel)
+def compute_token_saliency_maps_from_qkv(
+    model: nn.Module,
+    captured: dict[int, dict[str, torch.Tensor]],
+    hidden_states: tuple[torch.Tensor, ...],
+    *,
+    batch_index: int,
+    answer_query_positions: torch.Tensor,
+    reason_key_positions: torch.Tensor,
+    reason_query_positions: torch.Tensor,
+    visual_positions: torch.Tensor,
+    direction_ids: torch.Tensor,
+    grid_hw: tuple[int, int],
+    layers: tuple[int, ...] | None = None,
+    signed: bool = True,
+    parts: SaliencyModelParts | None = None,
+) -> torch.Tensor:
+    """Per-answer-token saliency maps — the **recompute** path (Stage-2).
 
-    h_grid, w_grid = grid_hw
-    if h_grid * w_grid != n_patch:
-        raise ValueError(
-            f"grid {h_grid}x{w_grid} = {h_grid * w_grid} != #visual tokens {n_patch}; "
-            "the visual-token -> patch-grid mapping is inconsistent (check "
-            "spatial_merge_size / image_grid_thw)."
+    Identical output to :func:`compute_token_saliency_maps`, but instead of reading
+    full ``[H, S, S]`` attention matrices captured from a forced-**eager** forward,
+    it reconstructs only the handful of attention *rows* the two-hop routing needs
+    (``answer_query`` ≤8 rows, ``reason_query`` T rows) from the model's own
+    post-RoPE / post-QK-norm ``q``/``k``/``v`` states. Those were captured from the
+    attention **interface** during a normal **SDPA/Flash** forward (see
+    ``OPDEvidenceTrainer.capture_qkv_attention``), so:
+
+    * the main forward stays SDPA (no ``S²`` eager tax on the other ~30 layers);
+    * memory drops from ``L·H·S²`` retained to ``K·H·(n_ans+T)·S`` transient;
+    * RoPE / QK-norm / GQA / the causal+padding mask are all the model's own — we
+      only redo ``softmax((q·kᵀ)·scaling + mask)`` for the selected rows, which
+      reproduces ``eager_attention_forward`` exactly (see ``test_recompute_equiv``).
+
+    ``captured[l]`` holds ``{"q","k","v","mask","scaling"}``: ``q`` ``[B,H,S,d]``,
+    ``k``/``v`` ``[B,H_kv,S,d]`` (pre-group-expansion, as the interface receives
+    them), ``mask`` the additive/boolean attention mask the interface got (or
+    ``None``), ``scaling`` the attention scale.
+    """
+    if parts is None:
+        parts = resolve_model_parts(model)
+    n_heads, head_dim = parts.n_heads, parts.head_dim
+    n_rep = parts.num_kv_groups
+
+    layer_ids = tuple(sorted(captured)) if layers is None else tuple(layers)
+
+    b = batch_index
+    device = captured[layer_ids[0]]["q"].device
+    answer_query_positions = answer_query_positions.to(device)
+    reason_key_positions = reason_key_positions.to(device)
+    reason_query_positions = reason_query_positions.to(device)
+    visual_positions = visual_positions.to(device)
+    n_ans = int(answer_query_positions.shape[0])
+    n_patch = int(visual_positions.shape[0])
+
+    tm = parts.text_model
+    logits_accum: torch.Tensor | None = None
+    for l in layer_ids:
+        layer = captured[l]
+        q_b = layer["q"][b]                                         # [H, S, d]
+        k_full = repeat_kv_heads(layer["k"][b], n_rep)             # [H, S, d]
+        v_full = repeat_kv_heads(layer["v"][b], n_rep)            # [H, S, d]
+        v_vis = v_full.index_select(1, visual_positions)           # [H, P, d]
+        mask_b = layer["mask"][b] if layer["mask"] is not None else None
+        scaling = float(layer["scaling"])
+
+        # answer-query -> reason-key:  [H, n_ans, S] -> [n_ans, H, T]
+        a_ans = _recompute_attention_rows(
+            q_b, k_full, scaling, mask_b, answer_query_positions
         )
-    return sel.reshape(n_ans, h_grid, w_grid)
+        think_attn = a_ans.index_select(2, reason_key_positions).permute(1, 0, 2).contiguous()
+        # reason-query -> visual-key:  [H, T, S] -> [H, T, P]
+        a_rea = _recompute_attention_rows(
+            q_b, k_full, scaling, mask_b, reason_query_positions
+        )
+        token_attn = a_rea.index_select(2, visual_positions)       # [H, T, P]
+
+        contrib = _ov_contrib(
+            tm.layers[l].self_attn.o_proj,
+            think_attn, token_attn, v_vis, n_ans, n_patch, n_heads, head_dim,
+        )
+        logits_accum = contrib if logits_accum is None else logits_accum + contrib
+
+    assert logits_accum is not None, "no layers captured for saliency"
+    return _finalize_saliency(
+        parts,
+        logits_accum,
+        hidden_states[-1][b],
+        answer_query_positions,
+        direction_ids,
+        grid_hw,
+        signed,
+    )

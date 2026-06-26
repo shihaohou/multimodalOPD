@@ -47,6 +47,11 @@ class OPDEvidenceScriptArguments(OPDScriptArguments):
     """OPD knobs (inherited) + evidence-alignment knobs."""
 
     lambda_evidence: float = 1.0
+    # How the evidence forward gets in-graph attention. "recompute" (default):
+    # SDPA/Flash forward + reconstruct only the needed attention rows from the
+    # model's own captured q/k/v (fast, low memory — the Stage-2 fix). "eager":
+    # the legacy forced-eager output_attentions path (retains every [H,S,S]).
+    evidence_attn_mode: str = "recompute"
     evidence_max_samples: int = 1
     # Explicit comma list of decoder layers to sum saliency over (overrides
     # evidence_num_layers). Empty => use the last `evidence_num_layers` layers.
@@ -127,6 +132,7 @@ def main() -> None:
         )
         print(
             "Evidence: "
+            f"attn_mode={script_args.evidence_attn_mode}, "
             f"lambda_evidence={script_args.lambda_evidence}, "
             f"max_samples={script_args.evidence_max_samples}, "
             f"layers={evidence_layers or 'all'}, "
@@ -259,6 +265,7 @@ def main() -> None:
         opd_top_k=script_args.opd_top_k,
         # evidence knobs
         lambda_evidence=script_args.lambda_evidence,
+        evidence_attn_mode=script_args.evidence_attn_mode,
         evidence_max_samples=script_args.evidence_max_samples,
         evidence_layers=evidence_layers,
         evidence_num_layers=script_args.evidence_num_layers,
@@ -308,6 +315,7 @@ def main() -> None:
                     "opd_dataset_name": script_args.dataset_name,
                     "opd_lambda_opd": script_args.lambda_opd,
                     "evidence_lambda": script_args.lambda_evidence,
+                    "evidence_attn_mode": script_args.evidence_attn_mode,
                     "evidence_max_samples": script_args.evidence_max_samples,
                     "evidence_layers": evidence_layers,
                     "evidence_top_ratio": script_args.evidence_top_ratio,

@@ -10,21 +10,28 @@ loss; ``L_evidence`` pulls the student's per-token saliency map toward the froze
 teacher's, on a small subset of high-KL answer tokens, via the gated
 signed-Pearson loss (see :mod:`baseline.evidence.evidence_loss`).
 
-**One forward, not two.** The saliency engine needs in-graph attention weights, so
-the student forward runs with ``output_attentions=True`` under the **eager**
-attention implementation. Crucially it is the SAME forward that produces the OPD
-logits — doing a second grad forward through the (DeepSpeed-wrapped) student would
-make ZeRO reduce each shared parameter's gradient twice in one backward
-("parameter ... has already been reduced"). So the OPD logits and the evidence
-attentions/hidden-states both come from a single forward; ``loss.backward()``
-traverses one graph and each parameter is reduced once.
+**One forward, not two.** The saliency engine needs in-graph attention, and it is
+the SAME forward that produces the OPD logits — doing a second grad forward through
+the (DeepSpeed-wrapped) student would make ZeRO reduce each shared parameter's
+gradient twice in one backward ("parameter ... has already been reduced"). So the
+OPD logits and the evidence attention/hidden-states both come from a single
+forward; ``loss.backward()`` traverses one graph and each parameter is reduced once.
 
-Because that single forward is eager + ``output_attentions`` over the whole
-micro-batch, the **evidence run wants a small ``per_device_train_batch_size``**
-(1-2) with higher grad-accum — eager attention over thousands of visual tokens is
-the dominant memory cost. Steps whose rollouts have no valid ``<reason>``+answer
-span (or when gradient checkpointing swallows the attentions) fall back to a
-cheap OPD-only forward. ``local_hf`` teacher only.
+Two ways to get that in-graph attention, selected by ``evidence_attn_mode``:
+
+* ``recompute`` (default, the Stage-2 fix): the forward stays on the fast kernel
+  (**SDPA/Flash**) and ``capture_qkv_attention`` stashes the model's own post-RoPE
+  ``q/k/v`` for the evidence layers; the engine then redoes the softmax for *only
+  the rows it needs* (``compute_token_saliency_maps_from_qkv``). No ``S²`` eager
+  tax on the other ~30 layers, and memory drops from ``L·H·S²`` retained to
+  ``K·H·(n_ans+T)·S`` — so ``per_device`` can usually go to 2-4. Numerically
+  identical to eager (``test_recompute_equiv``).
+* ``eager`` (legacy / reference): forces eager + captures full ``[H,S,S]`` via
+  hooks. ``output_attentions``-equivalent but retains every layer's attention
+  matrix, so it wants a small ``per_device_train_batch_size`` (1-2).
+
+Steps whose rollouts have no valid ``<reason>``+answer span (or where the capture
+does not fire) fall back to a cheap OPD-only forward. ``local_hf`` teacher only.
 """
 
 from __future__ import annotations
@@ -41,7 +48,9 @@ from baseline.evidence.evidence_loss import (
     top_indices_by_score,
 )
 from baseline.evidence.saliency_engine import (
+    capture_qkv_attention,
     compute_token_saliency_maps,
+    compute_token_saliency_maps_from_qkv,
     resolve_model_parts,
 )
 from baseline.evidence.span_utils import parse_batch_spans
@@ -126,6 +135,7 @@ class OPDEvidenceTrainer(OPDTrainer):
         self,
         *args: Any,
         lambda_evidence: float = 1.0,
+        evidence_attn_mode: str = "recompute",
         evidence_max_samples: int = 1,
         evidence_layers: tuple[int, ...] | None = None,
         evidence_num_layers: int = 4,
@@ -147,7 +157,14 @@ class OPDEvidenceTrainer(OPDTrainer):
                 "OPDEvidenceTrainer requires teacher_source='local_hf' (the evidence "
                 "term needs a full local teacher forward for the teacher saliency map)."
             )
+        if evidence_attn_mode not in {"recompute", "eager"}:
+            raise ValueError(
+                f"Unknown evidence_attn_mode {evidence_attn_mode!r}; use 'recompute' "
+                "(SDPA forward + selected-row attention recompute — the default, fast) "
+                "or 'eager' (legacy forced-eager output_attentions path)."
+            )
         self.lambda_evidence = float(lambda_evidence)
+        self.evidence_attn_mode = evidence_attn_mode
         self.evidence_max_samples = int(evidence_max_samples)
         self.evidence_layers = (
             tuple(int(x) for x in evidence_layers) if evidence_layers else None
@@ -255,7 +272,15 @@ class OPDEvidenceTrainer(OPDTrainer):
                 int(grid[2]) // s_parts.spatial_merge_size,
             )
 
-            student_maps = compute_token_saliency_maps(
+            # ``recompute`` (default): s_attentions/t_attentions hold the captured
+            # post-RoPE q/k/v dicts -> the engine redoes only the needed softmax
+            # rows under SDPA. ``eager``: they hold full [H,S,S] attention tensors.
+            engine = (
+                compute_token_saliency_maps_from_qkv
+                if self.evidence_attn_mode == "recompute"
+                else compute_token_saliency_maps
+            )
+            student_maps = engine(
                 unwrapped_student,
                 s_attentions,
                 s_hidden,
@@ -271,7 +296,7 @@ class OPDEvidenceTrainer(OPDTrainer):
                 parts=s_parts,
             )
             with torch.no_grad():
-                teacher_maps = compute_token_saliency_maps(
+                teacher_maps = engine(
                     self.teacher_model,
                     t_attentions,
                     t_hidden,
@@ -381,9 +406,10 @@ class OPDEvidenceTrainer(OPDTrainer):
                         flush=True,
                     )
 
-        # --- SINGLE student forward (one grad graph; see module docstring). The
-        #     evidence-layer attention weights are captured via forward hooks, NOT
-        #     output_attentions=True (which retains every layer's [H,S,S] -> OOM). -
+        # --- SINGLE student forward (one grad graph; see module docstring). In the
+        #     default ``recompute`` mode the forward stays on the fast kernel (SDPA)
+        #     and we only stash the post-RoPE q/k/v for the evidence layers; the
+        #     legacy ``eager`` mode forces eager + captures full [H,S,S] via hooks.
         student_inputs = self._with_completion(
             student_prompt,
             full_input_ids=rollout["generated_ids"],
@@ -391,7 +417,21 @@ class OPDEvidenceTrainer(OPDTrainer):
         )
         student_inputs["logits_to_keep"] = completion_length + 1
         s_attentions = s_hidden = None
-        if run_evidence:
+        if run_evidence and self.evidence_attn_mode == "recompute":
+            with capture_qkv_attention(
+                unwrapped, self._student_parts.text_model, s_layer_ids
+            ) as s_cap:
+                student_outputs = model(**student_inputs, output_hidden_states=True)
+            if any(layer_idx not in s_cap for layer_idx in s_layer_ids):
+                print(
+                    "[OPD-evidence] student q/k/v not captured (attention dispatch?); "
+                    "OPD-only this step.",
+                    flush=True,
+                )
+                run_evidence = False
+            else:
+                s_attentions, s_hidden = s_cap, student_outputs.hidden_states
+        elif run_evidence:  # legacy eager output_attentions path
             with force_eager_attention(unwrapped), capture_attention_weights(
                 self._student_parts.text_model, s_layer_ids
             ) as s_attn:
@@ -416,7 +456,24 @@ class OPDEvidenceTrainer(OPDTrainer):
             student_prompt, completion_ids, rollout["completion_attention_mask"]
         )
         t_attentions = t_hidden = None
-        if run_evidence:
+        if run_evidence and self.evidence_attn_mode == "recompute":
+            teacher_inputs["logits_to_keep"] = completion_length + 1
+            with torch.no_grad(), capture_qkv_attention(
+                self.teacher_model, self._teacher_parts.text_model, t_layer_ids
+            ) as t_cap:
+                t_out = self.teacher_model(
+                    **teacher_inputs, output_hidden_states=True, use_cache=False
+                )
+            teacher_logits = self._completion_logits(t_out.logits, completion_length)
+            if any(layer_idx not in t_cap for layer_idx in t_layer_ids):
+                print(
+                    "[OPD-evidence] teacher q/k/v not captured; OPD-only this step.",
+                    flush=True,
+                )
+                run_evidence = False
+            else:
+                t_attentions, t_hidden = t_cap, t_out.hidden_states
+        elif run_evidence:  # legacy eager output_attentions path
             teacher_inputs["logits_to_keep"] = completion_length + 1
             with torch.no_grad(), force_eager_attention(
                 self.teacher_model

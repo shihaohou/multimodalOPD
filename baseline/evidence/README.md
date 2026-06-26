@@ -88,31 +88,49 @@ works **iff the grids match** — purely an empirical check, not a theoretical b
   (config-driven, QK-norm-safe); whether the *pair* aligns is decided by the
   sanity-check grid assertion. If it fails, use the Qwen2.5-VL line.
 
-## Key caveat — eager-attention memory
+## Attention capture — `recompute` (default) vs `eager`
 
-The saliency engine needs in-graph attention weights, so the evidence forward uses
-**eager** attention with `output_attentions=True`, which materializes per-layer
-`[H, S, S]` matrices and keeps them for backward. Over thousands of visual tokens
-this is the dominant cost — far more than the full-vocab KL. Mitigations (all
-exposed as knobs):
+The saliency engine needs the model's attention *in-graph*. `EVIDENCE_ATTN_MODE`
+picks how it is obtained:
 
-- `EVIDENCE_MAX_SAMPLES` (default 1) — rows of the micro-batch the eager forward runs on.
-- `EVIDENCE_LAYERS` — sum saliency over a subset of decoder layers.
+- **`recompute` (default, the Stage-2 fix).** The forward stays on the fast kernel
+  (**SDPA/Flash**). `capture_qkv_attention` temporarily overrides that kernel's
+  registry entry with a wrapper that delegates to the real kernel (so the OPD
+  logits are byte-for-byte unchanged) and stashes the model's own post-RoPE /
+  post-QK-norm `q/k/v` for the evidence layers. The engine then redoes the softmax
+  for **only the rows the two-hop routing needs** (`answer_query` ≤8 rows,
+  `reason_query` T rows) — never the full `[H, S, S]`. RoPE / QK-norm / GQA / the
+  causal+padding mask are all the model's own (the config is left on its real
+  kernel, so `create_causal_mask` still builds the correct mask). Cost drops from
+  eager's `L·H·S²` (retained for backward) to `K·H·(n_ans+T)·S` transient, and the
+  other ~30 layers pay no eager tax → `per_device` can usually go to 2-4.
+  Numerically identical to eager — proven on CPU by
+  `python -m baseline.evidence.test_recompute_equiv` (`max|Δ|≈0`, incl. a
+  left-padded batch).
+
+- **`eager` (legacy / numerical reference).** Forces eager attention and captures
+  full `[H, S, S]` matrices via forward hooks. Equivalent result, but retains every
+  layer's attention matrix for backward — over thousands of visual tokens this is
+  the dominant cost, so it wants a small `per_device_train_batch_size` (1-2). Kept
+  as the reference the recompute path is validated against, and as a fallback if a
+  new model family's attention dispatch ever breaks the capture.
+
+Shared knobs that bound the work either way:
+
+- `EVIDENCE_MAX_SAMPLES` (default 1) — rows of the micro-batch scored.
+- `EVIDENCE_LAYERS` / `EVIDENCE_NUM_LAYERS` — which / how many decoder layers to sum.
 - `EVIDENCE_TOP_RATIO` / `EVIDENCE_MAX_TOKENS` — cap the answer tokens scored.
-- **Gradient checkpointing** can swallow `output_attentions` on some stacks; if
-  `loss_ev` never logs, set `GRADIENT_CHECKPOINTING=false` (costs memory) or lower
-  the batch. The trainer logs a warning and skips evidence rather than crashing.
-
-A future Stage-2 optimization (custom autograd recomputing only the selected query
-rows) would remove the full `[H,S,S]` materialization; v1 measures peak memory on
-a small batch first (Step 1).
+- In `eager` mode only, **gradient checkpointing** can swallow the attentions; if
+  `loss_ev` never logs, set `GRADIENT_CHECKPOINTING=false` or lower the batch. The
+  trainer logs a warning and skips evidence rather than crashing.
 
 ## Knobs (env vars → CLI)
 
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `LAMBDA_EVIDENCE` | 1.0 | weight of the evidence term |
-| `EVIDENCE_MAX_SAMPLES` | 1 | batch rows for the eager evidence forward |
+| `EVIDENCE_ATTN_MODE` | recompute | `recompute` (SDPA + selected-row recompute, fast) or `eager` (legacy full `[H,S,S]`) |
+| `EVIDENCE_MAX_SAMPLES` | 1 | batch rows scored by the evidence forward |
 | `EVIDENCE_LAYERS` | all | comma list of decoder layers to sum |
 | `EVIDENCE_TOP_RATIO` | 0.2 | top-KL fraction of answer tokens kept |
 | `EVIDENCE_MIN/MAX_TOKENS` | 1 / 8 | floor/cap on selected tokens per sample |

@@ -49,10 +49,10 @@ FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-# The evidence forward is a SINGLE eager output_attentions pass over the whole
-# micro-batch (it also serves the OPD logits — a 2nd grad forward would double-
-# reduce grads under DeepSpeed). Eager attention over thousands of visual tokens
-# is the memory wall, so keep per_device SMALL (1-2) and raise grad_accum.
+# In the default recompute mode the evidence forward stays on the fast kernel
+# (SDPA) and only reconstructs the few attention rows the saliency engine needs,
+# so the old eager S^2 memory wall is gone — per_device can usually go to 2-4.
+# (In legacy EVIDENCE_ATTN_MODE=eager keep per_device SMALL (1-2) + raise grad_accum.)
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-16}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
@@ -83,6 +83,13 @@ TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 
 # --- evidence-alignment knobs ------------------------------------------------
 LAMBDA_EVIDENCE="${LAMBDA_EVIDENCE:-1.0}"
+# How the evidence forward gets in-graph attention:
+#   recompute (default) — SDPA/Flash forward + reconstruct only the needed
+#     attention rows from the model's own captured q/k/v. Fast, low memory (no
+#     S^2 eager tax, no per-layer [H,S,S] retained). The Stage-2 speed fix.
+#   eager — legacy forced-eager output_attentions path (kept as a fallback /
+#     numerical reference; verified equivalent by baseline.evidence.test_recompute_equiv).
+EVIDENCE_ATTN_MODE="${EVIDENCE_ATTN_MODE:-recompute}"
 # How many rows of the micro-batch get a saliency map (capped by per_device). The
 # eager forward already covers the whole micro-batch; this just bounds the engine
 # work, so keeping per_device small is what bounds memory.
@@ -211,6 +218,7 @@ uv run accelerate launch \
   --opd_top_k "$OPD_TOP_K" \
   --token_loss_clip "$TOKEN_LOSS_CLIP" \
   --lambda_evidence "$LAMBDA_EVIDENCE" \
+  --evidence_attn_mode "$EVIDENCE_ATTN_MODE" \
   --evidence_max_samples "$EVIDENCE_MAX_SAMPLES" \
   "${EVIDENCE_LAYERS_ARGS[@]}" \
   --evidence_num_layers "$EVIDENCE_NUM_LAYERS" \
