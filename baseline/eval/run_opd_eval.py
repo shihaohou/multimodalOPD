@@ -104,10 +104,40 @@ def parse_args() -> argparse.Namespace:
 
 
 # -------------------------------------------------------------------- sample IO
-def dataset_samples(spec: Any, limit: int | None) -> list[EvalSample]:
+def open_eval_dataset(path: str, split: str):
+    """Load a HuggingFace dataset by id OR a LOCAL dir, robust to either on-disk
+    layout (``save_to_disk`` arrow, or a hub snapshot of parquet). A local path is
+    used as-is, so this works on offline boxes (``HF_HUB_OFFLINE=1``) where only id
+    lookups fail — point ``--datasets`` at e.g. ``/data/zli12321/mathvista``.
+    Falls back to the only/first split if ``split`` is absent.
+    """
     from datasets import load_dataset
 
-    data = load_dataset(spec.path, split=spec.split)
+    local = Path(path).expanduser()
+    if not local.exists():
+        return load_dataset(path, split=split)  # treat as a hub id
+
+    def _pick(dataset_dict):
+        return dataset_dict[split] if split in dataset_dict else dataset_dict[next(iter(dataset_dict))]
+
+    from datasets import DatasetDict
+
+    try:  # save_to_disk (arrow) dir
+        from datasets import load_from_disk
+
+        data = load_from_disk(str(local))
+        return _pick(data) if isinstance(data, DatasetDict) else data
+    except Exception:
+        pass
+    try:  # hub snapshot / parquet dir, split present
+        return load_dataset(str(local), split=split)
+    except Exception:  # split missing -> take what's there
+        data = load_dataset(str(local))
+        return _pick(data) if isinstance(data, DatasetDict) else data
+
+
+def dataset_samples(spec: Any, limit: int | None) -> list[EvalSample]:
+    data = open_eval_dataset(spec.path, spec.split)
     n = len(data) if limit is None else min(limit, len(data))
     samples = []
     for index in range(n):

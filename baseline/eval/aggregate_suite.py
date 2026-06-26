@@ -155,7 +155,8 @@ def print_table(rows: list[dict[str, Any]], model_name: str, ks: list[int]) -> N
 def main() -> None:
     parser = argparse.ArgumentParser(description="Aggregate the OPD benchmark suite.")
     parser.add_argument("--judged-summary", required=True)
-    parser.add_argument("--vqa-summary", required=True)
+    parser.add_argument("--vqa-summary", default=None,
+                        help="Deterministic-group summary; omit to show POPE/ChartQA/VQAv2 as '-'.")
     parser.add_argument("--sampled-summary", default=None,
                         help="Optional judged-group run with PASS_K=N (temp>0) for pass@k/avg@k.")
     parser.add_argument("--ks", default="1,8,16", help="Comma-separated k list for pass@k.")

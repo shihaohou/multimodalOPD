@@ -45,8 +45,11 @@ SKIP_JUDGE="${SKIP_JUDGE:-false}"
 JUDGE_KEY_ENV="${JUDGE_KEY_ENV:-DEEPSEEK_API_KEY}"
 
 # Deterministic group. VQAv2 val is huge; cap it (POPE/ChartQA stay full).
+# Point POPE_REPO / CHARTQA_REPO / VQAV2_REPO (+ *_SPLIT) at local dirs for an
+# offline box; SKIP_DET=true runs the judged group only (POPE/ChartQA/VQAv2 -> '-').
 DET_BENCHMARKS="${DET_BENCHMARKS:-pope,chartqa,vqav2}"
 VQAV2_LIMIT="${VQAV2_LIMIT:-}"
+SKIP_DET="${SKIP_DET:-false}"
 
 # Optional: ALSO report pass@k / avg@k for the judged (math/MCQ) group. Adds a
 # second, sampled generation pass (PASS_K=SAMPLED_K, temperature>0) over the judged
@@ -79,13 +82,17 @@ OUTPUT_DIR="$OUTPUT_ROOT/judged" MODEL_NAME="$MODEL_NAME" \
   GRADER="$GRADER" SKIP_JUDGE="$SKIP_JUDGE" JUDGE_KEY_ENV="$JUDGE_KEY_ENV" \
   bash scripts/eval_opd.sh
 
-echo "== deterministic group (no judge, greedy official metric) -> $OUTPUT_ROOT/vqa =="
-OUTPUT_DIR="$OUTPUT_ROOT/vqa" MODEL_NAME="$MODEL_NAME" \
-  BENCHMARKS="$DET_BENCHMARKS" \
-  PASS_K="$PASS_K" GEN_TEMPERATURE="$GEN_TEMPERATURE" \
-  TENSOR_PARALLEL_SIZE="$TENSOR_PARALLEL_SIZE" \
-  VQAV2_LIMIT="$VQAV2_LIMIT" \
-  bash scripts/eval_vqa.sh
+if [[ "$SKIP_DET" != "true" ]]; then
+  echo "== deterministic group (no judge, greedy official metric) -> $OUTPUT_ROOT/vqa =="
+  OUTPUT_DIR="$OUTPUT_ROOT/vqa" MODEL_NAME="$MODEL_NAME" \
+    BENCHMARKS="$DET_BENCHMARKS" \
+    PASS_K="$PASS_K" GEN_TEMPERATURE="$GEN_TEMPERATURE" \
+    TENSOR_PARALLEL_SIZE="$TENSOR_PARALLEL_SIZE" \
+    VQAV2_LIMIT="$VQAV2_LIMIT" \
+    bash scripts/eval_vqa.sh
+else
+  echo "== deterministic group SKIPPED (SKIP_DET=true) =="
+fi
 
 if [[ "$MULTI_K" == "true" ]]; then
   echo "== sampled pass for pass@k/avg@k (judged group, N=$SAMPLED_K temp=$SAMPLED_TEMPERATURE) -> $OUTPUT_ROOT/judged_sampled =="
@@ -101,11 +108,13 @@ echo "== aggregate -> $OUTPUT_ROOT/suite_summary.json =="
 AGG=(
   uv run python baseline/eval/aggregate_suite.py
   --judged-summary "$OUTPUT_ROOT/judged/summary.json"
-  --vqa-summary "$OUTPUT_ROOT/vqa/summary.json"
   --ks "$PASSK_KS"
   --model-name "$MODEL_NAME"
   --output "$OUTPUT_ROOT/suite_summary.json"
 )
+if [[ "$SKIP_DET" != "true" ]]; then
+  AGG+=(--vqa-summary "$OUTPUT_ROOT/vqa/summary.json")
+fi
 if [[ "$MULTI_K" == "true" ]]; then
   AGG+=(--sampled-summary "$OUTPUT_ROOT/judged_sampled/summary.json")
 fi

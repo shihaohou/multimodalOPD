@@ -49,6 +49,7 @@ from baseline.eval.run_opd_eval import (
     generate_records,
     make_engine,
     make_sampling_params,
+    open_eval_dataset,
     write_jsonl,
 )
 from baseline.eval.vqa_metrics import (
@@ -140,25 +141,12 @@ def parse_benchmark_list(raw: str) -> list[str]:
 def _open_dataset(source: str, split: str):
     """Load a HuggingFace dataset by id, OR a local snapshot dir (offline boxes).
 
-    Local dirs try ``load_from_disk`` (arrow) first, then ``load_dataset`` (auto
-    parquet/json). Pre-fetch once with e.g.
-    ``hf download lmms-lab/POPE --repo-type dataset --local-dir <dir>`` and pass
-    ``--pope-repo <dir>``.
+    Delegates to :func:`baseline.eval.run_opd_eval.open_eval_dataset`, which is
+    robust to either local layout (``save_to_disk`` arrow or a hub snapshot of
+    parquet) and falls back to the only/first split when ``split`` is absent —
+    e.g. ``--pope-repo /data/POPE --pope-split test`` on an offline box.
     """
-    from datasets import load_dataset
-
-    local = Path(source).expanduser()
-    if local.exists():
-        try:
-            from datasets import DatasetDict, load_from_disk
-
-            data = load_from_disk(str(local))
-            if isinstance(data, DatasetDict):
-                data = data[split] if split in data else data[next(iter(data))]
-            return data
-        except Exception:
-            return load_dataset(str(local), split=split)
-    return load_dataset(source, split=split)
+    return open_eval_dataset(source, split)
 
 
 def _first(row: dict[str, Any], keys: tuple[str, ...], default: Any = None) -> Any:
