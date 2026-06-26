@@ -338,12 +338,16 @@ if [[ "$PHASE" == "judge" ]]; then
     IFS='|' read -r kind tag model payload <<< "$spec"
     [[ "$kind" == "det" ]] && continue   # deterministic already scored in generate
     i=$((i + 1))
-    if [[ "$RESUME" == "true" ]] && job_done "$kind" "$(job_out "$kind" "$tag" "$payload")"; then
+    jout="$(job_out "$kind" "$tag" "$payload")"
+    if [[ "$RESUME" == "true" ]] && job_done "$kind" "$jout"; then
       echo "[judge ${i}/${total}] ${tag} | $(basename "$payload") -> skip done (RESUME)"
       continue
     fi
     echo "[judge ${i}/${total}] ${tag} | $(basename "$payload")"
     run_job "$kind" "" "$tag" "$model" "$payload" || echo "  (job exited non-zero; see log)"
+    # Surface this benchmark's score on the main log as soon as it's judged.
+    sc="$(grep -h 'pass@k=' "$jout/judge.log" 2>/dev/null | tail -1)"
+    [[ -n "$sc" ]] && echo "    -> ${sc}"
   done
   [[ "$total" -eq 0 ]] && echo "(deterministic-only request: nothing to judge — scored in the generate phase)"
   echo "All ${total} judge jobs finished. Per-job log: <id>/<dataset>/judge.log under ${OUTPUT_ROOT}/"
@@ -431,6 +435,7 @@ for path in sorted(glob.glob(os.path.join(root, "**", "summary.json"), recursive
             matrix.setdefault(name, {})[tag] = entry.get("pass_at_k")
 
 tags = sorted(tags)
+per_model = {}
 if matrix:
     width = max([len(n) for n in matrix] + [16])
     print(f"\n{'benchmark':<{width}} " + " ".join(f"{t:>10}" for t in tags))
@@ -442,7 +447,21 @@ if matrix:
         )
         print(f"{name:<{width}} {cells}")
     print("\n(judged rows = pass@k via LLM judge; det rows = official metric, no judge)")
+
+    # Per-checkpoint rollup: each ckpt's benchmark scores + a mean over the judged
+    # (pass@k) rows. det rows (labelled "pope(F1)" etc.) use their own metric, so they
+    # are listed but kept out of the judged average.
+    print("\n=== per-checkpoint summary ===")
+    for t in tags:
+        scores = {n: matrix[n][t] for n in sorted(matrix) if isinstance(matrix[n].get(t), (int, float))}
+        per_model[t] = scores
+        print(f"\n[{t}]  ({len(scores)} benchmarks)")
+        for n in sorted(scores):
+            print(f"  {n:<22} {scores[n]:.4f}")
+        judged = [v for n, v in scores.items() if not n.endswith(")")]
+        if judged:
+            print(f"  {'avg(judged pass@k)':<22} {sum(judged) / len(judged):.4f}")
 out = os.path.join(root, "matrix.json")
-json.dump({"tags": tags, "matrix": matrix}, open(out, "w"), indent=2, ensure_ascii=False)
+json.dump({"tags": tags, "matrix": matrix, "per_model": per_model}, open(out, "w"), indent=2, ensure_ascii=False)
 print(f"\nWrote {out}")
 PY
