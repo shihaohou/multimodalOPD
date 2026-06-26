@@ -366,6 +366,29 @@ class OPDTrainer(ViGOSTrainer):
             return loss, {"logits": student_logits.detach()}
         return loss
 
+    def _completion_snapshot_records(
+        self,
+        raw_inputs: dict[str, Any],
+        rollout: dict[str, Any],
+        step: int,
+    ) -> list[dict[str, Any]]:
+        """Augment the inherited rollout snapshot with the full student prompt.
+
+        OPD has no privileged teacher prompt, so the only prompt worth logging is
+        the non-privileged student prompt actually fed to the rollout: the
+        ``OPD_SYSTEM_PROMPT`` + user(image placeholder + raw question), exactly as
+        rendered for vLLM/HF generation. The base record only carries the raw
+        ``problem`` text; we add the rendered ``prompt`` so each snapshot row is a
+        self-contained (prompt -> completion) pair.
+        """
+        records = super()._completion_snapshot_records(raw_inputs, rollout, step)
+        prompts = self._metadata_values(
+            raw_inputs.get("student_prompt_texts"), len(records)
+        )
+        for idx, record in enumerate(records):
+            record["prompt"] = prompts[idx]
+        return records
+
     @torch.no_grad()
     def _rollout_diagnostic_metrics(
         self,
