@@ -127,8 +127,15 @@ TAM_USE_ECI="${TAM_USE_ECI:-true}"
 TAM_DETACH_LM_HEAD="${TAM_DETACH_LM_HEAD:-true}"
 TAM_DIVERGENCE="${TAM_DIVERGENCE:-cosine}"      # cosine | js | l1 | mse  (mse = normalized heatmap-regression)
 TAM_BLUR="${TAM_BLUR:-true}"
+# Spatial denoiser on the maps: gaussian (fixed blur, default) | rgf (the paper's
+# Rank-Gaussian Filter) | none. The paper-faithful ablation = TAM_DIVERGENCE=mse
+# TAM_DENOISE=rgf. TAM_BLUR=false forces none (back-compat).
+TAM_DENOISE="${TAM_DENOISE:-gaussian}"          # gaussian | rgf | none
 TAM_BLUR_KERNEL="${TAM_BLUR_KERNEL:-3}"
 TAM_BLUR_SIGMA="${TAM_BLUR_SIGMA:-1.0}"
+# Concentration gate (+ mass drop) on/off. false => align ALL aligned tokens with
+# equal weight (the "no gate" first step). true keeps the soft visual-token gate.
+TAM_GATE="${TAM_GATE:-true}"
 TAM_GATE_TEMP="${TAM_GATE_TEMP:-1.0}"
 TAM_GATE_H0="${TAM_GATE_H0:-0.9}"
 TAM_GATE_TAU="${TAM_GATE_TAU:-0.1}"
@@ -166,7 +173,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 
 echo "[opd-tam-qwen3] student=$MODEL_NAME_OR_PATH"
 echo "[opd-tam-qwen3] teacher=$TEACHER_MODEL  (frozen)"
-echo "[opd-tam-qwen3] freeze_vision_tower=$FREEZE_VISION_TOWER  lambda_tam=$LAMBDA_TAM  divergence=$TAM_DIVERGENCE"
+echo "[opd-tam-qwen3] freeze_vision_tower=$FREEZE_VISION_TOWER  lambda_tam=$LAMBDA_TAM  divergence=$TAM_DIVERGENCE  denoise=$TAM_DENOISE  gate=$TAM_GATE"
 
 GRADIENT_CHECKPOINTING_ARGS=()
 if [[ "$GRADIENT_CHECKPOINTING" == "true" ]]; then
@@ -189,13 +196,14 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
-# Auto-name encodes lambda_tam + divergence (cosine/mse/...) + ViT mode (fullft vs
-# freezevit) + a RUN_ID date stamp, so OPD (ltam0) / OPD+TAM / cosine-vs-mse /
-# full-FT / frozen-ViT runs are distinguishable AND re-runs never overwrite each
-# other. The date is appended even to a user-supplied RUN_CONFIG; pass OUTPUT_DIR
-# explicitly only to opt out.
+# Auto-name encodes lambda_tam + divergence (cosine/mse/...) + denoiser (gaussian/
+# rgf) + gate state + ViT mode (fullft vs freezevit) + a RUN_ID date stamp, so OPD
+# (ltam0) / OPD+TAM / cosine-vs-mse / gaussian-vs-rgf / gate-vs-nogate / full-FT /
+# frozen-ViT runs are distinguishable AND re-runs never overwrite each other. The
+# date is appended even to a user-supplied RUN_CONFIG; pass OUTPUT_DIR to opt out.
 VIT_TAG=$([[ "$FREEZE_VISION_TOWER" == "true" ]] && echo freezevit || echo fullft)
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${VIT_TAG}}_${RUN_ID}"
+GATE_TAG=$([[ "$TAM_GATE" == "true" ]] && echo "" || echo "_nogate")
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GATE_TAG}_${VIT_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
@@ -249,8 +257,10 @@ uv run accelerate launch \
   --tam_detach_lm_head "$TAM_DETACH_LM_HEAD" \
   --tam_divergence "$TAM_DIVERGENCE" \
   --tam_blur "$TAM_BLUR" \
+  --tam_denoise "$TAM_DENOISE" \
   --tam_blur_kernel "$TAM_BLUR_KERNEL" \
   --tam_blur_sigma "$TAM_BLUR_SIGMA" \
+  --tam_gate "$TAM_GATE" \
   --tam_gate_temp "$TAM_GATE_TEMP" \
   --tam_gate_h0 "$TAM_GATE_H0" \
   --tam_gate_tau "$TAM_GATE_TAU" \

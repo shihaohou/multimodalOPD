@@ -48,9 +48,13 @@ path. The closed-form ``s`` replaces ``tam.py``'s SciPy ``minimize_scalar`` (sam
 optimum, ``argmin_x ||a - x E||^2 = <a,E>/<E,E>``) so the whole thing is a few
 tensor ops.
 
-RGF (the rank-Gaussian denoiser in ``tam.py``) is **not** used here: ranking is
-non-differentiable. The trainer applies a fixed Gaussian blur to both maps
-instead (``baseline/tam/tam_losses.py``); RGF is left to offline visualization.
+Denoising of the resulting map happens **downstream** in
+``baseline/tam/tam_losses.py`` (so this engine returns the raw ECI'd map ``ã_i``).
+Two filters are available there: a fixed **Gaussian blur** (the smooth default) and
+a value-differentiable **Rank-Gaussian Filter** (``rank_gaussian_filter_maps`` —
+the paper's RGF, made differentiable w.r.t. map values via ``torch.sort`` for the
+``OPD + TAM-MSE-RGF`` ablation; the sort permutation is held constant, so the rank
+gradient is "hard").
 """
 
 from __future__ import annotations

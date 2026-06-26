@@ -48,29 +48,45 @@ Four properties that make it ideal for OPD:
 |---|---|---|---|
 | **Base map** (Eq.1) | logit-lens visual relevance | ✅ core, differentiable | student grad path |
 | **ECI** (Eq.2,4,5) | subtract context-token interference | ✅ but **stop-grad** correction | closed-form `s = <a,E>/<E,E>`, ECI detached |
-| **RGF** (Eq.6,7) | rank-Gaussian denoise | ❌ ranking non-differentiable | replaced by a fixed **Gaussian blur**; RGF left to offline viz |
+| **RGF** (Eq.6,7) | rank-Gaussian denoise | ✅ **opt-in** (`TAM_DENOISE=rgf`) | `rank_gaussian_filter_maps`: vectorized + value-differentiable via `torch.sort` (sort permutation held constant → "hard" rank grad). A fixed **Gaussian blur** is the smooth default; RGF reproduces the paper exactly (`TAM-MSE-RGF` ablation) |
 
 ## Loss (`tam_losses.py`)
 
 ```
 ã_i = ECI(a_i)                         # cleaned base map (ReLU)
-p_i = normalize( gaussian_blur(ã_i) )  # blur both sides equally; L2 (cosine) or sum-to-1 (js/l1)
-L_TAM = mean_i  g_i · d( p^stu_i , sg[p^tea_i] )
+ā_i = filter(ã_i)                      # filter = gaussian_blur (default) | RGF (paper) | none
+p_i = normalize(ā_i)                   # L2 (cosine) or Laplace sum-to-1 (js/l1/mse)
+L_TAM = mean_i  g_i · d( p^stu_i , sg[p^tea_i] )    # both sides filtered equally; teacher detached
 ```
 
-* `d` = `cosine` (`1-cos`, default — robust on non-negative maps), `js`
-  (Jensen-Shannon, the doc's theoretical default), or `l1` (total variation).
+* `d` (`TAM_DIVERGENCE`) = `cosine` (`1-cos`, default — robust on non-negative
+  maps), `js` (Jensen-Shannon, the doc's theoretical default), `l1` (total
+  variation), or `mse` (normalized heatmap-regression `Σ_j (p^S−p^T)²`).
+* `filter` (`TAM_DENOISE`) = `gaussian` (fixed blur, default), `rgf` (the paper's
+  Rank-Gaussian Filter, value-differentiable), or `none`.
 * `g_i` = **teacher-map concentration gate** (`sigmoid((h0 − H_norm)/τ)`):
   down-weights tokens whose teacher map is diffuse (function words point nowhere).
-  This is the doc's position gate #1 — cheap, no extra forward. The full loss is
+  Set `TAM_GATE=false` to disable it — then every aligned token gets weight 1 and
+  `L_TAM` is the plain `1/|P|` mean (the "align all tokens" step). The full loss is
   `L = λ_opd·L_OPD + λ_tam·L_TAM`; **token-KL is never removed**.
+
+### Paper-faithful ablation: **OPD + TAM-MSE-RGF**
+
+`TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_GATE=false` reproduces the paper's visual
+objective exactly — the denoised **visual** activation map `Ā_i^a = RGF(ECI(a_i))`,
+normalized to a spatial distribution, matched by per-patch MSE against the detached
+teacher's. (We use only `Ā_i^a`, **not** the multimodal viz map `M_i = N(Ā_i^a ⊥ r_i)`.)
+"Version A": hard RGF on both sides; the student's `torch.sort` is differentiable
+w.r.t. the map values but not the rank, so the gradient is "hard" — the known risk
+of this ablation. If it destabilizes, fall back to `TAM_DENOISE=gaussian` (the
+smooth stand-in) with the same `mse` divergence.
 
 ## Files
 
 | file | role |
 |---|---|
 | `tam_engine.py` | `compute_tam_token_maps` (differentiable base map + ECI), `resolve_tam_parts`. No attention, no decoder-layer poking — only `hidden_states[-1]` + `lm_head.weight`. |
-| `tam_losses.py` | `gaussian_blur_maps`, `concentration_gate`, `cosine/js/l1` divergences, `tam_alignment_loss`. |
+| `tam_losses.py` | `gaussian_blur_maps`, `rank_gaussian_filter_maps` (RGF), `apply_spatial_filter`, `concentration_gate`, `cosine/js/l1/mse` divergences, `tam_alignment_loss`. |
 | `tam_trainer.py` | `TAMTrainer(OPDTrainer)` — one student grad forward (OPD logits **and** TAM hidden states), one no-grad teacher forward, `L_opd + λ·L_tam`. |
 | `sanity_check.py` | standalone engine check: grad reaches the **vision tower**, teacher detached, runs under **SDPA** (no attention), grid match, peak memory. |
 | `../train_opd_tam.py` | entry point (`OPDTAMScriptArguments`, `--tam_*` knobs). |
@@ -109,8 +125,17 @@ bash scripts/train_opd_tam_qwen3_8b_to_2b.sh
 # ablation: LAMBDA_TAM=0 recovers vanilla OPD exactly (clean OPD-vs-OPD+TAM comparison).
 ```
 
+**OPD + TAM-MSE-RGF ablation** (paper-faithful denoised-map MSE, no gate, all tokens):
+
+```bash
+M=/path/to/models DATASET_NAME=/path/to/Vision-SR1-47K \
+TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_GATE=false \
+bash scripts/train_opd_tam_qwen3_8b_to_2b.sh
+# auto-named runs/opd_tam_qwen3_8b_to_2b_ltam1.0_mse_rgf_nogate_fullft_<date>
+```
+
 Watch `loss_opd` (behavior), `loss_tam` / `tam_div` (visual evidence — should fall
 without hurting `answer_accuracy`), and `tam_gate_mean` (fraction of tokens the
-gate keeps). Ablation knobs (doc §8): `TAM_DIVERGENCE`, `TAM_USE_ECI`,
-`TAM_ALIGN_SPAN`, `TAM_MAX_TOKENS`, `LAMBDA_TAM ∈ {0,0.5,1,5,10}`,
-`FREEZE_VISION_TOWER`.
+gate keeps; `=1.0` when `TAM_GATE=false`). Ablation knobs (doc §8): `TAM_DIVERGENCE`,
+`TAM_DENOISE`, `TAM_GATE`, `TAM_USE_ECI`, `TAM_ALIGN_SPAN`, `TAM_MAX_TOKENS`,
+`LAMBDA_TAM ∈ {0,0.5,1,5,10}`, `FREEZE_VISION_TOWER`.

@@ -6,9 +6,12 @@ per-token TAM maps from :mod:`baseline.tam.tam_engine`, gated to the
 
     L_tam = mean_{i in P} g_i * d( p^stu_i , sg[ p^tea_i ] )
 
-* **Gaussian blur** ``g(.)`` (the differentiable stand-in for TAM's rank-Gaussian
-  filter — migration doc §1) is applied to **both** maps so the student is not
-  penalized for noise the teacher map was denoised out of.
+* **spatial filter** ``g(.)`` is applied to **both** maps so the student is not
+  penalized for noise the teacher map was denoised out of. Two kinds:
+  ``gaussian`` (a fixed-weight ``conv2d`` blur — the smooth default) and ``rgf``
+  (:func:`rank_gaussian_filter_maps`, the paper's Rank-Gaussian Filter, made
+  value-differentiable for the ``OPD + TAM-MSE-RGF`` ablation). ``apply_spatial_filter``
+  dispatches; ``none`` skips filtering.
 * **normalization**: sum-to-1 (a spatial distribution) for ``js`` / ``l1`` / ``mse``;
   L2 for ``cosine``. Never min-max (migration doc §2/§3 — non-smooth and breaks
   cross-model comparability).
@@ -82,6 +85,93 @@ def gaussian_blur_maps(
     grid = F.pad(grid, (pad, pad, pad, pad), mode=mode)
     blurred = F.conv2d(grid, kernel)
     return blurred.reshape(n, n_v)
+
+
+def rank_gaussian_filter_maps(
+    maps: torch.Tensor,
+    grid_thw: tuple[int, int, int],
+    *,
+    kernel_size: int = 3,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Differentiable, vectorized **Rank-Gaussian Filter (RGF)** — the TAM paper's
+    denoiser (``TAM-main/tam.py::rank_guassian_filter``) on each ``[n, n_v]`` map
+    over its ``(t, H, W)`` patch grid. ``-> [n, n_v]``.
+
+    For every ``k*k`` window the paper: sorts the window values ascending, sets
+    ``sigma = std/mean`` (the coefficient of variation; **population** std, ddof=0),
+    builds a Gaussian over the **rank axis** ``ax = [0..k^2-1] - k^2//2`` (the
+    median rank gets the peak weight), sum-normalizes it, and returns the
+    rank-weighted sum of the sorted values. So RGF is an *adaptive rank filter*:
+    a low-variation window (small CoV → narrow kernel) collapses to its **median**;
+    a high-variation window (large CoV → wide kernel) toward its **mean** — a
+    robust, edge-preserving denoiser, unlike the fixed Gaussian blur which smears a
+    constant kernel regardless of local structure. Windows with non-positive mean
+    output ``0`` (matches the paper; for the non-negative TAM maps that means an
+    all-zero window stays zero).
+
+    **Differentiability.** Implemented with ``F.unfold`` + ``torch.sort``. The
+    gradient is exact w.r.t. the map **values** (``sort`` back-props through the
+    gather; ``mean``/``std``/``exp`` are smooth), but the sort **permutation** is
+    treated as constant, so the gradient is non-smooth at rank-swap boundaries —
+    this is the "hard RGF" used by the ``OPD + TAM-MSE-RGF`` ablation. (The paper's
+    NumPy version is for offline visualization and carries no gradient.)
+
+    Note: divisors are floored by ``eps`` (so a uniform window → its value, and an
+    all-zero window → 0, with no ``0/0`` NaN that the raw NumPy reference would hit).
+    """
+    t, h, w = (int(x) for x in grid_thw)
+    n, n_v = maps.shape
+    if t * h * w != n_v:
+        raise ValueError(
+            f"grid {t}x{h}x{w}={t * h * w} != #visual tokens {n_v}; cannot reshape "
+            "TAM maps for the rank-Gaussian filter (check spatial_merge_size / image_grid_thw)."
+        )
+    k = int(kernel_size)
+    if n == 0 or k <= 1 or min(h, w) < 2:
+        return maps  # nothing to filter (no tokens / degenerate grid).
+
+    pad = k // 2
+    grid = maps.reshape(n * t, 1, h, w)
+    mode = "reflect" if min(h, w) > pad else "replicate"
+    grid = F.pad(grid, (pad, pad, pad, pad), mode=mode)
+    # Every k*k window as a column: [N, k^2, L], L = H*W (im2col; differentiable).
+    windows = F.unfold(grid, kernel_size=k)                       # [N, k^2, L]
+    ksq = k * k
+    sorted_w, _ = torch.sort(windows, dim=1)                      # ascending along rank
+    mean = sorted_w.mean(dim=1, keepdim=True)                     # [N, 1, L]
+    std = sorted_w.var(dim=1, unbiased=False, keepdim=True).clamp_min(0).sqrt()
+    sigma = std / mean.clamp_min(eps)                             # coefficient of variation
+    ax = (
+        torch.arange(ksq, device=maps.device, dtype=sorted_w.dtype) - ksq // 2
+    ).view(1, ksq, 1)                                            # rank offset from median
+    kernel = torch.exp(-(ax * ax) / (2.0 * (sigma * sigma)).clamp_min(eps))  # [N, k^2, L]
+    kernel = kernel / kernel.sum(dim=1, keepdim=True).clamp_min(eps)
+    value = (sorted_w * kernel).sum(dim=1)                        # [N, L]
+    # Paper: a window whose mean is <= 0 contributes 0 (kills all-zero windows).
+    value = torch.where(mean.squeeze(1) > 0, value, torch.zeros_like(value))
+    return value.reshape(n, n_v)
+
+
+def apply_spatial_filter(
+    maps: torch.Tensor,
+    grid_thw: tuple[int, int, int],
+    *,
+    kind: str,
+    kernel_size: int = 3,
+    sigma: float = 1.0,
+) -> torch.Tensor:
+    """Dispatch the spatial denoiser applied to a ``[n, n_v]`` map before the
+    divergence: ``"none"`` (identity), ``"gaussian"`` (fixed blur — the smooth
+    default), or ``"rgf"`` (the paper's Rank-Gaussian Filter; ``sigma`` is ignored,
+    RGF derives its own per-window bandwidth)."""
+    if kind == "none":
+        return maps
+    if kind == "gaussian":
+        return gaussian_blur_maps(maps, grid_thw, kernel_size=kernel_size, sigma=sigma)
+    if kind == "rgf":
+        return rank_gaussian_filter_maps(maps, grid_thw, kernel_size=kernel_size)
+    raise ValueError(f"Unknown spatial filter kind {kind!r}; use 'none', 'gaussian', or 'rgf'.")
 
 
 def normalized_entropy(maps: torch.Tensor, temp: float = 1.0, eps: float = 1e-9) -> torch.Tensor:
@@ -166,8 +256,10 @@ def tam_alignment_loss(
     grid_thw: tuple[int, int, int],
     divergence: str = "cosine",
     blur: bool = True,
+    denoise: str | None = None,
     blur_kernel: int = 3,
     blur_sigma: float = 1.0,
+    use_gate: bool = True,
     gate_temp: float = 1.0,
     gate_h0: float = 0.9,
     gate_tau: float = 0.1,
@@ -183,8 +275,18 @@ def tam_alignment_loss(
         divergence: ``cosine`` | ``js`` | ``l1`` | ``mse``. The distribution family
             (``js`` / ``l1`` / ``mse``) runs on Laplace-smoothed sum-to-1 maps;
             ``cosine`` runs on L2-normalized maps.
-        blur / blur_kernel / blur_sigma: fixed Gaussian blur applied to both maps.
-        gate_*: teacher-map concentration gate parameters.
+        denoise: spatial filter applied to both maps — ``"gaussian"`` (fixed blur),
+            ``"rgf"`` (the paper's Rank-Gaussian Filter — the ``TAM-MSE-RGF``
+            ablation), or ``"none"``. ``None`` (default) derives it from ``blur``
+            (``True`` -> gaussian) for back-compat. ``blur_kernel`` is the filter
+            size for both; ``blur_sigma`` only applies to gaussian.
+        blur / blur_kernel / blur_sigma: legacy gaussian-blur toggle + params; kept
+            for back-compat (superseded by ``denoise`` when that is given).
+        use_gate: apply the teacher-map concentration gate (and the ``mass_threshold``
+            hard drop). ``False`` -> every token gets weight 1, so the loss is the
+            plain ``1/|P|`` mean over all aligned tokens (the "no gate, align all
+            tokens" ablation). Default ``True`` preserves current behavior.
+        gate_*: teacher-map concentration gate parameters (ignored if not ``use_gate``).
         mass_threshold: hard-drop tokens whose (blurred) teacher map barely responds.
             In ``(0, 1)`` it is RELATIVE to the sample's mean teacher mass (portable);
             ``>= 1`` is an absolute sum threshold. ``0`` disables it (the soft gate
@@ -203,11 +305,17 @@ def tam_alignment_loss(
 
     s = student_maps.float()
     t = teacher_maps.detach().float()
-    if blur:
-        s = gaussian_blur_maps(s, grid_thw, kernel_size=blur_kernel, sigma=blur_sigma)
-        t = gaussian_blur_maps(t, grid_thw, kernel_size=blur_kernel, sigma=blur_sigma)
+    kind = denoise if denoise is not None else ("gaussian" if blur else "none")
+    if kind != "none":
+        s = apply_spatial_filter(s, grid_thw, kind=kind, kernel_size=blur_kernel, sigma=blur_sigma)
+        t = apply_spatial_filter(t, grid_thw, kind=kind, kernel_size=blur_kernel, sigma=blur_sigma)
 
-    gate = concentration_gate(t, temp=gate_temp, h0=gate_h0, tau=gate_tau)  # [n], no grad
+    if use_gate:
+        gate = concentration_gate(t, temp=gate_temp, h0=gate_h0, tau=gate_tau)  # [n], no grad
+    else:
+        # No gate: every token contributes with weight 1, so the loss is the plain
+        # 1/|P| mean over all aligned tokens (the "align all tokens" ablation).
+        gate = torch.ones(n, device=s.device, dtype=s.dtype)
     # Mass filter: hard-drop tokens whose (blurred) teacher map barely responds
     # anywhere — function words / non-visual tokens have nothing to ground to, and
     # under Laplace smoothing their teacher map is ~uniform, so aligning to it just
@@ -216,9 +324,9 @@ def tam_alignment_loss(
     # to this sample's mean teacher mass (a portable "small" cutoff); a value >= 1
     # is an absolute sum threshold (back-compat). `tam_mass_kept` logs the surviving
     # fraction so the drop is never silent.
-    teacher_mass = t.sum(dim=-1)  # [n] raw blurred teacher response strength, no grad
+    teacher_mass = t.sum(dim=-1)  # [n] raw filtered teacher response strength, no grad
     mass_kept = torch.ones_like(teacher_mass)
-    if mass_threshold > 0:
+    if use_gate and mass_threshold > 0:
         cutoff = (
             mass_threshold * teacher_mass.mean()
             if mass_threshold < 1.0

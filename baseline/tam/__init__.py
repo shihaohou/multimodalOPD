@@ -26,12 +26,15 @@ from baseline.tam.tam_engine import (
     resolve_tam_parts,
 )
 from baseline.tam.tam_losses import (
+    apply_spatial_filter,
     concentration_gate,
     cosine_divergence,
     gaussian_blur_maps,
     js_divergence,
     l1_divergence,
+    mse_divergence,
     normalized_entropy,
+    rank_gaussian_filter_maps,
     tam_alignment_loss,
 )
 from baseline.tam.tam_trainer import TAMTrainer
@@ -41,11 +44,14 @@ __all__ = [
     "resolve_tam_parts",
     "compute_tam_token_maps",
     "gaussian_blur_maps",
+    "rank_gaussian_filter_maps",
+    "apply_spatial_filter",
     "normalized_entropy",
     "concentration_gate",
     "cosine_divergence",
     "js_divergence",
     "l1_divergence",
+    "mse_divergence",
     "tam_alignment_loss",
     "TAMTrainer",
 ]

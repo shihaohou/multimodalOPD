@@ -38,8 +38,8 @@ from baseline.opd_losses import masked_topk_kl_loss
 from baseline.opd_trainer import OPDTrainer
 from baseline.tam.tam_engine import compute_tam_token_maps, resolve_tam_parts
 from baseline.tam.tam_losses import (
+    apply_spatial_filter,
     concentration_gate,
-    gaussian_blur_maps,
     tam_alignment_loss,
 )
 
@@ -54,8 +54,10 @@ class TAMTrainer(OPDTrainer):
         tam_detach_lm_head: bool = True,
         tam_divergence: str = "cosine",
         tam_blur: bool = True,
+        tam_denoise: str = "gaussian",
         tam_blur_kernel: int = 3,
         tam_blur_sigma: float = 1.0,
+        tam_gate: bool = True,
         tam_gate_temp: float = 1.0,
         tam_gate_h0: float = 0.9,
         tam_gate_tau: float = 0.1,
@@ -78,14 +80,25 @@ class TAMTrainer(OPDTrainer):
             raise ValueError(
                 f"Unknown tam_divergence {tam_divergence!r}; use 'cosine', 'js', 'l1', or 'mse'."
             )
+        if tam_denoise not in {"none", "gaussian", "rgf"}:
+            raise ValueError(
+                f"Unknown tam_denoise {tam_denoise!r}; use 'none', 'gaussian', or 'rgf'."
+            )
         self.lambda_tam = float(lambda_tam)
         self.tam_align_span = tam_align_span
         self.tam_use_eci = bool(tam_use_eci)
         self.tam_detach_lm_head = bool(tam_detach_lm_head)
         self.tam_divergence = tam_divergence
         self.tam_blur = bool(tam_blur)
+        # Spatial denoiser on the maps: "gaussian" (fixed blur, default), "rgf" (the
+        # paper's Rank-Gaussian Filter — the TAM-MSE-RGF ablation), or "none".
+        # tam_blur=False forces "none" (back-compat); else tam_denoise selects.
+        self.tam_denoise = "none" if not bool(tam_blur) else tam_denoise
         self.tam_blur_kernel = int(tam_blur_kernel)
         self.tam_blur_sigma = float(tam_blur_sigma)
+        # Concentration gate (+ mass drop) on/off. False => align ALL aligned tokens
+        # with equal weight (the "no gate" ablation step).
+        self.tam_gate = bool(tam_gate)
         self.tam_gate_temp = float(tam_gate_temp)
         self.tam_gate_h0 = float(tam_gate_h0)
         self.tam_gate_tau = float(tam_gate_tau)
@@ -203,14 +216,13 @@ class TAMTrainer(OPDTrainer):
             if 0 < self.tam_max_tokens < candidate_ids.shape[0]:
                 grid_thw = (t_dim, h_grid, w_grid)
                 gate_for_select = concentration_gate(
-                    gaussian_blur_maps(
+                    apply_spatial_filter(
                         teacher_maps.float(),
                         grid_thw,
+                        kind=self.tam_denoise,
                         kernel_size=self.tam_blur_kernel,
                         sigma=self.tam_blur_sigma,
-                    )
-                    if self.tam_blur
-                    else teacher_maps.float(),
+                    ),
                     temp=self.tam_gate_temp,
                     h0=self.tam_gate_h0,
                     tau=self.tam_gate_tau,
@@ -237,9 +249,10 @@ class TAMTrainer(OPDTrainer):
                 teacher_maps,
                 grid_thw=(t_dim, h_grid, w_grid),
                 divergence=self.tam_divergence,
-                blur=self.tam_blur,
+                denoise=self.tam_denoise,
                 blur_kernel=self.tam_blur_kernel,
                 blur_sigma=self.tam_blur_sigma,
+                use_gate=self.tam_gate,
                 gate_temp=self.tam_gate_temp,
                 gate_h0=self.tam_gate_h0,
                 gate_tau=self.tam_gate_tau,

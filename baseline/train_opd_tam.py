@@ -62,8 +62,15 @@ class OPDTAMScriptArguments(OPDScriptArguments):
     tam_detach_lm_head: bool = True
     tam_divergence: str = "cosine"  # "cosine" | "js" | "l1" | "mse"
     tam_blur: bool = True
+    # Spatial denoiser on the TAM maps: "gaussian" (fixed blur, default), "rgf" (the
+    # paper's Rank-Gaussian Filter — the TAM-MSE-RGF ablation), or "none".
+    # tam_blur=false forces "none" (back-compat). The ablation = mse + rgf.
+    tam_denoise: str = "gaussian"  # "gaussian" | "rgf" | "none"
     tam_blur_kernel: int = 3
     tam_blur_sigma: float = 1.0
+    # Concentration gate (+ mass drop) on/off. false => align ALL aligned tokens with
+    # equal weight (the "no gate" first step). True keeps the soft visual-token gate.
+    tam_gate: bool = True
     tam_gate_temp: float = 1.0
     tam_gate_h0: float = 0.9
     tam_gate_tau: float = 0.1
@@ -102,6 +109,7 @@ def main() -> None:
     script_args.tam_use_eci = _as_bool(script_args.tam_use_eci)
     script_args.tam_detach_lm_head = _as_bool(script_args.tam_detach_lm_head)
     script_args.tam_blur = _as_bool(script_args.tam_blur)
+    script_args.tam_gate = _as_bool(script_args.tam_gate)
 
     if script_args.run_config:
         lr_str = f"{training_args.learning_rate:.0e}".replace("e-0", "e-")
@@ -141,9 +149,9 @@ def main() -> None:
             f"span={script_args.tam_align_span}, "
             f"divergence={script_args.tam_divergence}, "
             f"eci={script_args.tam_use_eci}, "
-            f"blur={script_args.tam_blur}(k={script_args.tam_blur_kernel},"
+            f"denoise={script_args.tam_denoise}(k={script_args.tam_blur_kernel},"
             f"sigma={script_args.tam_blur_sigma}), "
-            f"gate(h0={script_args.tam_gate_h0},tau={script_args.tam_gate_tau}), "
+            f"gate={script_args.tam_gate}(h0={script_args.tam_gate_h0},tau={script_args.tam_gate_tau}), "
             f"max_tokens={script_args.tam_max_tokens}"
         )
         print(f"Output directory: {training_args.output_dir}")
@@ -302,8 +310,10 @@ def main() -> None:
         tam_detach_lm_head=script_args.tam_detach_lm_head,
         tam_divergence=script_args.tam_divergence,
         tam_blur=script_args.tam_blur,
+        tam_denoise=script_args.tam_denoise,
         tam_blur_kernel=script_args.tam_blur_kernel,
         tam_blur_sigma=script_args.tam_blur_sigma,
+        tam_gate=script_args.tam_gate,
         tam_gate_temp=script_args.tam_gate_temp,
         tam_gate_h0=script_args.tam_gate_h0,
         tam_gate_tau=script_args.tam_gate_tau,
@@ -349,6 +359,8 @@ def main() -> None:
                     "tam_divergence": script_args.tam_divergence,
                     "tam_use_eci": script_args.tam_use_eci,
                     "tam_blur": script_args.tam_blur,
+                    "tam_denoise": script_args.tam_denoise,
+                    "tam_gate": script_args.tam_gate,
                     "tam_gate_h0": script_args.tam_gate_h0,
                     "tam_gate_tau": script_args.tam_gate_tau,
                     "tam_max_tokens": script_args.tam_max_tokens,

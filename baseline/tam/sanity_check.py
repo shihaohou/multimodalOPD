@@ -61,7 +61,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--response", default=DEFAULT_RESPONSE, help="Completion to teacher-force.")
     p.add_argument("--question", default="What is the man using to move the boat? Answer briefly.")
     p.add_argument("--image", default=None, help="Image path; default = a synthetic image.")
-    p.add_argument("--divergence", default="cosine", choices=["cosine", "js", "l1"])
+    p.add_argument("--divergence", default="cosine", choices=["cosine", "js", "l1", "mse"])
+    p.add_argument(
+        "--denoise",
+        default="gaussian",
+        choices=["gaussian", "rgf", "none"],
+        help="Spatial filter on the maps: gaussian (blur) | rgf (the paper's "
+        "Rank-Gaussian Filter — the TAM-MSE-RGF ablation) | none.",
+    )
+    p.add_argument(
+        "--no_gate",
+        dest="use_gate",
+        action="store_false",
+        default=True,
+        help="Disable the concentration gate: align ALL tokens with equal weight.",
+    )
     p.add_argument("--no_eci", dest="use_eci", action="store_false", default=True)
     p.add_argument("--no_blur", dest="blur", action="store_false", default=True)
     p.add_argument(
@@ -239,7 +253,12 @@ def main() -> None:
         teacher_maps,
         grid_thw=(t_dim, h_grid, w_grid),
         divergence=args.divergence,
-        blur=args.blur,
+        denoise=(args.denoise if args.blur else "none"),
+        use_gate=args.use_gate,
+    )
+    print(
+        f"[sanity] divergence={args.divergence} denoise="
+        f"{args.denoise if args.blur else 'none'} use_gate={args.use_gate}"
     )
     print(
         f"L_tam = {loss.item():.6f}  div={stats['tam_div'].item():.4f} "
