@@ -19,7 +19,7 @@ import argparse
 import json
 import os
 import sys
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -261,7 +261,9 @@ def generate_records(
 
 
 # ----------------------------------------------------------------------- judge
-def judge_records(records: list[dict[str, Any]], args: argparse.Namespace) -> list[dict[str, Any]]:
+def judge_records(
+    records: list[dict[str, Any]], args: argparse.Namespace, desc: str = "judge"
+) -> list[dict[str, Any]]:
     from openai import OpenAI
 
     api_key = os.environ.get(args.judge_key_env) or os.environ.get("OPENAI_API_KEY")
@@ -329,8 +331,18 @@ def judge_records(records: list[dict[str, Any]], args: argparse.Namespace) -> li
             "benchmark_meta": record.get("benchmark_meta"),
         }
 
+    try:
+        from tqdm import tqdm
+    except ImportError:  # progress bar is optional
+        def tqdm(iterable, **_kwargs):
+            return iterable
+
+    results: list[dict[str, Any]] = [{} for _ in records]
     with ThreadPoolExecutor(max_workers=max(1, args.judge_workers)) as pool:
-        return list(pool.map(judge_one, records))
+        futures = {pool.submit(judge_one, record): index for index, record in enumerate(records)}
+        for future in tqdm(as_completed(futures), total=len(records), desc=desc, unit="q"):
+            results[futures[future]] = future.result()
+    return results
 
 
 # ------------------------------------------------------------------ rule grading
@@ -415,7 +427,9 @@ def judge_existing_responses(args: argparse.Namespace, output_dir: Path) -> None
         if args.grader == "rule":
             judgments = grade_records_rule(records)
         else:
-            judgments = judge_records(records, args)
+            judgments = judge_records(
+                records, args, desc=f"judge {os.path.basename(str(source['name']).rstrip('/'))}"
+            )
         write_jsonl(judgment_file, judgments)
 
         if source["kind"] == "benchmark":
@@ -521,7 +535,9 @@ def main() -> None:
         if args.grader == "rule":
             judgments = grade_records_rule(records)
         else:
-            judgments = judge_records(records, args)
+            judgments = judge_records(
+                records, args, desc=f"judge {os.path.basename(str(source['name']).rstrip('/'))}"
+            )
         write_jsonl(judgment_file, judgments)
 
         if source["kind"] == "benchmark":
