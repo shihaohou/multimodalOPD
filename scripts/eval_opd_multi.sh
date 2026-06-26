@@ -152,7 +152,24 @@ if [[ -n "${DATASET_DIRS:-}" ]]; then
 else
   for name in $DATASETS; do
     if is_det "$name"; then
-      DET_GROUP+=("$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')")
+      lc="$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')"
+      case "$lc" in
+        pope)    repo="${POPE_REPO:-lmms-lab/POPE}" ;;
+        chartqa) repo="${CHARTQA_REPO:-lmms-lab/ChartQA}" ;;
+        vqav2)   repo="${VQAV2_REPO:-lmms-lab/VQAv2}" ;;
+        *)       repo="" ;;
+      esac
+      # A local-looking repo path (/, ./, ../, ~) that doesn't exist -> skip with a
+      # clear message instead of loading the model just to crash in the loader. A bare
+      # hub id (e.g. lmms-lab/POPE) isn't path-checked — it's left for eval_vqa to fetch.
+      case "$repo" in
+        /*|./*|../*|"~"*)
+          if [[ ! -e "$repo" ]]; then
+            echo "[skip] deterministic '$lc' repo not found: $repo (check POPE_REPO/CHARTQA_REPO/VQAV2_REPO)" >&2
+            continue
+          fi ;;
+      esac
+      DET_GROUP+=("$lc")
     else
       : "${DSROOT:?Set DSROOT (judged datasets join as DSROOT/name), or DATASET_DIRS.}"
       JUDGED_DIRS+=("$DSROOT/$name")
