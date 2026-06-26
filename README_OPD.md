@@ -66,7 +66,8 @@ is reused as a library (rollout/teacher/KL/DDP helpers) but its files are unchan
 | `scripts/eval_opd.sh` | Eval launcher (runs `baseline/eval/run_opd_eval.py`). |
 | `scripts/eval_mmvp.sh` | MMVP eval launcher (runs `baseline/eval/run_mmvp_eval.py`). |
 | `scripts/eval_vqa.sh` | POPE/ChartQA/VQAv2 eval launcher (runs `baseline/eval/run_vqa_eval.py`). |
-| `scripts/eval_suite.sh` | One-command full suite: judged + deterministic groups → merged `suite_summary.json` table. |
+| `scripts/eval_suite.sh` | One-command full suite: judged + deterministic groups → merged `suite_summary.json` table (`SKIP_JUDGE=true` = generate only). |
+| `scripts/judge_suite.sh` | Phase-B offline judge: `run_opd_eval.py --judge-only` over saved responses (one controlled `JUDGE_WORKERS` pool) + re-aggregate. Decouples GPU rollout from the judge. |
 | `scripts/serve_teacher_vllm.sh` | Launch the teacher scoring server. |
 
 ViGOS files under `vigos/` (`train_vigos.py`, `trainer.py`, `data_collator.py`, …) are unchanged.
@@ -430,6 +431,111 @@ training prompt** (unified system + `\boxed{}`), not lmms-eval's per-task
 templates — so absolute numbers differ from the public leaderboard; this harness is
 built for *consistent relative* comparison (before/after OPD, student vs teacher),
 not for reproducing leaderboard values.
+
+#### Many checkpoints at scale — decoupled generate → judge (reusable)
+
+Running the inline suite for **many checkpoints in parallel** makes every job's
+LLM-judge calls hit the one judge **at the same time** → the shared judge overloads
+and stalls. The fix is to **decouple**: generate on all GPUs with **no** judge
+(`SKIP_JUDGE=true`), then judge the saved `responses/*.jsonl` in **one controlled
+pass** (`scripts/judge_suite.sh` → `run_opd_eval.py --judge-only`, a single
+`JUDGE_WORKERS` pool — no per-GPU fan-out). POPE/ChartQA/VQAv2 are deterministic and
+finish during generation; only the math/MCQ group is judged. The final
+`suite_summary.json` is identical to the inline run.
+
+**0. Config** (edit the paths once):
+```bash
+cd <repo>
+D=/abs/datasets; Z=$D/zli12321                       # local dataset dirs (works offline)
+JUDGE_MODEL_PATH=/abs/models/<your-judge>            # the LLM judge to serve (e.g. a 32B)
+RUN_ID=$(date +%Y%m%d-%H%M%S); RUNROOT=eval_outputs/suite_$RUN_ID
+LOGDIR=$RUNROOT/logs; mkdir -p "$LOGDIR"
+
+export JUDGED_DATASETS="$Z/mathvista,$Z/mathverse,$Z/mathvision,$Z/MMMU,$Z/mmmu_pro_10options,$Z/mmmu-pro-vision,$Z/mmstar,$Z/hallusionbench"
+export POPE_REPO=$D/POPE POPE_SPLIT=test CHARTQA_REPO=$D/ChartQA CHARTQA_SPLIT=test VQAV2_REPO=$D/VQAv2 VQAV2_SPLIT=validation
+export JUDGE_API_URL=http://127.0.0.1:8000/v1 JUDGE_MODEL=judge OPENAI_API_KEY=dummy
+export JUDGE_EXTRA_BODY='{"chat_template_kwargs": {"enable_thinking": false}}'   # Qwen3 thinking-off
+
+declare -a JOBS=(                                    # tag=checkpoint_dir (+ teacher as a reference)
+  "ckptA=runs/<runA>/checkpoint-XXX"
+  "ckptB=runs/<runB>/checkpoint-XXX"
+  "teacher=$JUDGE_MODEL_PATH"
+)
+```
+
+**1. Start the vLLM judge** (OpenAI-compatible server). One card during generation —
+the 35B-A3B (~70 GB bf16) fits on an 80 GB card; verify thinking is off (it should
+print a short `{"verdict":...}` with no `<think>`):
+```bash
+CUDA_VISIBLE_DEVICES=0 vllm serve "$JUDGE_MODEL_PATH" \
+  --served-model-name judge --port 8000 --trust-remote-code \
+  --gpu-memory-utilization 0.90 --max-model-len 8192 --max-num-seqs 64
+# in another shell: curl -sf http://127.0.0.1:8000/v1/models && echo OK
+```
+
+**2. Phase A — generate on all GPUs, no judge** (`SKIP_JUDGE=true`). Free-card
+scheduler keeps each generation card busy; the judge isn't touched:
+```bash
+GEN_CARDS=(1 2 3 4 5 6 7)            # cards for generation (leave card 0 for the judge)
+declare -A SLOT
+for job in "${JOBS[@]}"; do
+  tag="${job%%=*}"; path="${job#*=}"; card=""
+  while [ -z "$card" ]; do
+    for c in "${GEN_CARDS[@]}"; do
+      pid="${SLOT[$c]:-}"
+      if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then card=$c; break; fi
+    done
+    [ -z "$card" ] && sleep 10
+  done
+  CUDA_VISIBLE_DEVICES=$card MODEL_PATH="$path" MODEL_NAME="$tag" \
+    OUTPUT_ROOT="$RUNROOT/$tag" VQAV2_LIMIT=5000 SKIP_JUDGE=true \
+    bash scripts/eval_suite.sh > "$LOGDIR/gen_$tag.log" 2>&1 &
+  SLOT[$card]=$!; echo "gen $tag -> card $card"
+done
+wait; echo "Phase A done -> $RUNROOT"
+```
+
+**3. Phase B — judge offline, one controlled pool.** Generation is done, so the GPUs
+are free; optionally restart the judge with **tensor parallelism** for a fast judge
+phase. Judge each model **sequentially** (so the judge only ever sees `JUDGE_WORKERS`
+concurrent — the rest queue):
+```bash
+# optional, now that GPUs are free — TP judge for max throughput:
+# pkill -f "vllm serve"; sleep 5
+# CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 vllm serve "$JUDGE_MODEL_PATH" \
+#   --served-model-name judge --port 8000 --trust-remote-code --tensor-parallel-size 8 \
+#   --gpu-memory-utilization 0.90 --max-model-len 8192 --max-num-seqs 256
+
+export JUDGE_WORKERS=48 JUDGE_MAX_TOKENS=512
+for job in "${JOBS[@]}"; do
+  tag="${job%%=*}"
+  OUTPUT_ROOT="$RUNROOT/$tag" MODEL_NAME="$tag" \
+    bash scripts/judge_suite.sh > "$LOGDIR/judge_$tag.log" 2>&1   # judges + re-aggregates
+done
+echo "Phase B done"
+```
+
+**4. Compare all models** in one table:
+```bash
+uv run python - "$RUNROOT" <<'PY'
+import glob, json, sys
+root = sys.argv[1]; rows = {}; tags = []
+for p in sorted(glob.glob(f"{root}/*/suite_summary.json")):
+    s = json.load(open(p)); t = s["model_name"]; tags.append(t)
+    for n, v in (s.get("table") or {}).items(): rows.setdefault(n, {})[t] = v
+w = max(len(n) for n in rows)
+print(f"{'benchmark':<{w}} " + " ".join(f"{t[:16]:>17}" for t in tags))
+for n in rows:
+    print(f"{n:<{w}} " + " ".join((f"{rows[n].get(t)*100:>16.2f}%" if isinstance(rows[n].get(t),(int,float)) else f"{'-':>17}") for t in tags))
+PY
+```
+
+Notes: keep Phase B **sequential** (one model at a time) so the judge gets exactly one
+`JUDGE_WORKERS` pool — watch the judge log's `Running / throughput` and raise
+`JUDGE_WORKERS` (or switch to TP) if it's idle, lower it if throughput drops to 0.
+Layout: `eval_outputs/suite_<RUN_ID>/{logs/, <tag>/{judged/, vqa/, suite_summary.json}}`.
+Offline box: the local dataset dirs are mmap'd + OS-page-cached, so parallel jobs share
+the file reads (no N× disk I/O); only image-decode/tokenize is per-process.
 
 **LoRA mode** (`FINETUNING_MODE=lora`): merge the adapter first, then point
 `MODEL_PATH` at the merged dir:
