@@ -22,6 +22,9 @@ export TRANSFORMERS_NO_TF=1
 export TOKENIZERS_PARALLELISM=false
 # vLLM v1 forks its EngineCore; force spawn so a CUDA-initialized parent can't break it.
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+# Silence PIL's harmless palette-transparency advisory (it floods logs on chart/PNG
+# datasets); .convert("RGB") handles those images fine. Propagates to vLLM's subprocess.
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore:Palette images with Transparency:UserWarning}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/mmvp_${RUN_ID}}"
