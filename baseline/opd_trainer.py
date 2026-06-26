@@ -86,6 +86,75 @@ class OPDTrainer(ViGOSTrainer):
                     "opd_kl_direction='forward' (the server returns top-k logprobs)."
                 )
 
+    def _completion_placeholder_token_ids(self) -> set[int]:
+        """Image/video placeholder token ids — these must never appear inside a
+        sampled completion. If the on-policy student emits one, re-running
+        prompt+completion makes Qwen's ``get_placeholder_mask`` count more
+        placeholder tokens than the ViT produced image features and raise
+        ("Image features and image tokens do not match"), killing the whole
+        multi-GPU run. Collected once from the model config (Qwen3-VL:
+        ``image_token_id`` / ``video_token_id``) with a tokenizer fallback.
+        """
+        cached = getattr(self, "_completion_placeholder_ids_cache", None)
+        if cached is not None:
+            return cached
+        ids: set[int] = set()
+        try:
+            config = self.accelerator.unwrap_model(self.model).config
+        except Exception:
+            config = getattr(self.model, "config", None)
+        for obj in (
+            config,
+            getattr(config, "text_config", None),
+            getattr(config, "vision_config", None),
+        ):
+            for attr in ("image_token_id", "video_token_id"):
+                tid = getattr(obj, attr, None) if obj is not None else None
+                if isinstance(tid, int) and tid >= 0:
+                    ids.add(tid)
+        tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        unk = getattr(tokenizer, "unk_token_id", None)
+        for token in ("<|image_pad|>", "<|video_pad|>"):
+            try:
+                tid = tokenizer.convert_tokens_to_ids(token)
+            except Exception:
+                tid = None
+            if isinstance(tid, int) and tid >= 0 and tid != unk:
+                ids.add(tid)
+        self._completion_placeholder_ids_cache = ids
+        return ids
+
+    def _generate_on_policy(self, *args: Any, **kwargs: Any) -> dict[str, torch.Tensor]:
+        # The on-policy student can occasionally sample an image/video placeholder
+        # token into its (text) completion. Re-running prompt+completion then trips
+        # Qwen's get_placeholder_mask token/feature-count check and kills the whole
+        # run. Replace any such token in the completion region with the pad token
+        # (shape-preserving) in BOTH completion_ids and the completion tail of
+        # generated_ids, so the student/teacher forwards stay consistent.
+        rollout = super()._generate_on_policy(*args, **kwargs)
+        placeholder_ids = self._completion_placeholder_token_ids()
+        completion = rollout.get("completion_ids") if isinstance(rollout, dict) else None
+        if not placeholder_ids or not isinstance(completion, torch.Tensor):
+            return rollout
+        bad = torch.zeros_like(completion, dtype=torch.bool)
+        for tid in placeholder_ids:
+            bad |= completion == tid
+        if not bool(bad.any()):
+            return rollout
+        pad_id = self._pad_token_id()
+        completion[bad] = pad_id
+        generated = rollout.get("generated_ids")
+        if isinstance(generated, torch.Tensor) and generated.shape[1] >= completion.shape[1]:
+            prompt_len = generated.shape[1] - completion.shape[1]
+            generated[:, prompt_len:][bad] = pad_id
+        if self.accelerator.is_main_process:
+            print(
+                f"[OPD] sanitized {int(bad.sum())} image/video placeholder "
+                "token(s) sampled into completions this step (frequent triggering "
+                "=> the policy may be degenerating; consider lowering LR)."
+            )
+        return rollout
+
     def _report_opd_nan(
         self,
         model: nn.Module,
