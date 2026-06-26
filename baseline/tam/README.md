@@ -70,6 +70,75 @@ L_TAM = mean_i  g_i · d( p^stu_i , sg[p^tea_i] )    # both sides filtered equal
   `L_TAM` is the plain `1/|P|` mean (the "align all tokens" step). The full loss is
   `L = λ_opd·L_OPD + λ_tam·L_TAM`; **token-KL is never removed**.
 
+## Readout direction: emitted token vs OPD correction (`TAM_DIRECTION`)
+
+The base map can be read along **any** vocab-space direction. Two choices:
+
+```
+token       a_i = ReLU( F^v · W[y_i]^T )              # emitted-token evidence (original TAM)
+correction  a_i = ReLU( F^v · (W^T u_i)^T ),  u_i = sg(top-k(p_T - p_S))   # OPD residual evidence
+```
+
+* **`token`** (default): "which patches support the token the student *emitted*." On
+  the (majority) tokens where teacher≈student this map is easy to match — both look
+  at the obvious region — so the loss bottoms out fast and **decouples from what OPD
+  is still correcting** (the observed `loss_tam` plateau).
+* **`correction`**: "which patches support the teacher's *intended correction*."
+  `u_i = p_T - p_S` is the **same residual the OPD reverse-KL is built on**; reading
+  the map along it makes the visual channel and the behavior channel share one
+  signal. On agreement tokens `u_i ≈ 0` → empty map → the term **auto-zeros**, so the
+  loss concentrates on exactly the disagreement set OPD works on. This is the
+  Saliency-R1-style *correction-direction* alignment.
+
+Mechanics (`sparse_correction_topk` + `project_correction` in `tam_engine.py`):
+
+1. **sparse top-k by `|p_T − p_S|`** (`TAM_CORR_TOP_K`, default 100) — keeps the few
+   high-disagreement tokens, drops the ~150k-wide noise tail (and makes the
+   projection a cheap gather). Picks *disagreement*, not the union of the argmaxes.
+2. **L1-normalize** the kept correction (`TAM_CORR_NORMALIZE`, default on): `û = u/Σ|u|`
+   so the map *shape* is decoupled from the disagreement *magnitude*.
+3. **`corr_mass = Σ|p_T − p_S|`** is re-injected as a per-token **loss weight**
+   (`TAM_CORR_GATE`, default on → the **A′** variant): `L = Σ_i m_i·d_i / Σ_i m_i`, so
+   near-agreement (empty-correction) tokens don't dilute the mean. Off → plain mean.
+4. **No extra forward.** `p_S`/`p_T` are the OPD completion logits already computed,
+   indexed to line up with the aligned tokens. `u` **and** both `lm_head`s are
+   detached, so the evidence gradient still reaches `F^v` only — `W^T u` is a
+   constant readout direction, exactly like `W[y_i]` was.
+5. **ECI off** with correction (`TAM_USE_ECI=false`): ECI's context interference is
+   defined around the one-hot token identity, and prompt context tokens have no
+   rollout residual — a fully-consistent correction-ECI isn't well-defined, so keep
+   it off for a clean isolation.
+
+`hybrid` (fallback): `u_i = onehot(y_i) + α·sg(p_T − p_S)` (`TAM_CORR_ALPHA`) — keeps
+the emitted-token evidence and adds the residual. Run **only if** pure `correction`
+turns out too sparse; it re-mixes the two signals so the science is less clean.
+
+### Recommended ablation ladder (isolate the direction variable)
+
+Current run = `mse + rgf(hard) + nogate`. Change **one** variable at a time:
+
+| run | knobs (on top of `TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_GATE=false`) | question |
+|---|---|---|
+| **A0**  | `TAM_DIRECTION=token` (current) | baseline |
+| **A0′** | `TAM_DIRECTION=token TAM_USE_ECI=false` | isolate the ECI-off effect |
+| **A**   | `TAM_DIRECTION=correction TAM_USE_ECI=false TAM_CORR_GATE=false` | does the correction direction help at all? |
+| **A′**  | `TAM_DIRECTION=correction TAM_USE_ECI=false` (corr-mass weight on) | + fix near-agreement dilution |
+
+Headline comparison is **A′ vs A0′** (both ECI-off), not A′ vs A0 — else a gain could
+just be the ECI-off change. Watch the new **`tam_corr_mass`** metric (mean
+disagreement of the aligned tokens): if it collapses toward 0, the rollouts already
+agree with the teacher and the correction signal is genuinely sparse → consider
+`hybrid`. The forward adds no model passes, so A′ costs the same as A0.
+
+```bash
+# A' (the recommended next run):
+M=/path/to/models DATASET_NAME=/path/to/Vision-SR1-47K \
+TAM_DIRECTION=correction TAM_USE_ECI=false \
+TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_GATE=false \
+bash scripts/train_opd_tam_qwen3_8b_to_2b.sh
+# auto-named ..._mse_rgf_nogate_correctioncorrgate_ecioff_fullft_<date>
+```
+
 ### Paper-faithful ablation: **OPD + TAM-MSE-RGF**
 
 `TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_GATE=false` reproduces the paper's visual
@@ -131,6 +200,9 @@ Validate the engine first (1 GPU):
 uv run python -m baseline.tam.sanity_check \
     --student_model Qwen/Qwen3-VL-2B-Instruct \
     --teacher_model Qwen/Qwen3-VL-8B-Instruct --attn sdpa
+# correction direction (the A' path): add --direction correction --no_eci
+#   --direction correction --no_eci --divergence mse --denoise rgf --no_gate
+# asserts the correction direction is detached and the grad still reaches the ViT.
 ```
 
 Then train (8×A100/H800; full ViT, OPD+TAM):
@@ -155,7 +227,11 @@ bash scripts/train_opd_tam_qwen3_8b_to_2b.sh
 ```
 
 Watch `loss_opd` (behavior), `loss_tam` / `tam_div` (visual evidence — should fall
-without hurting `answer_accuracy`), and `tam_gate_mean` (fraction of tokens the
-gate keeps; `=1.0` when `TAM_GATE=false`). Ablation knobs (doc §8): `TAM_DIVERGENCE`,
+without hurting `answer_accuracy`), `tam_gate_mean` (fraction of tokens the gate
+keeps; `=1.0` when `TAM_GATE=false`), and — for `TAM_DIRECTION=correction` — the new
+**`tam_corr_mass`** (mean teacher↔student disagreement of the aligned tokens; a
+collapse toward 0 means the rollouts already agree → the correction signal is
+sparse). Ablation knobs (doc §8): `TAM_DIRECTION`, `TAM_CORR_TOP_K`,
+`TAM_CORR_NORMALIZE`, `TAM_CORR_GATE`, `TAM_CORR_ALPHA`, `TAM_DIVERGENCE`,
 `TAM_DENOISE`, `TAM_RGF_GRAD`, `TAM_GATE`, `TAM_USE_ECI`, `TAM_ALIGN_SPAN`,
 `TAM_MAX_TOKENS`, `LAMBDA_TAM ∈ {0,0.5,1,5,10}`, `FREEZE_VISION_TOWER`.

@@ -36,7 +36,12 @@ if __package__ is None or __package__ == "":
 
 import torch
 
-from baseline.tam.tam_engine import compute_tam_token_maps, resolve_tam_parts
+from baseline.tam.tam_engine import (
+    compute_tam_token_maps,
+    project_correction,
+    resolve_tam_parts,
+    sparse_correction_topk,
+)
 from baseline.tam.tam_losses import tam_alignment_loss
 
 # Well-formed OPD completion (reasoning + \boxed{}); used so the check does not
@@ -61,6 +66,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--response", default=DEFAULT_RESPONSE, help="Completion to teacher-force.")
     p.add_argument("--question", default="What is the man using to move the boat? Answer briefly.")
     p.add_argument("--image", default=None, help="Image path; default = a synthetic image.")
+    p.add_argument(
+        "--direction",
+        default="token",
+        choices=["token", "correction", "hybrid"],
+        help="TAM base-map readout direction: token (one-hot W[y_i], original) | "
+        "correction (W^T sg(p_T-p_S), the OPD residual — needs --teacher_model) | "
+        "hybrid (one-hot + alpha*correction).",
+    )
+    p.add_argument("--corr_top_k", type=int, default=100, help="top-k |p_T-p_S| vocab entries for the correction direction.")
+    p.add_argument("--no_corr_normalize", dest="corr_normalize", action="store_false", default=True, help="Disable L1-normalization of the correction direction.")
+    p.add_argument("--no_corr_gate", dest="corr_gate", action="store_false", default=True, help="Disable corr_mass per-token loss weighting (the A' variant).")
+    p.add_argument("--corr_alpha", type=float, default=1.0, help="hybrid: one-hot + alpha*correction.")
     p.add_argument("--divergence", default="cosine", choices=["cosine", "js", "l1", "mse"])
     p.add_argument(
         "--denoise",
@@ -205,22 +222,11 @@ def main() -> None:
 
     torch.cuda.reset_peak_memory_stats()
 
-    # --- student forward (WITH grad) -> student TAM maps -----------------------
+    # --- student forward (WITH grad); teacher forward (NO grad) ----------------
     student.train()
     s_out = student(**fwd_kwargs)
-    student_maps = compute_tam_token_maps(
-        s_out.hidden_states[-1][0],
-        s_parts.lm_head.weight,
-        visual_positions=visual_positions,
-        token_ids=cand_ids,
-        token_positions=cand_pos,
-        context_positions=ctx_pos,
-        context_ids=ctx_ids,
-        use_eci=args.use_eci,
-        detach_lm_head=True,
-    )
 
-    # --- teacher forward (NO grad) -> teacher TAM maps (grid check) -------------
+    teacher = t_parts = t_out = t_visual = None
     if args.teacher_model:
         teacher = _load_model(args.teacher_model, args.attn, dtype)
         t_parts = resolve_tam_parts(teacher)
@@ -235,11 +241,60 @@ def main() -> None:
         print("[sanity] GRID CHECK PASSED — teacher/student share the patch grid. ✅")
         with torch.no_grad():
             t_out = teacher(**fwd_kwargs)
+
+    # --- correction readout direction (needs BOTH models' logits) --------------
+    d_s = d_t = corr_mass = None
+    if args.direction != "token":
+        if t_out is None:
+            raise SystemExit("--direction correction/hybrid needs --teacher_model (teacher logits).")
+        # logits[p-1] is the next-token distribution that produced the token at abs
+        # position p (the OPD completion logits, here read off the full-sequence fwd).
+        s_logits_cand = s_out.logits[0].index_select(0, cand_pos - 1)
+        t_logits_cand = t_out.logits[0].index_select(0, cand_pos - 1)
+        vocab = min(s_logits_cand.shape[-1], t_logits_cand.shape[-1])
+        u_k, idx, corr_mass = sparse_correction_topk(
+            s_logits_cand[..., :vocab], t_logits_cand[..., :vocab],
+            top_k=args.corr_top_k, normalize=args.corr_normalize,
+        )
+        d_s = project_correction(u_k, idx, s_parts.lm_head.weight)
+        d_t = project_correction(u_k, idx, t_parts.lm_head.weight)
+        if args.direction == "hybrid":
+            d_s = s_parts.lm_head.weight.detach().index_select(0, cand_ids).float() + args.corr_alpha * d_s
+            d_t = t_parts.lm_head.weight.detach().index_select(0, cand_ids).float() + args.corr_alpha * d_t
+        print(
+            f"[sanity] direction={args.direction} top_k={args.corr_top_k} "
+            f"normalize={args.corr_normalize} corr_mass.mean={corr_mass.mean().item():.4e} "
+            f"d_s={tuple(d_s.shape)} d_t={tuple(d_t.shape)} "
+            f"d_s.requires_grad={d_s.requires_grad} (want False)"
+        )
+        assert not d_s.requires_grad and not d_t.requires_grad, (
+            "correction direction must be detached (sg(u) + detached lm_head) so the "
+            "evidence gradient reaches F^v only, not the logits / unembedding."
+        )
+
+    # --- student TAM maps (grad) -----------------------------------------------
+    student_maps = compute_tam_token_maps(
+        s_out.hidden_states[-1][0],
+        s_parts.lm_head.weight,
+        visual_positions=visual_positions,
+        token_ids=cand_ids,
+        token_directions=d_s,
+        token_positions=cand_pos,
+        context_positions=ctx_pos,
+        context_ids=ctx_ids,
+        use_eci=args.use_eci,
+        detach_lm_head=True,
+    )
+
+    # --- teacher TAM maps (NO grad) --------------------------------------------
+    if args.teacher_model:
+        with torch.no_grad():
             teacher_maps = compute_tam_token_maps(
                 t_out.hidden_states[-1][0],
                 t_parts.lm_head.weight,
                 visual_positions=t_visual,
                 token_ids=cand_ids,
+                token_directions=d_t,
                 token_positions=cand_pos,
                 context_positions=ctx_pos,
                 context_ids=ctx_ids,
@@ -255,6 +310,9 @@ def main() -> None:
     print(f"S_T.requires_grad = {teacher_maps.requires_grad} (want False)")
     assert student_maps.requires_grad and not teacher_maps.requires_grad
 
+    token_weights = (
+        corr_mass if (args.direction == "correction" and args.corr_gate) else None
+    )
     loss, stats = tam_alignment_loss(
         student_maps,
         teacher_maps,
@@ -263,15 +321,17 @@ def main() -> None:
         denoise=(args.denoise if args.blur else "none"),
         rgf_grad=args.rgf_grad,
         use_gate=args.use_gate,
+        token_weights=token_weights,
     )
     print(
         f"[sanity] divergence={args.divergence} denoise="
         f"{args.denoise if args.blur else 'none'} rgf_grad={args.rgf_grad} "
-        f"use_gate={args.use_gate}"
+        f"use_gate={args.use_gate} corr_weight={'on' if token_weights is not None else 'off'}"
     )
     print(
         f"L_tam = {loss.item():.6f}  div={stats['tam_div'].item():.4f} "
-        f"gate_mean={stats['tam_gate_mean'].item():.4f} n_tokens={stats['tam_n']}"
+        f"gate_mean={stats['tam_gate_mean'].item():.4f} "
+        f"corr_mass={stats['tam_corr_mass'].item():.4e} n_tokens={stats['tam_n']}"
     )
     loss.backward()
 

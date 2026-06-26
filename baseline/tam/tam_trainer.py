@@ -36,7 +36,12 @@ import torch.nn as nn
 
 from baseline.opd_losses import masked_topk_kl_loss
 from baseline.opd_trainer import OPDTrainer
-from baseline.tam.tam_engine import compute_tam_token_maps, resolve_tam_parts
+from baseline.tam.tam_engine import (
+    compute_tam_token_maps,
+    project_correction,
+    resolve_tam_parts,
+    sparse_correction_topk,
+)
 from baseline.tam.tam_losses import (
     apply_spatial_filter,
     concentration_gate,
@@ -50,6 +55,11 @@ class TAMTrainer(OPDTrainer):
         *args: Any,
         lambda_tam: float = 1.0,
         tam_align_span: str = "completion",
+        tam_direction: str = "token",
+        tam_corr_top_k: int = 100,
+        tam_corr_normalize: bool = True,
+        tam_corr_gate: bool = True,
+        tam_corr_alpha: float = 1.0,
         tam_use_eci: bool = True,
         tam_detach_lm_head: bool = True,
         tam_divergence: str = "cosine",
@@ -77,6 +87,12 @@ class TAMTrainer(OPDTrainer):
                 f"Unknown tam_align_span {tam_align_span!r}; use 'completion', "
                 "'answer', or 'reason_answer'."
             )
+        if tam_direction not in {"token", "correction", "hybrid"}:
+            raise ValueError(
+                f"Unknown tam_direction {tam_direction!r}; use 'token' (one-hot "
+                "W[y_i], the emitted-token map), 'correction' (W^T sg(p_T-p_S), the "
+                "OPD residual map), or 'hybrid' (one-hot + alpha*correction)."
+            )
         if tam_divergence not in {"cosine", "js", "l1", "mse"}:
             raise ValueError(
                 f"Unknown tam_divergence {tam_divergence!r}; use 'cosine', 'js', 'l1', or 'mse'."
@@ -92,6 +108,21 @@ class TAMTrainer(OPDTrainer):
             )
         self.lambda_tam = float(lambda_tam)
         self.tam_align_span = tam_align_span
+        # Readout direction for the TAM base map:
+        #   token       one-hot W[y_i] — the emitted-token evidence (original TAM).
+        #   correction  W^T sg(top-k(p_T - p_S)) — the OPD teacher↔student residual:
+        #               where the image supports the teacher's intended correction.
+        #   hybrid      one-hot + tam_corr_alpha * correction (keeps both signals).
+        self.tam_direction = tam_direction
+        self.tam_corr_top_k = int(tam_corr_top_k)
+        # L1-normalize the correction direction (decouple map shape from disagreement
+        # magnitude; the magnitude is re-injected as corr_mass loss weight instead).
+        self.tam_corr_normalize = bool(tam_corr_normalize)
+        # Weight each token's alignment by corr_mass = Σ|p_T - p_S| (the per-token
+        # disagreement). Only used for direction="correction"; fixes the dilution of
+        # near-agreement tokens that have an empty correction map. = the A' variant.
+        self.tam_corr_gate = bool(tam_corr_gate)
+        self.tam_corr_alpha = float(tam_corr_alpha)
         self.tam_use_eci = bool(tam_use_eci)
         self.tam_detach_lm_head = bool(tam_detach_lm_head)
         self.tam_divergence = tam_divergence
@@ -153,12 +184,50 @@ class TAMTrainer(OPDTrainer):
             return valid.new_zeros(0)
         return valid.index_select(0, valid.new_tensor(keep))
 
+    def _correction_directions(
+        self,
+        student_logits_b: torch.Tensor,
+        teacher_logits_b: torch.Tensor,
+        comp_idx: torch.Tensor,
+        candidate_ids: torch.Tensor,
+        s_weight: torch.Tensor,
+        t_weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Per-candidate OPD correction directions for the student & teacher maps.
+
+        Builds ``u_i = sg(top-k(p_T - p_S))`` (L1-normalized) at the candidate
+        completion positions — ``student_logits_b`` / ``teacher_logits_b`` are the
+        shared-vocab completion logits the OPD loss already computed, indexed by the
+        within-completion ``comp_idx`` (lines up 1:1 with ``candidate_ids``) — and
+        projects it onto each model's hidden space via its own detached lm_head:
+        ``d^S = W_S^T u``, ``d^T = W_T^T u``. All returns are detached, so the
+        evidence gradient reaches ``F^v`` only (never the logits or the unembedding).
+        For ``direction='hybrid'`` adds the one-hot ``W[y_i]`` row + ``alpha·corr``
+        (keeps the emitted-token evidence and adds the residual). Returns
+        ``(d_s, d_t, corr_mass)``."""
+        ps_logits = student_logits_b.index_select(0, comp_idx)
+        pt_logits = teacher_logits_b.index_select(0, comp_idx)
+        u_k, idx, corr_mass = sparse_correction_topk(
+            ps_logits,
+            pt_logits,
+            top_k=self.tam_corr_top_k,
+            normalize=self.tam_corr_normalize,
+        )
+        d_s = project_correction(u_k, idx, s_weight)
+        d_t = project_correction(u_k, idx, t_weight)
+        if self.tam_direction == "hybrid":
+            d_s = s_weight.detach().index_select(0, candidate_ids).float() + self.tam_corr_alpha * d_s
+            d_t = t_weight.detach().index_select(0, candidate_ids).float() + self.tam_corr_alpha * d_t
+        return d_s, d_t, corr_mass
+
     def _tam_loss(
         self,
         student_prompt: dict[str, torch.Tensor],
         rollout: dict[str, torch.Tensor],
         student_hidden_last: torch.Tensor,
         teacher_hidden_last: torch.Tensor,
+        student_logits: torch.Tensor | None = None,
+        teacher_logits: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor | None, dict[str, float]]:
         """TAM alignment loss from the already-computed last-layer hidden states.
 
@@ -176,11 +245,18 @@ class TAMTrainer(OPDTrainer):
         s_weight = s_parts.lm_head.weight
         t_weight = t_parts.lm_head.weight
 
+        use_correction = self.tam_direction != "token"
+        if use_correction and (student_logits is None or teacher_logits is None):
+            raise ValueError(
+                f"tam_direction={self.tam_direction!r} needs the completion logits; "
+                "pass student_logits/teacher_logits to _tam_loss."
+            )
         loss_terms: list[torch.Tensor] = []
         div_sum = 0.0
         js_sum = 0.0
         gate_sum = 0.0
         kept_sum = 0.0
+        corr_sum = 0.0
         n_total = 0
         valid_samples = 0
         for b in range(generated_ids.shape[0]):
@@ -207,12 +283,24 @@ class TAMTrainer(OPDTrainer):
             context_positions = context_mask.nonzero(as_tuple=True)[0]
             context_ids = seq_ids.index_select(0, context_positions)
 
+            # Correction (or hybrid) readout directions d^S/d^T = W^T sg(p_T-p_S),
+            # plus corr_mass; None for the one-hot "token" direction (engine uses
+            # W[candidate_ids]). Computed from the OPD completion logits (lined up
+            # with comp_idx) — no extra forward.
+            d_s = d_t = corr_mass = None
+            if use_correction:
+                d_s, d_t, corr_mass = self._correction_directions(
+                    student_logits[b], teacher_logits[b], comp_idx, candidate_ids,
+                    s_weight, t_weight,
+                )
+
             with torch.no_grad():
                 teacher_maps = compute_tam_token_maps(
                     teacher_hidden_last[b],
                     t_weight,
                     visual_positions=visual_positions,
                     token_ids=candidate_ids,
+                    token_directions=d_t,
                     token_positions=candidate_positions,
                     context_positions=context_positions,
                     context_ids=context_ids,
@@ -241,12 +329,17 @@ class TAMTrainer(OPDTrainer):
                 candidate_ids = candidate_ids.index_select(0, sel)
                 candidate_positions = candidate_positions.index_select(0, sel)
                 teacher_maps = teacher_maps.index_select(0, sel)
+                if d_s is not None:
+                    d_s = d_s.index_select(0, sel)
+                if corr_mass is not None:
+                    corr_mass = corr_mass.index_select(0, sel)
 
             student_maps = compute_tam_token_maps(
                 student_hidden_last[b],
                 s_weight,
                 visual_positions=visual_positions,
                 token_ids=candidate_ids,
+                token_directions=d_s,
                 token_positions=candidate_positions,
                 context_positions=context_positions,
                 context_ids=context_ids,
@@ -254,6 +347,14 @@ class TAMTrainer(OPDTrainer):
                 detach_lm_head=self.tam_detach_lm_head,
             )
 
+            # corr_mass loss weighting is the A' variant: weight each token by the
+            # teacher↔student disagreement so near-agreement (empty-correction)
+            # tokens don't dilute the mean. Only for the pure correction direction.
+            token_weights = (
+                corr_mass
+                if (self.tam_corr_gate and self.tam_direction == "correction")
+                else None
+            )
             loss_b, stats_b = tam_alignment_loss(
                 student_maps,
                 teacher_maps,
@@ -268,6 +369,7 @@ class TAMTrainer(OPDTrainer):
                 gate_h0=self.tam_gate_h0,
                 gate_tau=self.tam_gate_tau,
                 mass_threshold=self.tam_mass_threshold,
+                token_weights=token_weights,
             )
             loss_terms.append(loss_b)
             n_b = int(stats_b["tam_n"])
@@ -275,6 +377,7 @@ class TAMTrainer(OPDTrainer):
             js_sum += float(stats_b["tam_js"]) * n_b
             gate_sum += float(stats_b["tam_gate_mean"]) * n_b
             kept_sum += float(stats_b["tam_mass_kept"]) * n_b
+            corr_sum += float(stats_b["tam_corr_mass"]) * n_b
             n_total += n_b
             valid_samples += 1
 
@@ -288,6 +391,7 @@ class TAMTrainer(OPDTrainer):
             "tam_js_sum": js_sum,
             "tam_gate_sum": gate_sum,
             "tam_mass_kept_sum": kept_sum,
+            "tam_corr_mass_sum": corr_sum,
         }
 
     def _assert_shared_grid(self) -> None:
@@ -427,7 +531,12 @@ class TAMTrainer(OPDTrainer):
         tam_stats: dict[str, float] = {}
         if run_tam and student_hidden_last is not None and teacher_hidden_last is not None:
             tam_loss, tam_stats = self._tam_loss(
-                student_prompt, rollout, student_hidden_last, teacher_hidden_last
+                student_prompt,
+                rollout,
+                student_hidden_last,
+                teacher_hidden_last,
+                student_logits=student_kl_logits,
+                teacher_logits=teacher_kl_logits,
             )
             if tam_loss is not None and bool(torch.isfinite(tam_loss.detach())):
                 loss = loss + self.lambda_tam * tam_loss
@@ -468,6 +577,7 @@ class TAMTrainer(OPDTrainer):
             metrics["tam_js"] = (tam_stats.get("tam_js_sum", 0.0), n_sel)
             metrics["tam_gate_mean"] = (tam_stats.get("tam_gate_sum", 0.0), n_sel)
             metrics["tam_mass_kept"] = (tam_stats.get("tam_mass_kept_sum", 0.0), n_sel)
+            metrics["tam_corr_mass"] = (tam_stats.get("tam_corr_mass_sum", 0.0), n_sel)
             metrics["tam_n_selected"] = (
                 n_sel,
                 max(tam_stats.get("tam_valid_samples", 1.0), 1.0),

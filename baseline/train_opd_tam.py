@@ -57,6 +57,21 @@ class OPDTAMScriptArguments(OPDScriptArguments):
     # Which rollout tokens to align on: "completion" (all, gate selects — default),
     # "answer" (\boxed{} span only), or "reason_answer" (<reason> + \boxed{}).
     tam_align_span: str = "completion"
+    # TAM base-map readout direction:
+    #   token       one-hot W[y_i] — the emitted-token evidence (original TAM, default).
+    #   correction  W^T sg(top-k(p_T - p_S)) — the OPD teacher↔student residual: where
+    #               the image supports the teacher's intended correction. Auto-zeros on
+    #               agreement tokens, so the evidence loss tracks the OPD disagreement.
+    #   hybrid      one-hot + tam_corr_alpha * correction (keeps both signals).
+    tam_direction: str = "token"  # token | correction | hybrid
+    tam_corr_top_k: int = 100  # keep this many largest-|p_T-p_S| vocab entries
+    # L1-normalize the correction direction (map shape decoupled from disagreement
+    # magnitude; the magnitude is re-injected as the corr_mass loss weight instead).
+    tam_corr_normalize: bool = True
+    # Weight each token's alignment by corr_mass = Σ|p_T-p_S| (the disagreement); only
+    # for direction=correction. = the A' variant — fixes near-agreement-token dilution.
+    tam_corr_gate: bool = True
+    tam_corr_alpha: float = 1.0  # hybrid: one-hot + alpha*correction
     tam_use_eci: bool = True
     # Read the map along a detached lm_head row so the gradient lands on the visual
     # representation F^v, not the unembedding (migration doc §3). Keep True.
@@ -116,6 +131,8 @@ def main() -> None:
     script_args.tam_detach_lm_head = _as_bool(script_args.tam_detach_lm_head)
     script_args.tam_blur = _as_bool(script_args.tam_blur)
     script_args.tam_gate = _as_bool(script_args.tam_gate)
+    script_args.tam_corr_normalize = _as_bool(script_args.tam_corr_normalize)
+    script_args.tam_corr_gate = _as_bool(script_args.tam_corr_gate)
 
     if script_args.run_config:
         lr_str = f"{training_args.learning_rate:.0e}".replace("e-0", "e-")
@@ -153,6 +170,16 @@ def main() -> None:
             "TAM: "
             f"lambda_tam={script_args.lambda_tam}, "
             f"span={script_args.tam_align_span}, "
+            f"direction={script_args.tam_direction}"
+            + (
+                f"(top_k={script_args.tam_corr_top_k},norm={script_args.tam_corr_normalize},"
+                f"corr_gate={script_args.tam_corr_gate}"
+                + (f",alpha={script_args.tam_corr_alpha}" if script_args.tam_direction == "hybrid" else "")
+                + ")"
+                if script_args.tam_direction != "token"
+                else ""
+            )
+            + ", "
             f"divergence={script_args.tam_divergence}, "
             f"eci={script_args.tam_use_eci}, "
             f"denoise={script_args.tam_denoise}(k={script_args.tam_blur_kernel},"
@@ -313,6 +340,11 @@ def main() -> None:
         # TAM knobs
         lambda_tam=script_args.lambda_tam,
         tam_align_span=script_args.tam_align_span,
+        tam_direction=script_args.tam_direction,
+        tam_corr_top_k=script_args.tam_corr_top_k,
+        tam_corr_normalize=script_args.tam_corr_normalize,
+        tam_corr_gate=script_args.tam_corr_gate,
+        tam_corr_alpha=script_args.tam_corr_alpha,
         tam_use_eci=script_args.tam_use_eci,
         tam_detach_lm_head=script_args.tam_detach_lm_head,
         tam_divergence=script_args.tam_divergence,
@@ -364,6 +396,11 @@ def main() -> None:
                     "opd_lambda_opd": script_args.lambda_opd,
                     "tam_lambda": script_args.lambda_tam,
                     "tam_align_span": script_args.tam_align_span,
+                    "tam_direction": script_args.tam_direction,
+                    "tam_corr_top_k": script_args.tam_corr_top_k,
+                    "tam_corr_normalize": script_args.tam_corr_normalize,
+                    "tam_corr_gate": script_args.tam_corr_gate,
+                    "tam_corr_alpha": script_args.tam_corr_alpha,
                     "tam_divergence": script_args.tam_divergence,
                     "tam_use_eci": script_args.tam_use_eci,
                     "tam_blur": script_args.tam_blur,

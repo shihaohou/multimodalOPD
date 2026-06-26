@@ -23,7 +23,9 @@ modules. See ``baseline/tam/README.md`` and the migration doc.
 from baseline.tam.tam_engine import (
     TAMModelParts,
     compute_tam_token_maps,
+    project_correction,
     resolve_tam_parts,
+    sparse_correction_topk,
 )
 from baseline.tam.tam_losses import (
     apply_spatial_filter,
@@ -43,6 +45,8 @@ __all__ = [
     "TAMModelParts",
     "resolve_tam_parts",
     "compute_tam_token_maps",
+    "sparse_correction_topk",
+    "project_correction",
     "gaussian_blur_maps",
     "rank_gaussian_filter_maps",
     "apply_spatial_filter",

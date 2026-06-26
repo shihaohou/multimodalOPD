@@ -324,6 +324,7 @@ def tam_alignment_loss(
     gate_h0: float = 0.9,
     gate_tau: float = 0.1,
     mass_threshold: float = 0.0,
+    token_weights: torch.Tensor | None = None,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | int]]:
     """Concentration-gated mean of ``d(p^stu, sg[p^tea])`` over the given tokens.
@@ -356,6 +357,12 @@ def tam_alignment_loss(
             In ``(0, 1)`` it is RELATIVE to the sample's mean teacher mass (portable);
             ``>= 1`` is an absolute sum threshold. ``0`` disables it (the soft gate
             still down-weights diffuse tokens).
+        token_weights: optional ``[n]`` external per-token importance, multiplied into
+            the gate (so it composes with ``use_gate``). For the OPD **correction**
+            direction this is ``corr_mass = Σ_k |p_T - p_S|`` — weight each token's
+            alignment by how much the teacher wants to correct it, so the loss is
+            ``Σ_i m_i·d_i / Σ_i m_i`` and near-agreement tokens (empty correction
+            map) don't dilute the mean. Detached. ``None`` -> weight 1.
 
     Returns ``(loss, stats)``; ``loss`` is normalized by the gate sum (floored by
     ``eps`` so a batch of weakly-gated tokens is not washed out).
@@ -365,7 +372,8 @@ def tam_alignment_loss(
         zero = student_maps.sum() * 0.0
         z = zero.detach()
         return zero, {
-            "tam_div": z, "tam_js": z, "tam_gate_mean": z, "tam_mass_kept": z, "tam_n": 0
+            "tam_div": z, "tam_js": z, "tam_gate_mean": z, "tam_mass_kept": z,
+            "tam_corr_mass": z, "tam_n": 0,
         }
 
     s = student_maps.float()
@@ -389,6 +397,14 @@ def tam_alignment_loss(
         # No gate: every token contributes with weight 1, so the loss is the plain
         # 1/|P| mean over all aligned tokens (the "align all tokens" ablation).
         gate = torch.ones(n, device=s.device, dtype=s.dtype)
+    # External per-token importance (OPD correction mass): weight each token by how
+    # much the teacher wants to correct it, composing multiplicatively with the gate.
+    # Detached — a constant reduction weight, no gradient.
+    corr_mass_mean = s.new_zeros(())
+    if token_weights is not None:
+        tw = token_weights.detach().to(device=s.device, dtype=s.dtype)
+        corr_mass_mean = tw.mean()
+        gate = gate * tw
     # Mass filter: hard-drop tokens whose (blurred) teacher map barely responds
     # anywhere — function words / non-visual tokens have nothing to ground to, and
     # under Laplace smoothing their teacher map is ~uniform, so aligning to it just
@@ -436,6 +452,7 @@ def tam_alignment_loss(
         "tam_js": js_monitor.detach(),
         "tam_gate_mean": gate.detach().mean(),
         "tam_mass_kept": mass_kept.detach().mean(),
+        "tam_corr_mass": corr_mass_mean.detach(),
         "tam_n": n,
     }
     return loss, stats

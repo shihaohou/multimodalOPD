@@ -141,12 +141,81 @@ def resolve_tam_parts(
     return parts
 
 
+def sparse_correction_topk(
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    *,
+    top_k: int = 100,
+    normalize: bool = True,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sparse OPD **correction direction** ``sg(top-k(p_T - p_S))`` per token.
+
+    The TAM base map can be read along *any* vocab-space direction; the OPD-native
+    one is the teacher↔student *residual* ``u_i = p_T(.|x,y_<i) - p_S(.|x,y_<i)`` —
+    exactly the signal the OPD reverse-KL is built on. Reading the visual map along
+    ``u_i`` (instead of the emitted token's one-hot ``W[y_i]``) makes the evidence
+    channel highlight the patches that support the teacher's *intended correction*,
+    and it auto-zeros on tokens where teacher≈student (nothing to align there),
+    concentrating the loss on the same disagreement set the OPD token loss works on.
+
+    Sparse top-k by ``|p_T - p_S|`` keeps the few high-disagreement tokens and drops
+    the ~150k-wide noise tail (and makes the downstream projection a cheap gather).
+    Picking by ``|Δ|`` (not a union of the two argmaxes) targets *disagreement*: a
+    token both models rank high but agree on carries no correction and is skipped.
+
+    Args:
+        student_logits / teacher_logits: ``[n, V]`` logits at the candidate token
+            positions, on the **shared** vocab (caller clips to ``min(V_s, V_t)``).
+            Detached internally — the correction direction is a constant w.r.t. the
+            student graph (``sg``); the evidence gradient must reach ``F^v`` only.
+        top_k: keep this many largest-``|Δ|`` vocab entries (``min``'d with ``V``).
+        normalize: L1-normalize the kept correction (``û = u / Σ|u|``) so the map's
+            *shape* is decoupled from the disagreement *magnitude* — otherwise a
+            high-KL token's map would simply be larger. The magnitude is returned
+            separately as ``corr_mass`` to weight the per-token loss instead.
+
+    Returns ``(u_k, idx, corr_mass)``: ``u_k`` ``[n, k]`` signed (optionally
+    L1-normalized) correction weights, ``idx`` ``[n, k]`` their vocab ids, and
+    ``corr_mass`` ``[n] = Σ_k |u_k|`` the raw per-token disagreement mass (a natural
+    importance weight: high = teacher strongly disagrees = worth aligning). All
+    detached.
+    """
+    ps = student_logits.detach().float().softmax(-1)
+    pt = teacher_logits.detach().float().softmax(-1)
+    delta = pt - ps                                          # sg(p_T - p_S)  [n, V]
+    k = min(int(top_k), delta.shape[-1])
+    _, idx = delta.abs().topk(k, dim=-1)                     # [n, k] highest disagreement
+    u_k = delta.gather(-1, idx)                              # signed corrections [n, k]
+    corr_mass = u_k.abs().sum(-1)                            # [n] disagreement mass
+    if normalize:
+        u_k = u_k / corr_mass.clamp_min(eps).unsqueeze(-1)  # L1-normalized direction
+    return u_k.detach(), idx.detach(), corr_mass.detach()
+
+
+def project_correction(
+    u_k: torch.Tensor, idx: torch.Tensor, lm_head_weight: torch.Tensor
+) -> torch.Tensor:
+    """Project a sparse vocab correction onto hidden space: ``d_i = Σ_k u_k · W[idx_k]``.
+
+    ``[n, k] , [n, k] , [V, hidden] -> [n, hidden]``. The ``lm_head`` is **detached**
+    (the map stays linear in ``F^v``; the gradient must not leak into the
+    unembedding). Use the *student* ``W_S`` for the student map and the *teacher*
+    ``W_T`` for the teacher map — both consume the same shared-vocab ``u_k`` / ``idx``,
+    so teacher/student hidden dims may differ and the maps are still ``[n, n_v]`` and
+    directly comparable (the shared vocab is the cross-size bridge).
+    """
+    w = lm_head_weight.detach().index_select(0, idx.reshape(-1)).view(*idx.shape, -1).float()
+    return (u_k.unsqueeze(-1).float() * w).sum(-2)           # [n, hidden]
+
+
 def compute_tam_token_maps(
     hidden_last: torch.Tensor,
     lm_head_weight: torch.Tensor,
     *,
     visual_positions: torch.Tensor,
     token_ids: torch.Tensor,
+    token_directions: torch.Tensor | None = None,
     token_positions: torch.Tensor | None = None,
     context_positions: torch.Tensor | None = None,
     context_ids: torch.Tensor | None = None,
@@ -168,7 +237,15 @@ def compute_tam_token_maps(
             tokens (``input_ids == image_token_id``).
         token_ids: ``[n_cand]`` vocab ids of the tokens to explain (the rolled-out
             completion tokens). Each picks the ``lm_head`` row ``W[y_i]`` the map is
-            read along.
+            read along (the default one-hot / *emitted-token* direction). Still used
+            for the ECI non-repeat mask even when ``token_directions`` overrides it.
+        token_directions: optional ``[n_cand, hidden]`` precomputed readout direction
+            (the OPD **correction** ``d_i = W^T sg(p_T - p_S)`` from
+            :func:`project_correction`, already detached). When given, the base map
+            (**and** the ECI text-relevance term) are read along it instead of the
+            one-hot ``W[token_ids]`` row — the gradient still lands on ``F^v`` only.
+            ECI's context interference maps stay one-hot (``W[context_ids]``); run
+            ``use_eci=False`` with correction directions (the recommended path).
         token_positions: ``[n_cand]`` absolute sequence positions of those tokens —
             only needed for the ECI causal mask (a context token must precede the
             token it interferes with). Required when ``use_eci``.
@@ -195,7 +272,13 @@ def compute_tam_token_maps(
     # F^v in fp32: the maps are bf16 off the hidden states and the dot products are
     # numerically touchy; .float() keeps the student grad path into hidden_last.
     f_vis = hidden_last.index_select(0, visual_positions).float()      # [n_v, hidden]
-    w_tok = weight.index_select(0, token_ids).float()                  # [n_cand, hidden]
+    if token_directions is not None:
+        # OPD correction direction d_i = W^T sg(p_T - p_S), already projected to
+        # hidden space and detached by the caller — read the map along it instead of
+        # the one-hot W[y_i] row. Grad still flows through f_vis only.
+        w_tok = token_directions.to(device=device).float()            # [n_cand, hidden]
+    else:
+        w_tok = weight.index_select(0, token_ids).float()             # [n_cand, hidden]  W[y_i]
     base = torch.relu(f_vis @ w_tok.t()).t()                           # [n_cand, n_v]  (grad)
 
     if (

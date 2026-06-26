@@ -123,6 +123,22 @@ TOKEN_LOSS_CLIP="${TOKEN_LOSS_CLIP:-0.0}"
 LAMBDA_TAM="${LAMBDA_TAM:-1.0}"
 # completion = align on all rollout tokens, gate selects visual ones (default).
 TAM_ALIGN_SPAN="${TAM_ALIGN_SPAN:-completion}"
+# TAM base-map readout DIRECTION (the v_next experiment):
+#   token       one-hot W[y_i] — emitted-token evidence (original TAM, default).
+#   correction  W^T sg(top-k(p_T-p_S)) — the OPD teacher↔student residual: where the
+#               image supports the teacher's intended correction. Auto-zeros on
+#               agreement tokens. The recommended A' run is:
+#                 TAM_DIRECTION=correction TAM_USE_ECI=false TAM_GATE=false \
+#                 TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_RGF_GRAD=hard
+#               (corr-mass loss weighting is on by default via TAM_CORR_GATE).
+#   hybrid      one-hot + TAM_CORR_ALPHA*correction (fallback if correction too sparse).
+TAM_DIRECTION="${TAM_DIRECTION:-token}"          # token | correction | hybrid
+TAM_CORR_TOP_K="${TAM_CORR_TOP_K:-100}"          # keep this many largest-|p_T-p_S| vocab entries
+TAM_CORR_NORMALIZE="${TAM_CORR_NORMALIZE:-true}" # L1-normalize the correction direction
+# Weight each token's alignment by corr_mass = Σ|p_T-p_S| (only for direction=correction).
+# = the A' variant; fixes the dilution of near-agreement (empty-correction) tokens.
+TAM_CORR_GATE="${TAM_CORR_GATE:-true}"
+TAM_CORR_ALPHA="${TAM_CORR_ALPHA:-1.0}"          # hybrid: one-hot + alpha*correction
 TAM_USE_ECI="${TAM_USE_ECI:-true}"
 TAM_DETACH_LM_HEAD="${TAM_DETACH_LM_HEAD:-true}"
 TAM_DIVERGENCE="${TAM_DIVERGENCE:-cosine}"      # cosine | js | l1 | mse  (mse = normalized heatmap-regression)
@@ -181,7 +197,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 
 echo "[opd-tam-qwen3] student=$MODEL_NAME_OR_PATH"
 echo "[opd-tam-qwen3] teacher=$TEACHER_MODEL  (frozen)"
-echo "[opd-tam-qwen3] freeze_vision_tower=$FREEZE_VISION_TOWER  lambda_tam=$LAMBDA_TAM  divergence=$TAM_DIVERGENCE  denoise=$TAM_DENOISE  rgf_grad=$TAM_RGF_GRAD  gate=$TAM_GATE"
+echo "[opd-tam-qwen3] freeze_vision_tower=$FREEZE_VISION_TOWER  lambda_tam=$LAMBDA_TAM  direction=$TAM_DIRECTION  divergence=$TAM_DIVERGENCE  denoise=$TAM_DENOISE  rgf_grad=$TAM_RGF_GRAD  gate=$TAM_GATE  corr_gate=$TAM_CORR_GATE  eci=$TAM_USE_ECI"
 
 GRADIENT_CHECKPOINTING_ARGS=()
 if [[ "$GRADIENT_CHECKPOINTING" == "true" ]]; then
@@ -211,6 +227,12 @@ fi
 # date is appended even to a user-supplied RUN_CONFIG; pass OUTPUT_DIR to opt out.
 VIT_TAG=$([[ "$FREEZE_VISION_TOWER" == "true" ]] && echo freezevit || echo fullft)
 GATE_TAG=$([[ "$TAM_GATE" == "true" ]] && echo "" || echo "_nogate")
+# Encode the readout direction (the v_next variable) when it isn't the default
+# one-hot 'token', plus an ECI-off tag, so correction/hybrid (and the A0' ECI-off
+# control) runs are distinct from the original-TAM runs.
+DIR_TAG=$([[ "$TAM_DIRECTION" == "token" ]] && echo "" || echo "_${TAM_DIRECTION}")
+[[ "$TAM_DIRECTION" == "correction" && "$TAM_CORR_GATE" == "true" ]] && DIR_TAG="${DIR_TAG}corrgate"
+[[ "$TAM_USE_ECI" == "false" ]] && DIR_TAG="${DIR_TAG}_ecioff"
 # Encode the RGF grad surrogate only when it matters (denoise=rgf and not the
 # default 'hard') so hard-RGF / gaussian-grad / detach_sigma runs are distinct.
 GRAD_TAG=""
@@ -220,7 +242,7 @@ GRAD_TAG=""
 # Sanitized to [A-Za-z0-9._-] for path/wandb safety.
 DATASET_TAG="$(basename "${DATASET_NAME%/}")"
 DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_${DATASET_TAG}_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GRAD_TAG}${GATE_TAG}_${VIT_TAG}}_${RUN_ID}"
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_${DATASET_TAG}_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GRAD_TAG}${GATE_TAG}${DIR_TAG}_${VIT_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
@@ -270,6 +292,11 @@ uv run accelerate launch \
   --token_loss_clip "$TOKEN_LOSS_CLIP" \
   --lambda_tam "$LAMBDA_TAM" \
   --tam_align_span "$TAM_ALIGN_SPAN" \
+  --tam_direction "$TAM_DIRECTION" \
+  --tam_corr_top_k "$TAM_CORR_TOP_K" \
+  --tam_corr_normalize "$TAM_CORR_NORMALIZE" \
+  --tam_corr_gate "$TAM_CORR_GATE" \
+  --tam_corr_alpha "$TAM_CORR_ALPHA" \
   --tam_use_eci "$TAM_USE_ECI" \
   --tam_detach_lm_head "$TAM_DETACH_LM_HEAD" \
   --tam_divergence "$TAM_DIVERGENCE" \
