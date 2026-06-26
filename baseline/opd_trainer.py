@@ -18,6 +18,8 @@ full-vocabulary masked KL, DDP loss normalization, answer-accuracy metrics). Onl
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -406,6 +408,13 @@ class OPDTrainer(ViGOSTrainer):
         prompts = self._metadata_values(
             raw_inputs.get("student_prompt_texts"), batch_size
         )
+        images = raw_inputs.get("student_images") or []
+        # The global gather concatenates per-rank records in rank order, then keeps
+        # only the first `completion_log_max_samples`. So row (rank r, row i) survives
+        # iff r*batch_size + i < max_samples — gate image dumping on that to write the
+        # model-input image exactly for the rows that end up in the snapshot (no
+        # orphan PNGs, no need to all_gather heavy PIL images across ranks).
+        max_samples = int(getattr(self, "completion_log_max_samples", 16))
 
         records = []
         for row_idx in range(batch_size):
@@ -424,6 +433,11 @@ class OPDTrainer(ViGOSTrainer):
                 extract_boxed_content(completion_text),
                 answers[row_idx],
             )
+            image_rel = None
+            if rank * batch_size + row_idx < max_samples and row_idx < len(images):
+                image_rel = self._save_snapshot_image(
+                    images[row_idx], step, rank, row_idx
+                )
             records.append(
                 {
                     "global_step": step,
@@ -433,12 +447,155 @@ class OPDTrainer(ViGOSTrainer):
                     "sample_id": sample_ids[row_idx],
                     "problem": problems[row_idx],
                     "reference": references[row_idx],
+                    "image": image_rel,
                     "prompt": prompts[row_idx],
                     "completion": completion_text,
                     "answer_correct": answer_correct,
                 }
             )
         return records
+
+    def _save_snapshot_image(
+        self, image: Any, step: int, rank: int, row_idx: int
+    ) -> str | None:
+        """Persist the model-input image for one rollout row next to the snapshot.
+
+        Returns a path relative to ``completion_samples/`` (where both the JSONL
+        and the Markdown sidecar live), e.g. ``images/step000005_rank0_row0.png``,
+        so the sidecar can link it directly. Best-effort: any failure (no PIL
+        ``save``, odd mode, disk error) degrades to ``None`` and never interrupts
+        training — this is a debug artifact, not part of the loss path.
+        """
+        if image is None or not hasattr(image, "save"):
+            return None
+        rel = f"images/step{step:06d}_rank{rank}_row{row_idx}.png"
+        try:
+            out_dir = Path(str(getattr(self.args, "output_dir", "runs/opd")))
+            target = out_dir / "completion_samples" / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            img = image if image.mode in ("RGB", "L") else image.convert("RGB")
+            img.save(target)
+        except Exception as exc:  # noqa: BLE001 - debug artifact, never fatal
+            if not getattr(self, "_warned_snapshot_image_failure", False):
+                print(
+                    "Warning: failed to save rollout snapshot image; continuing "
+                    f"without it. {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                self._warned_snapshot_image_failure = True
+            return None
+        return rel
+
+    def _maybe_log_completion_snapshot(
+        self,
+        raw_inputs: dict[str, Any],
+        rollout: dict[str, Any],
+    ) -> None:
+        """OPD snapshot writer: JSONL (machine) + Markdown sidecar (human).
+
+        Replicates ViGOSTrainer's gather/truncate/JSONL/W&B flow (kept self-
+        contained so vigos/ stays untouched) and additionally writes a per-step
+        ``.md`` that renders prompt/completion with real line breaks — the JSONL
+        escapes newlines to a single physical line, which is unreadable in an
+        editor for long CoT and awkward to diff across steps — and inlines the
+        saved model-input image.
+        """
+        interval = int(getattr(self, "completion_log_steps", 0) or 0)
+        if interval <= 0:
+            return
+        step = int(getattr(getattr(self, "state", None), "global_step", 0) or 0)
+        if step % interval != 0:
+            return
+        if step == int(getattr(self, "_last_completion_log_step", -1)):
+            return
+        self._last_completion_log_step = step
+
+        local_records = self._completion_snapshot_records(raw_inputs, rollout, step)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            gathered: list[Any] = [
+                None for _ in range(torch.distributed.get_world_size())
+            ]
+            torch.distributed.all_gather_object(gathered, local_records)
+        else:
+            gathered = [local_records]
+
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is not None and not getattr(
+            accelerator, "is_main_process", True
+        ):
+            return
+
+        records = [r for rank_records in gathered for r in (rank_records or [])]
+        records = records[: int(getattr(self, "completion_log_max_samples", 16))]
+        if not records:
+            return
+
+        sample_dir = (
+            Path(str(getattr(self.args, "output_dir", "runs/opd")))
+            / "completion_samples"
+        )
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = sample_dir / f"completions_step{step:06d}.jsonl"
+        with snapshot_path.open("w", encoding="utf-8") as handle:
+            for record in records:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self._write_completion_snapshot_markdown(records, sample_dir, step)
+        self._log_completion_snapshot_to_wandb(records, snapshot_path, step)
+
+    def _write_completion_snapshot_markdown(
+        self, records: list[dict[str, Any]], sample_dir: Path, step: int
+    ) -> None:
+        """Human-readable sidecar: one section per rollout, real newlines."""
+        try:
+            n = len(records)
+            lines = [f"# completions — step {step}  ({n} samples)", ""]
+            for i, r in enumerate(records, 1):
+                mark = "✅" if r.get("answer_correct") else "❌"
+                lines += [
+                    f"## {i}/{n} · rank{r.get('rank')} row{r.get('local_row')} · "
+                    f"id={r.get('sample_id')} · answer {mark} "
+                    f"(ref={r.get('reference')})",
+                    "",
+                ]
+                if r.get("image"):
+                    lines += [f"![image]({r['image']})", ""]
+                lines += ["**problem:**", "", str(r.get("problem", "")), ""]
+                lines += ["**prompt:**", "", self._md_code_block(r.get("prompt", "")), ""]
+                lines += [
+                    "**completion:**",
+                    "",
+                    self._md_code_block(r.get("completion", "")),
+                    "",
+                    "---",
+                    "",
+                ]
+            (sample_dir / f"completions_step{step:06d}.md").write_text(
+                "\n".join(lines), encoding="utf-8"
+            )
+        except Exception as exc:  # noqa: BLE001 - debug artifact, never fatal
+            if not getattr(self, "_warned_snapshot_md_failure", False):
+                print(
+                    "Warning: failed to write completion snapshot markdown; "
+                    f"JSONL still written. {type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+                self._warned_snapshot_md_failure = True
+
+    @staticmethod
+    def _md_code_block(text: Any) -> str:
+        """Fence ``text`` in a backtick block longer than any run inside it.
+
+        CoT can contain its own ``` fences; a fixed 3-backtick fence would be
+        closed early and break rendering. Pick a fence one backtick longer than
+        the longest backtick run in the content (min 3).
+        """
+        text = str(text)
+        longest = run = 0
+        for ch in text:
+            run = run + 1 if ch == "`" else 0
+            longest = max(longest, run)
+        fence = "`" * max(3, longest + 1)
+        return f"{fence}\n{text}\n{fence}"
 
     @torch.no_grad()
     def _rollout_diagnostic_metrics(
