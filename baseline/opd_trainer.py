@@ -229,6 +229,11 @@ class OPDTrainer(ViGOSTrainer):
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
         student_prompt = self._prompt_inputs(inputs, "student")
         rollout = self._generate_on_policy(model, student_prompt, inputs)
+        # OPD overrides compute_loss wholesale, so the rollout-snapshot hook from
+        # ViGOSTrainer.compute_loss is not inherited along this path — call it here
+        # (grad-free) so completion_log_steps actually writes prompt->completion
+        # JSONL under <output_dir>/completion_samples.
+        self._maybe_log_completion_snapshot(inputs, rollout)
 
         completion_ids = rollout["completion_ids"]
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)

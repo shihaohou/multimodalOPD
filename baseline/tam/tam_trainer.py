@@ -325,6 +325,11 @@ class TAMTrainer(OPDTrainer):
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
         student_prompt = self._prompt_inputs(inputs, "student")
         rollout = self._generate_on_policy(model, student_prompt, inputs)
+        # TAM reimplements compute_loss (no super() call), so the rollout-snapshot
+        # hook is not reached along this path either — invoke it here so
+        # completion_log_steps writes prompt->completion JSONL under
+        # <output_dir>/completion_samples for TAM runs too.
+        self._maybe_log_completion_snapshot(inputs, rollout)
         completion_ids = rollout["completion_ids"]
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)
         completion_length = completion_ids.shape[1]
