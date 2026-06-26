@@ -242,6 +242,19 @@ def main() -> None:
     if getattr(tokenizer, "pad_token", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
+    # Qwen embeds a padded vocab (e.g. 151936) wider than the tokenizer's real
+    # string vocab, so on-policy sampling can emit an id in the padded region.
+    # The slow tokenizer maps such an id to None and then dies in "".join(tokens)
+    # while decoding the rollout — one bad token kills the whole run. Coalesce
+    # None -> "" so an unmapped id is dropped instead of crashing.
+    if hasattr(tokenizer, "_convert_id_to_token"):
+        _orig_id_to_token = tokenizer._convert_id_to_token
+
+        def _safe_id_to_token(index, _orig=_orig_id_to_token):
+            token = _orig(index)
+            return "" if token is None else token
+
+        tokenizer._convert_id_to_token = _safe_id_to_token
 
     # --- Student (trainable LoRA) -------------------------------------------------
     model_kwargs = {
