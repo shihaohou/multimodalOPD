@@ -66,6 +66,11 @@ class OPDTAMScriptArguments(OPDScriptArguments):
     # paper's Rank-Gaussian Filter — the TAM-MSE-RGF ablation), or "none".
     # tam_blur=false forces "none" (back-compat). The ablation = mse + rgf.
     tam_denoise: str = "gaussian"  # "gaussian" | "rgf" | "none"
+    # Student-side RGF gradient surrogate (only when tam_denoise=rgf). Forward is
+    # always exact RGF; this shapes only the student's backward:
+    #   hard (true grad, default) | detach_sigma (exact fwd, bounded grad) |
+    #   gaussian (fwd RGF, grad Gaussian) | identity (fwd RGF, grad straight-through).
+    tam_rgf_grad: str = "hard"
     tam_blur_kernel: int = 3
     tam_blur_sigma: float = 1.0
     # Concentration gate (+ mass drop) on/off. false => align ALL aligned tokens with
@@ -150,7 +155,7 @@ def main() -> None:
             f"divergence={script_args.tam_divergence}, "
             f"eci={script_args.tam_use_eci}, "
             f"denoise={script_args.tam_denoise}(k={script_args.tam_blur_kernel},"
-            f"sigma={script_args.tam_blur_sigma}), "
+            f"sigma={script_args.tam_blur_sigma},grad={script_args.tam_rgf_grad}), "
             f"gate={script_args.tam_gate}(h0={script_args.tam_gate_h0},tau={script_args.tam_gate_tau}), "
             f"max_tokens={script_args.tam_max_tokens}"
         )
@@ -311,6 +316,7 @@ def main() -> None:
         tam_divergence=script_args.tam_divergence,
         tam_blur=script_args.tam_blur,
         tam_denoise=script_args.tam_denoise,
+        tam_rgf_grad=script_args.tam_rgf_grad,
         tam_blur_kernel=script_args.tam_blur_kernel,
         tam_blur_sigma=script_args.tam_blur_sigma,
         tam_gate=script_args.tam_gate,
@@ -360,6 +366,7 @@ def main() -> None:
                     "tam_use_eci": script_args.tam_use_eci,
                     "tam_blur": script_args.tam_blur,
                     "tam_denoise": script_args.tam_denoise,
+                    "tam_rgf_grad": script_args.tam_rgf_grad,
                     "tam_gate": script_args.tam_gate,
                     "tam_gate_h0": script_args.tam_gate_h0,
                     "tam_gate_tau": script_args.tam_gate_tau,

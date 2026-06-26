@@ -55,6 +55,7 @@ class TAMTrainer(OPDTrainer):
         tam_divergence: str = "cosine",
         tam_blur: bool = True,
         tam_denoise: str = "gaussian",
+        tam_rgf_grad: str = "hard",
         tam_blur_kernel: int = 3,
         tam_blur_sigma: float = 1.0,
         tam_gate: bool = True,
@@ -84,6 +85,11 @@ class TAMTrainer(OPDTrainer):
             raise ValueError(
                 f"Unknown tam_denoise {tam_denoise!r}; use 'none', 'gaussian', or 'rgf'."
             )
+        if tam_rgf_grad not in {"hard", "detach_sigma", "gaussian", "identity"}:
+            raise ValueError(
+                f"Unknown tam_rgf_grad {tam_rgf_grad!r}; use 'hard', 'detach_sigma', "
+                "'gaussian', or 'identity'."
+            )
         self.lambda_tam = float(lambda_tam)
         self.tam_align_span = tam_align_span
         self.tam_use_eci = bool(tam_use_eci)
@@ -94,6 +100,10 @@ class TAMTrainer(OPDTrainer):
         # paper's Rank-Gaussian Filter — the TAM-MSE-RGF ablation), or "none".
         # tam_blur=False forces "none" (back-compat); else tam_denoise selects.
         self.tam_denoise = "none" if not bool(tam_blur) else tam_denoise
+        # Student-side RGF gradient surrogate (only used when tam_denoise=="rgf"):
+        # "hard" (true grad) | "detach_sigma" | "gaussian" | "identity". Forward is
+        # always exact RGF; this shapes only the student's backward.
+        self.tam_rgf_grad = tam_rgf_grad
         self.tam_blur_kernel = int(tam_blur_kernel)
         self.tam_blur_sigma = float(tam_blur_sigma)
         # Concentration gate (+ mass drop) on/off. False => align ALL aligned tokens
@@ -250,6 +260,7 @@ class TAMTrainer(OPDTrainer):
                 grid_thw=(t_dim, h_grid, w_grid),
                 divergence=self.tam_divergence,
                 denoise=self.tam_denoise,
+                rgf_grad=self.tam_rgf_grad,
                 blur_kernel=self.tam_blur_kernel,
                 blur_sigma=self.tam_blur_sigma,
                 use_gate=self.tam_gate,

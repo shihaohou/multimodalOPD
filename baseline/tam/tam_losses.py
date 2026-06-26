@@ -92,6 +92,7 @@ def rank_gaussian_filter_maps(
     grid_thw: tuple[int, int, int],
     *,
     kernel_size: int = 3,
+    detach_sigma: bool = False,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """Differentiable, vectorized **Rank-Gaussian Filter (RGF)** — the TAM paper's
@@ -116,6 +117,14 @@ def rank_gaussian_filter_maps(
     treated as constant, so the gradient is non-smooth at rank-swap boundaries —
     this is the "hard RGF" used by the ``OPD + TAM-MSE-RGF`` ablation. (The paper's
     NumPy version is for offline visualization and carries no gradient.)
+
+    ``detach_sigma``: stop-grad the per-window bandwidth ``sigma = std/mean`` so the
+    rank kernel is a **constant** in the backward pass. The forward value is
+    **unchanged** (exact RGF), but the gradient drops the ``∂sigma`` term — the one
+    that blows up on sparse windows (small ``mean`` -> large ``1/mean``) — leaving
+    only the bounded, RGF-shaped rank-routed term ``sum_r kernel_r * sorted_v_r``.
+    Used by ``rgf_with_surrogate_grad(grad="detach_sigma")``; the most faithful
+    gradient surrogate (forward is still exact RGF, unlike the gaussian surrogate).
 
     Note: divisors are floored by ``eps`` (so a uniform window → its value, and an
     all-zero window → 0, with no ``0/0`` NaN that the raw NumPy reference would hit).
@@ -142,6 +151,8 @@ def rank_gaussian_filter_maps(
     mean = sorted_w.mean(dim=1, keepdim=True)                     # [N, 1, L]
     std = sorted_w.var(dim=1, unbiased=False, keepdim=True).clamp_min(0).sqrt()
     sigma = std / mean.clamp_min(eps)                             # coefficient of variation
+    if detach_sigma:
+        sigma = sigma.detach()  # constant rank kernel in backward; forward unchanged.
     ax = (
         torch.arange(ksq, device=maps.device, dtype=sorted_w.dtype) - ksq // 2
     ).view(1, ksq, 1)                                            # rank offset from median
@@ -172,6 +183,54 @@ def apply_spatial_filter(
     if kind == "rgf":
         return rank_gaussian_filter_maps(maps, grid_thw, kernel_size=kernel_size)
     raise ValueError(f"Unknown spatial filter kind {kind!r}; use 'none', 'gaussian', or 'rgf'.")
+
+
+def rgf_with_surrogate_grad(
+    maps: torch.Tensor,
+    grid_thw: tuple[int, int, int],
+    *,
+    grad: str = "hard",
+    kernel_size: int = 3,
+    blur_sigma: float = 1.0,
+) -> torch.Tensor:
+    """RGF with a **straight-through gradient surrogate** — forward is always exact
+    ``RGF(maps)``; only the backward path changes (apply on the *student* map; the
+    teacher is detached so its grad mode is moot). ``grad``:
+
+    * ``"hard"``        — the true RGF gradient (value-differentiable; rank held
+      constant). The paper-faithful default; same class as max-pool / median grad.
+    * ``"detach_sigma"``— exact-RGF forward, but the per-window bandwidth ``sigma``
+      is stop-grad'd so the backward drops the ``∂sigma`` term that explodes on
+      sparse windows. Most faithful surrogate (forward unchanged, RGF-shaped grad).
+    * ``"gaussian"``    — STE ``G(maps) + sg(RGF(maps) - G(maps))``: forward RGF,
+      backward = Gaussian-blur gradient (smooth spatial diffusion, same family).
+    * ``"identity"``    — STE ``maps + sg(RGF(maps) - maps)``: forward RGF, backward
+      identity (gradient straight to the raw map, no spatial mixing — the bluntest).
+
+    All four agree in the forward pass (== ``RGF(maps)``); they differ only in what
+    gradient reaches ``maps``. ``"hard"``/``"detach_sigma"`` have NO forward/backward
+    mismatch in value; ``"gaussian"``/``"identity"`` trade a mismatch for a smoother
+    update. See the ``TAM_RGF_GRAD`` knob and ``baseline/tam/README.md``.
+    """
+    if grad == "hard":
+        return rank_gaussian_filter_maps(maps, grid_thw, kernel_size=kernel_size)
+    if grad == "detach_sigma":
+        return rank_gaussian_filter_maps(
+            maps, grid_thw, kernel_size=kernel_size, detach_sigma=True
+        )
+    rgf = rank_gaussian_filter_maps(maps, grid_thw, kernel_size=kernel_size)
+    if grad == "identity":
+        surrogate = maps
+    elif grad == "gaussian":
+        surrogate = gaussian_blur_maps(
+            maps, grid_thw, kernel_size=kernel_size, sigma=blur_sigma
+        )
+    else:
+        raise ValueError(
+            f"Unknown rgf grad surrogate {grad!r}; use 'hard', 'detach_sigma', "
+            "'gaussian', or 'identity'."
+        )
+    return surrogate + (rgf - surrogate).detach()  # forward == rgf; backward == surrogate
 
 
 def normalized_entropy(maps: torch.Tensor, temp: float = 1.0, eps: float = 1e-9) -> torch.Tensor:
@@ -257,6 +316,7 @@ def tam_alignment_loss(
     divergence: str = "cosine",
     blur: bool = True,
     denoise: str | None = None,
+    rgf_grad: str = "hard",
     blur_kernel: int = 3,
     blur_sigma: float = 1.0,
     use_gate: bool = True,
@@ -280,6 +340,11 @@ def tam_alignment_loss(
             ablation), or ``"none"``. ``None`` (default) derives it from ``blur``
             (``True`` -> gaussian) for back-compat. ``blur_kernel`` is the filter
             size for both; ``blur_sigma`` only applies to gaussian.
+        rgf_grad: when ``denoise == "rgf"``, the student-side gradient surrogate —
+            ``"hard"`` (true RGF grad, default), ``"detach_sigma"``, ``"gaussian"``,
+            or ``"identity"`` (see :func:`rgf_with_surrogate_grad`). Forward is always
+            exact RGF on both sides; this only changes how the student back-props.
+            Ignored for ``gaussian`` / ``none``.
         blur / blur_kernel / blur_sigma: legacy gaussian-blur toggle + params; kept
             for back-compat (superseded by ``denoise`` when that is given).
         use_gate: apply the teacher-map concentration gate (and the ``mass_threshold``
@@ -306,7 +371,15 @@ def tam_alignment_loss(
     s = student_maps.float()
     t = teacher_maps.detach().float()
     kind = denoise if denoise is not None else ("gaussian" if blur else "none")
-    if kind != "none":
+    if kind == "rgf":
+        # Student: RGF forward + the chosen backward surrogate (rgf_grad). Teacher:
+        # plain RGF (detached anyway). Both sides see the SAME RGF-denoised view in
+        # forward; only the student's gradient path is shaped by rgf_grad.
+        s = rgf_with_surrogate_grad(
+            s, grid_thw, grad=rgf_grad, kernel_size=blur_kernel, blur_sigma=blur_sigma
+        )
+        t = rank_gaussian_filter_maps(t, grid_thw, kernel_size=blur_kernel)
+    elif kind != "none":
         s = apply_spatial_filter(s, grid_thw, kind=kind, kernel_size=blur_kernel, sigma=blur_sigma)
         t = apply_spatial_filter(t, grid_thw, kind=kind, kernel_size=blur_kernel, sigma=blur_sigma)
 

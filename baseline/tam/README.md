@@ -79,7 +79,25 @@ teacher's. (We use only `Ā_i^a`, **not** the multimodal viz map `M_i = N(Ā_i^a
 "Version A": hard RGF on both sides; the student's `torch.sort` is differentiable
 w.r.t. the map values but not the rank, so the gradient is "hard" — the known risk
 of this ablation. If it destabilizes, fall back to `TAM_DENOISE=gaussian` (the
-smooth stand-in) with the same `mse` divergence.
+smooth stand-in) with the same `mse` divergence, or use a gradient surrogate below.
+
+#### `TAM_RGF_GRAD` — student-side gradient surrogate (forward stays exact RGF)
+
+The forward is **always** exact RGF on both sides (so the loss *value* is identical
+across all modes — only the student's backward changes):
+
+| mode | forward | backward | notes |
+|---|---|---|---|
+| `hard` (default) | RGF | true RGF grad | paper-faithful; same class as max-pool / median grad — try this first, the "hard" grad is rarely actually broken |
+| `detach_sigma` | RGF (exact) | RGF grad **minus** the `σ=std/mean` term | **recommended hedge**: forward unchanged, drops only the one term that explodes on sparse windows; grad stays RGF-shaped & bounded |
+| `gaussian` | RGF | Gaussian-blur grad (`G(ã)+sg(RGF(ã)−G(ã))`) | smooth spatial diffusion (GPT's suggestion); forward≠backward family |
+| `identity` | RGF | straight-through to the raw map | bluntest; ignores RGF's rank redistribution entirely |
+
+Faithfulness `hard > detach_sigma > gaussian > identity`. Suggested order: run `hard`
+as the scientific baseline; if loss/grad-norm misbehaves, switch to `detach_sigma`,
+then `gaussian`. (A *separate* experiment — teacher target RGF, student forward
+Gaussian — is **not** a gradient trick; set `TAM_DENOISE=gaussian` and compare to a
+teacher-only-RGF run rather than conflating it here.)
 
 ## Files
 
@@ -132,10 +150,12 @@ M=/path/to/models DATASET_NAME=/path/to/Vision-SR1-47K \
 TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_GATE=false \
 bash scripts/train_opd_tam_qwen3_8b_to_2b.sh
 # auto-named runs/opd_tam_qwen3_8b_to_2b_ltam1.0_mse_rgf_nogate_fullft_<date>
+# stability hedge (forward still exact RGF, bounded gradient):
+#   ... TAM_RGF_GRAD=detach_sigma ...   -> ..._mse_rgf_detach_sigmagrad_nogate_...
 ```
 
 Watch `loss_opd` (behavior), `loss_tam` / `tam_div` (visual evidence — should fall
 without hurting `answer_accuracy`), and `tam_gate_mean` (fraction of tokens the
 gate keeps; `=1.0` when `TAM_GATE=false`). Ablation knobs (doc §8): `TAM_DIVERGENCE`,
-`TAM_DENOISE`, `TAM_GATE`, `TAM_USE_ECI`, `TAM_ALIGN_SPAN`, `TAM_MAX_TOKENS`,
-`LAMBDA_TAM ∈ {0,0.5,1,5,10}`, `FREEZE_VISION_TOWER`.
+`TAM_DENOISE`, `TAM_RGF_GRAD`, `TAM_GATE`, `TAM_USE_ECI`, `TAM_ALIGN_SPAN`,
+`TAM_MAX_TOKENS`, `LAMBDA_TAM ∈ {0,0.5,1,5,10}`, `FREEZE_VISION_TOWER`.

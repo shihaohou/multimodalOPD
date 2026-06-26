@@ -70,6 +70,13 @@ def parse_args() -> argparse.Namespace:
         "Rank-Gaussian Filter — the TAM-MSE-RGF ablation) | none.",
     )
     p.add_argument(
+        "--rgf_grad",
+        default="hard",
+        choices=["hard", "detach_sigma", "gaussian", "identity"],
+        help="Student RGF gradient surrogate (only with --denoise rgf): hard (true "
+        "grad) | detach_sigma | gaussian | identity. Forward is always exact RGF.",
+    )
+    p.add_argument(
         "--no_gate",
         dest="use_gate",
         action="store_false",
@@ -254,11 +261,13 @@ def main() -> None:
         grid_thw=(t_dim, h_grid, w_grid),
         divergence=args.divergence,
         denoise=(args.denoise if args.blur else "none"),
+        rgf_grad=args.rgf_grad,
         use_gate=args.use_gate,
     )
     print(
         f"[sanity] divergence={args.divergence} denoise="
-        f"{args.denoise if args.blur else 'none'} use_gate={args.use_gate}"
+        f"{args.denoise if args.blur else 'none'} rgf_grad={args.rgf_grad} "
+        f"use_gate={args.use_gate}"
     )
     print(
         f"L_tam = {loss.item():.6f}  div={stats['tam_div'].item():.4f} "

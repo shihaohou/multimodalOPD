@@ -131,6 +131,14 @@ TAM_BLUR="${TAM_BLUR:-true}"
 # Rank-Gaussian Filter) | none. The paper-faithful ablation = TAM_DIVERGENCE=mse
 # TAM_DENOISE=rgf. TAM_BLUR=false forces none (back-compat).
 TAM_DENOISE="${TAM_DENOISE:-gaussian}"          # gaussian | rgf | none
+# Student-side RGF gradient surrogate (only used when TAM_DENOISE=rgf). Forward is
+# ALWAYS exact RGF on both sides; this shapes only the student's backward:
+#   hard         true RGF grad (paper-faithful default; like max-pool/median grad)
+#   detach_sigma exact-RGF forward, bounded grad (drops the std/mean term) — safest
+#                surrogate that keeps the RGF forward; my recommended stability hedge
+#   gaussian     fwd RGF, backward = Gaussian-blur grad (smooth, GPT's suggestion)
+#   identity     fwd RGF, backward = straight-through to the raw map (bluntest)
+TAM_RGF_GRAD="${TAM_RGF_GRAD:-hard}"            # hard | detach_sigma | gaussian | identity
 TAM_BLUR_KERNEL="${TAM_BLUR_KERNEL:-3}"
 TAM_BLUR_SIGMA="${TAM_BLUR_SIGMA:-1.0}"
 # Concentration gate (+ mass drop) on/off. false => align ALL aligned tokens with
@@ -173,7 +181,7 @@ REPORT_TO="${REPORT_TO:-wandb}"
 
 echo "[opd-tam-qwen3] student=$MODEL_NAME_OR_PATH"
 echo "[opd-tam-qwen3] teacher=$TEACHER_MODEL  (frozen)"
-echo "[opd-tam-qwen3] freeze_vision_tower=$FREEZE_VISION_TOWER  lambda_tam=$LAMBDA_TAM  divergence=$TAM_DIVERGENCE  denoise=$TAM_DENOISE  gate=$TAM_GATE"
+echo "[opd-tam-qwen3] freeze_vision_tower=$FREEZE_VISION_TOWER  lambda_tam=$LAMBDA_TAM  divergence=$TAM_DIVERGENCE  denoise=$TAM_DENOISE  rgf_grad=$TAM_RGF_GRAD  gate=$TAM_GATE"
 
 GRADIENT_CHECKPOINTING_ARGS=()
 if [[ "$GRADIENT_CHECKPOINTING" == "true" ]]; then
@@ -203,7 +211,11 @@ fi
 # date is appended even to a user-supplied RUN_CONFIG; pass OUTPUT_DIR to opt out.
 VIT_TAG=$([[ "$FREEZE_VISION_TOWER" == "true" ]] && echo freezevit || echo fullft)
 GATE_TAG=$([[ "$TAM_GATE" == "true" ]] && echo "" || echo "_nogate")
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GATE_TAG}_${VIT_TAG}}_${RUN_ID}"
+# Encode the RGF grad surrogate only when it matters (denoise=rgf and not the
+# default 'hard') so hard-RGF / gaussian-grad / detach_sigma runs are distinct.
+GRAD_TAG=""
+[[ "$TAM_DENOISE" == "rgf" && "$TAM_RGF_GRAD" != "hard" ]] && GRAD_TAG="_${TAM_RGF_GRAD}grad"
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GRAD_TAG}${GATE_TAG}_${VIT_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
@@ -258,6 +270,7 @@ uv run accelerate launch \
   --tam_divergence "$TAM_DIVERGENCE" \
   --tam_blur "$TAM_BLUR" \
   --tam_denoise "$TAM_DENOISE" \
+  --tam_rgf_grad "$TAM_RGF_GRAD" \
   --tam_blur_kernel "$TAM_BLUR_KERNEL" \
   --tam_blur_sigma "$TAM_BLUR_SIGMA" \
   --tam_gate "$TAM_GATE" \
