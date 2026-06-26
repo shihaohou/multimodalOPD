@@ -43,6 +43,8 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
 VLLM_LIMIT_IMAGES="${VLLM_LIMIT_IMAGES:-16}"
 DTYPE="${DTYPE:-auto}"
+# vLLM tokenizer: auto = fast (much quicker request preprocessing); slow = fallback.
+TOKENIZER_MODE="${TOKENIZER_MODE:-auto}"
 # Grading: llm = LLM judge (default, same as ViGOS); rule = mathruler + option/exact
 # match (no API, deterministic/reproducible); both = grade the SAME generations with
 # rule AND llm, then write a per-sample rule-vs-llm comparison (judgments_rule/,
@@ -87,6 +89,7 @@ CMD=(
   --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --limit-images "$VLLM_LIMIT_IMAGES"
   --dtype "$DTYPE"
+  --tokenizer-mode "$TOKENIZER_MODE"
   --judge-model "$JUDGE_MODEL"
   --judge-api-url "$JUDGE_API_URL"
   --judge-key-env "$JUDGE_KEY_ENV"

@@ -86,6 +86,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--limit-images", type=int, default=16)
     p.add_argument("--dtype", default="auto")
+    p.add_argument(
+        "--tokenizer-mode",
+        default="auto",
+        help="vLLM tokenizer mode: auto = fast tokenizer when available (faster "
+        "request preprocessing); slow = the old Python tokenizer (fallback).",
+    )
     # grading / judge
     p.add_argument(
         "--grader",
@@ -178,7 +184,10 @@ def make_engine(args: argparse.Namespace):
     kwargs: dict[str, Any] = dict(
         model=args.model_path,
         trust_remote_code=True,
-        tokenizer_mode="slow",
+        # Fast tokenizer by default (auto) — much quicker request preprocessing
+        # (the "Adding requests" phase). Override with --tokenizer-mode slow if a
+        # checkpoint's fast tokenizer misbehaves.
+        tokenizer_mode=getattr(args, "tokenizer_mode", "auto"),
         tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
         limit_mm_per_prompt={"image": args.limit_images},

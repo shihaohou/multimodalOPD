@@ -70,6 +70,7 @@ VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.90}"
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
 VLLM_LIMIT_IMAGES="${VLLM_LIMIT_IMAGES:-4}"
 DTYPE="${DTYPE:-auto}"
+TOKENIZER_MODE="${TOKENIZER_MODE:-auto}"   # auto = fast tokenizer (quicker preprocessing); slow = fallback
 
 CMD=(
   uv run python baseline/eval/run_vqa_eval.py
@@ -95,6 +96,7 @@ CMD=(
   --gpu-memory-utilization "$VLLM_GPU_MEMORY_UTILIZATION"
   --limit-images "$VLLM_LIMIT_IMAGES"
   --dtype "$DTYPE"
+  --tokenizer-mode "$TOKENIZER_MODE"
 )
 
 if [[ "$PROMPT_SUFFIX" != "__DEFAULT__" ]]; then

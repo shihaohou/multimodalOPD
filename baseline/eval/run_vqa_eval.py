@@ -118,6 +118,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-model-len", type=int, default=None)
     p.add_argument("--limit-images", type=int, default=4)
     p.add_argument("--dtype", default="auto")
+    p.add_argument("--tokenizer-mode", default="auto",
+                   help="vLLM tokenizer mode: auto = fast (faster preprocessing); slow = fallback.")
     return p.parse_args()
 
 
