@@ -34,18 +34,23 @@ set -euo pipefail
 #   PHASE=all      : generate + judge inline (judged) and generate + score (det), all
 #                    on the GPU scheduler (the original behavior, one shot).
 #
+# Shared-disk defaults (same paths on every machine; override via env if a box differs)
+#   D=/.../datasets  M=/.../models  DSROOT=$D/zli12321
+#   POPE_REPO=$D/POPE  CHARTQA_REPO=$D/ChartQA  VQAV2_REPO=$D/VQAv2
+#   -> the common run needs only MODELS + OUTPUT_ROOT + PHASE.
+#
 # Required:
 #   MODELS="path1;path2;..."  or  "tag1=path1;tag2=path2;..."
-#       Each entry is a checkpoint path, optionally "tag=path". With NO tag, the
+#       Each entry is a checkpoint path, optionally "tag=path"; a BARE name resolves
+#       against $M ("Qwen3-VL-8B-Instruct" -> $M/Qwen3-VL-8B-Instruct). With NO tag, the
 #       output subdir + matrix label are derived from the path: the basename
 #       (.../models/CapCurriculum-8B -> "CapCurriculum-8B"), or "<run>/checkpoint-N"
 #       when the basename is a generic checkpoint dir. With a tag, the tag is used.
 #       Per-job logs go INSIDE each output folder (<id>/<dataset>/<phase>.log) —
 #       there is no central logs/ dir.
-# Benchmarks (default = full standard set; override to run a subset):
-#   DSROOT=/abs/dir  DATASETS="name1 name2 ... pope chartqa vqav2"
-#       judged names join as DSROOT/name (missing skipped); pope/chartqa/vqav2 route
-#       to eval_vqa.sh regardless of DSROOT.
+# Benchmarks (default = full standard set; override DATASETS to run a subset):
+#   DATASETS="name1 name2 ... pope chartqa vqav2"  (judged names join as DSROOT/name,
+#       missing skipped; pope/chartqa/vqav2 route to eval_vqa.sh via *_REPO).
 #   DATASET_DIRS="/abs/d1,/abs/d2,..."   explicit JUDGED dirs only (no det routing).
 # Optional: NGPU (8), GPUS="0,1,2,..." (overrides NGPU), OUTPUT_ROOT, RUN_ID, DRYRUN=1,
 #   RESUME=1 (rerun the same command -> only the failed/missing jobs are redone),
@@ -115,6 +120,16 @@ esac
 JUDGED_DEFAULT="mathvista mathverse mathvision MMMU mmmu_pro_10options mmmu-pro-vision mmstar hallusionbench"
 DET_DEFAULT="pope chartqa vqav2"
 DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT}"
+
+# Shared-disk layout (identical on every machine -> sane defaults so the common
+# command needs only MODELS/OUTPUT_ROOT/PHASE). Override any of these via env on a box
+# whose paths differ. D = datasets root, M = models root.
+D="${D:-/home/web_server/antispam/project/houshihao/datasets}"
+M="${M:-/home/web_server/antispam/project/houshihao/models}"
+DSROOT="${DSROOT:-$D/zli12321}"
+export POPE_REPO="${POPE_REPO:-$D/POPE}"        # passed through to eval_vqa.sh (det group)
+export CHARTQA_REPO="${CHARTQA_REPO:-$D/ChartQA}"
+export VQAV2_REPO="${VQAV2_REPO:-$D/VQAv2}"
 # Names (case-insensitive) that are deterministic -> eval_vqa.sh, never the judge.
 is_det() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in pope|chartqa|vqav2) return 0 ;; *) return 1 ;; esac; }
 
@@ -198,8 +213,12 @@ for tm in "${_models[@]}"; do
   if [[ "$tm" == *=* ]]; then
     tag="${tm%%=*}"; model="${tm#*=}"      # explicit tag=path
   else
-    model="$tm"; tag="$(model_id "$tm")"   # no tag -> derive id from the path
+    tag=""; model="$tm"
   fi
+  # A bare (non-absolute) model name resolves against the shared models dir $M, so
+  # MODELS="Qwen3-VL-8B-Instruct;CapCurriculum-8B" works without full paths.
+  [[ "$model" != /* && -n "${M:-}" && -e "$M/$model" ]] && model="$M/$model"
+  [[ -z "$tag" ]] && tag="$(model_id "$model")"   # no tag -> derive id from the path
   for ddir in ${JUDGED_DIRS[@]+"${JUDGED_DIRS[@]}"}; do
     if [[ ! -e "$ddir" ]]; then
       echo "[skip] judged dataset not found, skipping for all models: $ddir" >&2

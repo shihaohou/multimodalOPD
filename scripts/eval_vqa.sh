@@ -36,15 +36,16 @@ OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/vqa_${RUN_ID}}"
 MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"
 
 BENCHMARKS="${BENCHMARKS:-pope,chartqa,vqav2}"
-# Sources: HF dataset id OR a local snapshot dir (see the download commands in the
-# README). Pre-fetch with e.g. `hf download lmms-lab/POPE --repo-type dataset
-# --local-dir <dir>` then set POPE_REPO=<dir>.
-POPE_REPO="${POPE_REPO:-lmms-lab/POPE}"
+# Sources: a local snapshot dir, or an HF dataset id. Default to the shared-disk
+# layout ($D = datasets root, same on every machine); override *_REPO on a box whose
+# paths differ, or point at the HF ids (lmms-lab/POPE etc.) for an online box.
+D="${D:-/home/web_server/antispam/project/houshihao/datasets}"
+POPE_REPO="${POPE_REPO:-$D/POPE}"
 POPE_SPLIT="${POPE_SPLIT:-test}"
 POPE_CATEGORY="${POPE_CATEGORY:-}"        # random|popular|adversarial ('' = all)
-CHARTQA_REPO="${CHARTQA_REPO:-lmms-lab/ChartQA}"
+CHARTQA_REPO="${CHARTQA_REPO:-$D/ChartQA}"
 CHARTQA_SPLIT="${CHARTQA_SPLIT:-test}"
-VQAV2_REPO="${VQAV2_REPO:-lmms-lab/VQAv2}"
+VQAV2_REPO="${VQAV2_REPO:-$D/VQAv2}"
 VQAV2_SPLIT="${VQAV2_SPLIT:-validation}"
 LIMIT="${LIMIT:-}"
 # VQAv2-only cap (its val set is ~214k vs a few-k for POPE/ChartQA); overrides
