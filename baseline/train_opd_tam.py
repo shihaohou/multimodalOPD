@@ -31,6 +31,7 @@ from transformers import AutoProcessor, HfArgumentParser, TrainingArguments, set
 
 import vigos.dataset_utils as dataset_utils
 from baseline.opd_data_collator import OPDDataCollator
+from baseline.opd_dataset import load_opd_dataset
 from baseline.tam.tam_trainer import TAMTrainer
 from baseline.train_opd import OPDScriptArguments, _OPDWandBConfigCallback
 from vigos.train_vigos import (
@@ -262,7 +263,8 @@ def main() -> None:
     teacher_model.eval()
 
     # --- Data -------------------------------------------------------------------
-    dataset = dataset_utils.load_vigos_dataset(
+    # ViRL39K-aware (local parquet -> problem/image/answer); HF ids fall through.
+    dataset = load_opd_dataset(
         script_args.dataset_name, script_args.dataset_split
     )
     if script_args.max_train_samples is not None:

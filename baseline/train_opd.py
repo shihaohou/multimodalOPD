@@ -48,7 +48,11 @@ from vigos.train_vigos import (
     _reporting_to_wandb,
 )
 
-_load_dataset = dataset_utils.load_vigos_dataset
+from baseline.opd_dataset import load_opd_dataset
+
+# ViRL39K-aware loader (local parquet -> problem/image/answer); falls through to
+# vigos.dataset_utils.load_vigos_dataset for HuggingFace ids / canonical datasets.
+_load_dataset = load_opd_dataset
 _filter_tiny_image_samples = dataset_utils.filter_tiny_image_samples
 
 
