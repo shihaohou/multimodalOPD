@@ -37,10 +37,11 @@ set -euo pipefail
 # Required:
 #   MODELS="path1;path2;..."  or  "tag1=path1;tag2=path2;..."
 #       Each entry is a checkpoint path, optionally "tag=path". With NO tag, the
-#       output subdir + matrix label are derived from the path's last two components:
-#       runs/<run>/checkpoint-93 -> "<run>/checkpoint-93". With a tag, the tag is used
-#       (short, generic). Per-job logs go INSIDE each output folder
-#       (<id>/<dataset>/<phase>.log) — there is no central logs/ dir.
+#       output subdir + matrix label are derived from the path: the basename
+#       (.../models/CapCurriculum-8B -> "CapCurriculum-8B"), or "<run>/checkpoint-N"
+#       when the basename is a generic checkpoint dir. With a tag, the tag is used.
+#       Per-job logs go INSIDE each output folder (<id>/<dataset>/<phase>.log) —
+#       there is no central logs/ dir.
 # Benchmarks (default = full standard set; override to run a subset):
 #   DSROOT=/abs/dir  DATASETS="name1 name2 ... pope chartqa vqav2"
 #       judged names join as DSROOT/name (missing skipped); pope/chartqa/vqav2 route
@@ -93,17 +94,24 @@ DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT}"
 is_det() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in pope|chartqa|vqav2) return 0 ;; *) return 1 ;; esac; }
 
 # A model's output-subdir + matrix label. Explicit "tag=path" in MODELS wins;
-# otherwise it is derived from the checkpoint PATH (its last two components), so
-# runs/<run>/checkpoint-93 -> "<run>/checkpoint-93" instead of a generic ckptA.
-model_id() {  # path -> "<parent>/<base>" (or "<base>")
+# otherwise it is derived from the PATH. Usually the basename is descriptive enough
+# (.../models/CapCurriculum-8B -> "CapCurriculum-8B"); only when the basename is a
+# generic checkpoint dir name (checkpoint-93, global_step500, ...) — ambiguous on its
+# own — do we prepend the run dir (runs/<run>/checkpoint-93 -> "<run>/checkpoint-93").
+model_id() {  # path -> "<base>" (or "<run>/<base>" for a checkpoint dir)
   local p="${1%/}" base parent
   base="$(basename "$p")"
-  parent="$(basename "$(dirname "$p")")"
-  if [[ -z "$parent" || "$parent" == "." || "$parent" == "/" || "$parent" == "$base" ]]; then
-    printf '%s' "$base"
-  else
-    printf '%s/%s' "$parent" "$base"
-  fi
+  case "$base" in
+    checkpoint-*|checkpoint_*|global_step*|global-step*|step-*|step_*|epoch-*|epoch_*)
+      parent="$(basename "$(dirname "$p")")"
+      if [[ -n "$parent" && "$parent" != "." && "$parent" != "/" && "$parent" != "$base" ]]; then
+        printf '%s/%s' "$parent" "$base"
+      else
+        printf '%s' "$base"
+      fi
+      ;;
+    *) printf '%s' "$base" ;;  # already a descriptive model name
+  esac
 }
 
 case "$PHASE" in
