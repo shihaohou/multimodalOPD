@@ -50,7 +50,9 @@ set -euo pipefail
 # Optional: NGPU (8), GPUS="0,1,2,..." (overrides NGPU), OUTPUT_ROOT, RUN_ID, DRYRUN=1,
 #   RESUME=1 (rerun the same command -> only the failed/missing jobs are redone),
 #   LAUNCH_STAGGER=30 (seconds between job launches; spreads the CPU-bound image
-#   preprocessing so 8 jobs don't thrash the CPU while the GPUs idle).
+#   preprocessing so 8 jobs don't thrash the CPU while the GPUs idle),
+#   DET_SPLIT=1 (run pope/chartqa/vqav2 as 3 separate scheduler jobs -> 3 cards,
+#   instead of one job doing all three on a single card).
 #
 # Two-phase example (saturate 8 cards on everything, judge with a model you deploy later):
 #   # 1) generate judged + fully score the deterministic group, across all 8 GPUs:
@@ -99,6 +101,14 @@ esac
 # thrash the CPU while the GPUs idle. A stagger (e.g. 20-40) offsets their CPU-heavy
 # phases against each other's GPU-heavy phases -> better CPU/GPU overlap. 0 = off.
 LAUNCH_STAGGER="${LAUNCH_STAGGER:-0}"
+# DET_SPLIT -> run each deterministic benchmark (pope/chartqa/vqav2) as its OWN job
+# (its own card via the scheduler), instead of one job per ckpt that runs all three in
+# turn on a single card. More parallelism (uses spare cards) at the cost of reloading
+# the model once per benchmark. Accept 1/true/yes/on.
+case "$(printf '%s' "${DET_SPLIT:-}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) DET_SPLIT=true ;;
+  *) DET_SPLIT=false ;;
+esac
 
 # Default benchmark set (override DATASETS to run a subset). Judged group + the three
 # deterministic benchmarks (matched by name and routed to eval_vqa.sh).
@@ -181,6 +191,7 @@ DET_CSV="$(IFS=,; printf '%s' "${DET_GROUP[*]:-}")"
 # ---- job list: kind|tag|model|payload (judged dataset dir, or det csv group) ----
 SPECS=()
 JUDGED_N=0
+DET_N=0
 IFS=';' read -r -a _models <<< "$MODELS"
 for tm in "${_models[@]}"; do
   [[ -z "$tm" ]] && continue
@@ -197,8 +208,14 @@ for tm in "${_models[@]}"; do
     SPECS+=("judged|${tag}|${model}|${ddir}")
     JUDGED_N=$((JUDGED_N + 1))
   done
-  if [[ -n "$DET_CSV" ]]; then
-    SPECS+=("det|${tag}|${model}|${DET_CSV}")
+  if [[ "$DET_SPLIT" == "true" ]]; then
+    for b in ${DET_GROUP[@]+"${DET_GROUP[@]}"}; do   # one job per benchmark -> own card
+      SPECS+=("det|${tag}|${model}|${b}")
+      DET_N=$((DET_N + 1))
+    done
+  elif [[ -n "$DET_CSV" ]]; then
+    SPECS+=("det|${tag}|${model}|${DET_CSV}")        # one job, all three on one card
+    DET_N=$((DET_N + 1))
   fi
 done
 [[ ${#SPECS[@]} -eq 0 ]] && { echo "No jobs to run (check MODELS / datasets)."; exit 1; }
@@ -213,16 +230,21 @@ if [[ "$PHASE" != "generate" && "$JUDGED_N" -gt 0 && "${GRADER:-llm}" != "rule" 
   fi
 fi
 
-DET_N=0; [[ -n "$DET_CSV" ]] && DET_N=$(( ${#_models[@]} ))
 echo "Planned ${#SPECS[@]} jobs (${JUDGED_N} judged + ${DET_N} deterministic) over ${NGPU} GPU(s) [${CARDS[*]}] -> ${OUTPUT_ROOT}"
-[[ -n "$DET_CSV" ]] && echo "  deterministic group: ${DET_CSV} (eval_vqa.sh, no judge)"
+[[ -n "$DET_CSV" ]] && echo "  deterministic group: ${DET_CSV} (eval_vqa.sh, no judge$([[ "$DET_SPLIT" == "true" ]] && echo ", split: 1 card each"))"
 [[ "$RESUME" == "true" ]] && echo "  RESUME=true: jobs already complete will be skipped"
 mkdir -p "$OUTPUT_ROOT"
 
-# A job's output dir. det -> <id>/_vqa; judged -> <id>/<sanitized-dataset>.
+# A job's output dir. det combined (csv) -> <id>/_vqa; det split (single benchmark)
+# -> <id>/_vqa_<bench> so concurrent split jobs don't clobber each other's summary.json;
+# judged -> <id>/<sanitized-dataset>.
 job_out() {  # kind tag payload
   if [[ "$1" == "det" ]]; then
-    printf '%s/%s/_vqa' "$OUTPUT_ROOT" "$2"
+    if [[ "$3" == *,* ]]; then
+      printf '%s/%s/_vqa' "$OUTPUT_ROOT" "$2"
+    else
+      printf '%s/%s/_vqa_%s' "$OUTPUT_ROOT" "$2" "$3"
+    fi
   else
     local s; s="$(basename "$3")"; s="${s//[^A-Za-z0-9_.-]/_}"
     printf '%s/%s/%s' "$OUTPUT_ROOT" "$2" "$s"
