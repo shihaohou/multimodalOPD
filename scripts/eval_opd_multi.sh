@@ -272,8 +272,8 @@ if [[ "$PHASE" == "generate" ]]; then
   echo
   echo "Phase 1 (generate) complete -> ${OUTPUT_ROOT}/<id>/  (logs: <id>/<dataset>/generate.log)"
   echo "  judged group: responses saved (awaiting judge);  deterministic group: already scored."
-  echo "Deploy your judge, then judge the judged group with the SAME output root:"
-  echo "  OUTPUT_ROOT=${OUTPUT_ROOT} PHASE=judge \\"
+  echo "Deploy your judge, then judge the judged group with the SAME output root + MODELS:"
+  echo "  OUTPUT_ROOT=${OUTPUT_ROOT} PHASE=judge${PASS_K:+ PASS_K=$PASS_K} \\"
   echo "  JUDGE_API_URL=<url> JUDGE_MODEL=<served> OPENAI_API_KEY=<key> \\"
   echo "  MODELS='${MODELS}' \\"
   if [[ -n "${DATASET_DIRS:-}" ]]; then
