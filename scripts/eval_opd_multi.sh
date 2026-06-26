@@ -35,7 +35,12 @@ set -euo pipefail
 #                    on the GPU scheduler (the original behavior, one shot).
 #
 # Required:
-#   MODELS="tag1=path1;tag2=path2;..."   (tag becomes MODEL_NAME + output subdir)
+#   MODELS="path1;path2;..."  or  "tag1=path1;tag2=path2;..."
+#       Each entry is a checkpoint path, optionally "tag=path". With NO tag, the
+#       output subdir + matrix label are derived from the path's last two components:
+#       runs/<run>/checkpoint-93 -> "<run>/checkpoint-93". With a tag, the tag is used
+#       (short, generic). Per-job logs go INSIDE each output folder
+#       (<id>/<dataset>/<phase>.log) — there is no central logs/ dir.
 # Benchmarks (default = full standard set; override to run a subset):
 #   DSROOT=/abs/dir  DATASETS="name1 name2 ... pope chartqa vqav2"
 #       judged names join as DSROOT/name (missing skipped); pope/chartqa/vqav2 route
@@ -46,7 +51,7 @@ set -euo pipefail
 # Two-phase example (saturate 8 cards on everything, judge with a model you deploy later):
 #   # 1) generate judged + fully score the deterministic group, across all 8 GPUs:
 #   OUTPUT_ROOT=eval_outputs/bench_myrun PHASE=generate NGPU=8 \
-#   MODELS="ckptA=runs/a/checkpoint-100;ckptB=runs/b/checkpoint-100" \
+#   MODELS="runs/a/checkpoint-100;runs/b/checkpoint-100" \   # no tag -> folder = <run>/checkpoint-100
 #   DSROOT=$D/zli12321 \
 #   POPE_REPO=$D/lmms-lab/POPE CHARTQA_REPO=$D/lmms-lab/ChartQA VQAV2_REPO=$D/lmms-lab/VQAv2 \
 #   PASS_K=1 GEN_TEMPERATURE=0 bash scripts/eval_opd_multi.sh
@@ -54,7 +59,7 @@ set -euo pipefail
 #   # 3) judge the saved judged responses (SAME OUTPUT_ROOT/MODELS/DATASETS):
 #   OUTPUT_ROOT=eval_outputs/bench_myrun PHASE=judge \
 #   JUDGE_API_URL=http://127.0.0.1:8000/v1 JUDGE_MODEL=<served> OPENAI_API_KEY=x \
-#   MODELS="ckptA=runs/a/checkpoint-100;ckptB=runs/b/checkpoint-100" \
+#   MODELS="runs/a/checkpoint-100;runs/b/checkpoint-100" \   # no tag -> folder = <run>/checkpoint-100
 #   DSROOT=$D/zli12321 bash scripts/eval_opd_multi.sh
 #
 # One-shot example (judge already up, do everything inline on all 8 cards):
@@ -86,6 +91,20 @@ DET_DEFAULT="pope chartqa vqav2"
 DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT}"
 # Names (case-insensitive) that are deterministic -> eval_vqa.sh, never the judge.
 is_det() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in pope|chartqa|vqav2) return 0 ;; *) return 1 ;; esac; }
+
+# A model's output-subdir + matrix label. Explicit "tag=path" in MODELS wins;
+# otherwise it is derived from the checkpoint PATH (its last two components), so
+# runs/<run>/checkpoint-93 -> "<run>/checkpoint-93" instead of a generic ckptA.
+model_id() {  # path -> "<parent>/<base>" (or "<base>")
+  local p="${1%/}" base parent
+  base="$(basename "$p")"
+  parent="$(basename "$(dirname "$p")")"
+  if [[ -z "$parent" || "$parent" == "." || "$parent" == "/" || "$parent" == "$base" ]]; then
+    printf '%s' "$base"
+  else
+    printf '%s/%s' "$parent" "$base"
+  fi
+}
 
 case "$PHASE" in
   generate|judge|all) ;;
@@ -125,8 +144,11 @@ JUDGED_N=0
 IFS=';' read -r -a _models <<< "$MODELS"
 for tm in "${_models[@]}"; do
   [[ -z "$tm" ]] && continue
-  tag="${tm%%=*}"
-  model="${tm#*=}"
+  if [[ "$tm" == *=* ]]; then
+    tag="${tm%%=*}"; model="${tm#*=}"      # explicit tag=path
+  else
+    model="$tm"; tag="$(model_id "$tm")"   # no tag -> derive id from the path
+  fi
   for ddir in ${JUDGED_DIRS[@]+"${JUDGED_DIRS[@]}"}; do
     if [[ ! -e "$ddir" ]]; then
       echo "[skip] judged dataset not found, skipping for all models: $ddir" >&2
@@ -154,22 +176,26 @@ fi
 DET_N=0; [[ -n "$DET_CSV" ]] && DET_N=$(( ${#_models[@]} ))
 echo "Planned ${#SPECS[@]} jobs (${JUDGED_N} judged + ${DET_N} deterministic) over ${NGPU} GPU(s) [${CARDS[*]}] -> ${OUTPUT_ROOT}"
 [[ -n "$DET_CSV" ]] && echo "  deterministic group: ${DET_CSV} (eval_vqa.sh, no judge)"
-mkdir -p "$OUTPUT_ROOT/logs"
+mkdir -p "$OUTPUT_ROOT"
 
 run_job() {  # kind card tag model payload
   local kind="$1" card="$2" tag="$3" model="$4" payload="$5"
   local out logf safe
+  # Each job's log lives INSIDE its own output folder (no central logs/ dir), named
+  # by phase so generate.log and judge.log sit next to that job's responses/summary.
   if [[ "$kind" == "det" ]]; then
     out="$OUTPUT_ROOT/$tag/_vqa"
-    logf="$OUTPUT_ROOT/logs/${PHASE}_${tag}_vqa.log"
+    mkdir -p "$out"
+    logf="$out/${PHASE}.log"
     CUDA_VISIBLE_DEVICES="$card" MODEL_PATH="$model" MODEL_NAME="$tag" \
       BENCHMARKS="$payload" OUTPUT_DIR="$out" \
       bash scripts/eval_vqa.sh > "$logf" 2>&1
     return
   fi
-  safe="$(basename "$payload" | tr -c 'A-Za-z0-9_.-' '_')"
+  safe="$(basename "$payload")"; safe="${safe//[^A-Za-z0-9_.-]/_}"  # sanitize (no trailing _)
   out="$OUTPUT_ROOT/$tag/$safe"
-  logf="$OUTPUT_ROOT/logs/${PHASE}_${tag}_${safe}.log"
+  mkdir -p "$out"
+  logf="$out/${PHASE}.log"
   local -a job_env=(MODEL_PATH="$model" MODEL_NAME="$tag" EVAL_DATASETS="$payload" OUTPUT_DIR="$out")
   case "$PHASE" in
     generate) job_env+=(CUDA_VISIBLE_DEVICES="$card" SKIP_JUDGE=true) ;;
@@ -214,7 +240,7 @@ if [[ "$PHASE" == "judge" ]]; then
     run_job "$kind" "" "$tag" "$model" "$payload" || echo "  (job exited non-zero; see log)"
   done
   [[ "$total" -eq 0 ]] && echo "(deterministic-only request: nothing to judge — scored in the generate phase)"
-  echo "All ${total} judge jobs finished. Logs in ${OUTPUT_ROOT}/logs/"
+  echo "All ${total} judge jobs finished. Per-job log: <id>/<dataset>/judge.log under ${OUTPUT_ROOT}/"
 else
   # ---- generate / all: <=NGPU concurrent, one job pinned per free card ----
   declare -A SLOT  # SLOT[card]=pid of the job currently on that card
@@ -237,14 +263,14 @@ else
     SLOT[$card]=$!
   done
   wait
-  echo "All ${#SPECS[@]} jobs finished. Logs in ${OUTPUT_ROOT}/logs/"
+  echo "All ${#SPECS[@]} jobs finished. Per-job log: <id>/<dataset>/${PHASE}.log under ${OUTPUT_ROOT}/"
 fi
 
 # Generate phase: judged group is generated-only (no scores yet) -> skip aggregation
 # and print the exact judge-phase command. The deterministic group is already scored.
 if [[ "$PHASE" == "generate" ]]; then
   echo
-  echo "Phase 1 (generate) complete -> ${OUTPUT_ROOT}/<tag>/"
+  echo "Phase 1 (generate) complete -> ${OUTPUT_ROOT}/<id>/  (logs: <id>/<dataset>/generate.log)"
   echo "  judged group: responses saved (awaiting judge);  deterministic group: already scored."
   echo "Deploy your judge, then judge the judged group with the SAME output root:"
   echo "  OUTPUT_ROOT=${OUTPUT_ROOT} PHASE=judge \\"
@@ -272,12 +298,14 @@ DET_METRIC = {  # det benchmark -> (metric key in summary['benchmarks'][name]['m
     "vqav2": ("vqa_accuracy", "vqav2(soft)"),
 }
 matrix, tags = {}, set()
-for path in sorted(glob.glob(os.path.join(root, "*", "*", "summary.json"))):
+# Recursive: a model's output folder may be nested (e.g. "<run>/checkpoint-93"), so
+# summary.json can sit deeper than two levels under root.
+for path in sorted(glob.glob(os.path.join(root, "**", "summary.json"), recursive=True)):
     try:
         summary = json.load(open(path))
     except Exception:
         continue
-    tag = summary.get("model_name") or os.path.basename(os.path.dirname(os.path.dirname(path)))
+    tag = summary.get("model_name") or os.path.relpath(os.path.dirname(os.path.dirname(path)), root)
     tags.add(tag)
     bms = summary.get("benchmarks")
     if isinstance(bms, dict):  # eval_vqa deterministic summary (name -> {metrics: {...}})
