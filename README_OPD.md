@@ -100,6 +100,58 @@ alignment between teacher and student is what OPD needs. The system prompt lives
 `baseline/opd_data_collator.py::OPD_SYSTEM_PROMPT` (and is mirrored in the GRPO
 launcher's `--system`); switching datasets needs no prompt changes.
 
+### ViRL39K (`TIGER-Lab/ViRL39K`) — local parquet, auto-adapted
+
+ViRL39K does **not** ship the canonical `problem`/`images`/`answer` schema, so it is
+handled by `baseline/opd_dataset.py::load_opd_dataset` (both OPD entries use it; HF
+ids and canonical datasets fall through unchanged — nothing to set for Vision-SR1).
+Its local layout is a single top-level `39Krelease.parquet` (38,870 rows:
+`question`/`answer`/`qid`/… + an `image` column of **relative path strings** into a
+sibling `images/` dir) plus `images.zip`. The adapter:
+
+- loads the **parquet directly** (avoids the `imagefolder` builder — see gotcha below),
+- `question` → `problem` (strips the literal `<image>` placeholder token),
+- `image` (list of relative paths) → the **first** image, resolved to an absolute
+  path and cast to `datasets.Image()` (so the tiny-image filter + collator get a
+  decoded PIL, not a path string),
+- keeps `answer` as-is (already `\boxed{}`). **Multi-image questions keep only their
+  FIRST image** — the count is logged (`[opd-dataset] ViRL39K-style parquet
+  adapted: 38870 rows … N multi-image questions kept FIRST image only`).
+
+**Run it** — point `DATASET_NAME` at the dataset dir (the one with `39Krelease.parquet`
++ `images/`) and turn the size filter off (ViRL is curated; this skips a slow 38k-image
+decode pass — the collator still pads degenerate images as a backstop):
+
+```bash
+export D=/path/to/datasets            # dir holding ViRL39K/
+DATASET_NAME=$D/ViRL39K FILTER_TINY_IMAGES=false \
+TEACHER_MODEL=$M/Vero-Qwen3I-8B MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct \
+RUN_CONFIG=opd_qwen3_vero_8b2b_fullft_ViRL39K \
+bash scripts/train_opd.sh
+# OPD + TAM-MSE-RGF on ViRL39K: same DATASET_NAME / FILTER_TINY_IMAGES=false, plus
+#   TAM_DIVERGENCE=mse TAM_DENOISE=rgf TAM_RGF_GRAD=hard TAM_GATE=false
+#   bash scripts/train_opd_tam_qwen3_8b_to_2b.sh   (resolves the Qwen3-VL pair from $M)
+```
+
+No `ANSWER_FIELD`/problem-field override is needed — the adapter emits
+`problem`/`image`/`answer` directly. **Pre-flight** (confirm the adapt before a full run):
+
+```bash
+uv run python - <<'PY'
+from baseline.opd_dataset import load_opd_dataset
+ds = load_opd_dataset("/path/to/datasets/ViRL39K")
+print(len(ds), ds.column_names)                       # 38870  ['problem','image','answer']
+ex = ds[0]; print(repr(ex["problem"][:80]), ex["answer"], type(ex["image"]).__name__, ex["image"].size)
+PY
+```
+
+> **Gotcha — don't point `load_dataset` at the dir without the adapter.** Plain
+> `load_dataset("…/ViRL39K", split="train")` triggers the **imagefolder** builder, which
+> scans `images/` *and* the extracted `images.zip` → **~75,624 rows, only an `image`
+> column, no text** (75624 = the ~37.8k images counted twice). The adapter avoids this by
+> reading the parquet. Also make sure `…/ViRL39K` is the **dataset** dir (parquet + images),
+> not a directory that happens to hold a model checkpoint.
+
 ## Training
 
 ```bash
