@@ -73,10 +73,32 @@ def format_opd_student_prompt(
     return problem_text
 
 
-# Unified system prompt for ALL stages (teacher GRPO, student OPD, eval), from the
-# paper appendix. Keeps teacher and student structurally aligned, which is what OPD
-# needs (the teacher scores the student's tokens under the same prompt).
+# Unified system prompt for the student OPD rollout AND eval. The frozen teacher
+# scores the student's sampled tokens under this SAME prompt (one prompt is built;
+# see OPDTrainer.compute_loss), so student and teacher stay structurally aligned.
+#
+# Default = the OPD-main / DeepSeek-R1 convention: free-text chain-of-thought with
+# the final answer in \boxed{}, and NO rigid reasoning tags. We dropped the earlier
+# "<reason></reason>" requirement on purpose: Qwen3-VL-2B-Instruct is a *non-thinking*
+# checkpoint (its chat template has no native <think> channel and no enable_thinking
+# switch), so a hard-tag instruction is only a soft request it follows ~half the time
+# -> rollouts oscillated between "<reason>…</reason>\boxed{}" and a bare \boxed{}.
+# Free CoT removes that tag-compliance coin-flip while keeping the reasoning itself.
+#
+# Caveat: a teacher GRPO-trained for the <reason> format (e.g. Vero) was optimized on
+# the TAGGED prompt below; under reverse KL it can still tug the student toward
+# <reason>. To match such a teacher exactly (or run the tagged-format ablation), set
+# OPD_SYSTEM_PROMPT = OPD_SYSTEM_PROMPT_REASON_TAGS.
 OPD_SYSTEM_PROMPT = (
+    "A conversation between user and assistant. The user asks a question, and the "
+    "assistant solves it. The assistant first thinks about the reasoning process in "
+    "the mind and then provides the user with the answer. The final answer MUST BE put "
+    "in \\boxed{}."
+)
+
+# Previous default: identical, but requiring the chain-of-thought to be wrapped in
+# <reason></reason>. Kept for the tagged-format ablation / teacher (Vero) alignment.
+OPD_SYSTEM_PROMPT_REASON_TAGS = (
     "A conversation between user and assistant. The user asks a question, and the "
     "assistant solves it. The assistant first thinks about the reasoning process in "
     "the mind and then provides the user with the answer. The reasoning process "
