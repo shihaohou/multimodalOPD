@@ -31,6 +31,10 @@ LIMIT="${LIMIT:-}"
 # Format instruction lives in the unified system prompt (baseline/eval/opd_eval_prompt
 # OPD_SYSTEM_PROMPT); the user turn is just the question, so no suffix by default.
 PROMPT_SUFFIX="${PROMPT_SUFFIX:-}"
+# System-prompt style: think (default, <think> tags) | freecot (no tags, direct CoT +
+# \boxed) | reason (<reason> tags) | none, or a raw string. Set this to match how the
+# checkpoint was trained (OPD_PROMPT_STYLE in scripts/train_opd.sh).
+OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
 PASS_K="${PASS_K:-5}"
 BATCH_SIZE="${BATCH_SIZE:-0}"   # 0 = feed all prompts to vLLM at once (fastest)
 MAX_TOKENS="${MAX_TOKENS:-4096}"
@@ -78,6 +82,7 @@ CMD=(
   --default-split "$DEFAULT_SPLIT"
   --grader "$GRADER"
   --prompt-suffix "$PROMPT_SUFFIX"
+  --system-prompt "$OPD_PROMPT_STYLE"
   --pass-k "$PASS_K"
   --batch-size "$BATCH_SIZE"
   --max-tokens "$MAX_TOKENS"

@@ -112,6 +112,33 @@ OPD_SYSTEM_PROMPT_REASON_TAGS = (
     "in \\boxed{}."
 )
 
+# Named system-prompt styles selectable from the CLI / env (one control knob shared by
+# training rollout, the frozen teacher, and eval — OPD scores all of them on this one
+# prompt, so they must agree). "think" = the current default (<think></think> tags);
+# "freecot" = OPD-main free-text CoT with no tags (direct reasoning then \boxed{});
+# "reason" = <reason></reason> tags; "none" = no system prompt at all.
+OPD_SYSTEM_PROMPTS = {
+    "think": OPD_SYSTEM_PROMPT,
+    "freecot": OPD_SYSTEM_PROMPT_FREECOT,
+    "reason": OPD_SYSTEM_PROMPT_REASON_TAGS,
+    "none": "",
+}
+
+
+def resolve_opd_system_prompt(value: str | None) -> str:
+    """Map a style name (think/freecot/reason/none) to its prompt string.
+
+    Any other non-empty value is passed through verbatim as a raw system-prompt
+    override (escape hatch). Empty / ``None`` falls back to the default so an
+    unset knob keeps the current behaviour.
+    """
+    if value is None:
+        return OPD_SYSTEM_PROMPT
+    key = value.strip()
+    if not key:
+        return OPD_SYSTEM_PROMPT
+    return OPD_SYSTEM_PROMPTS.get(key.lower(), value)
+
 
 def build_opd_messages(
     problem: Any,

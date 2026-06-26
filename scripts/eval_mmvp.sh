@@ -41,6 +41,9 @@ LIMIT="${LIMIT:-}"
 # PROMPT_SUFFIX="" for the bare question only. Sentinel keeps the bash side free of
 # embedded-newline quoting.
 PROMPT_SUFFIX="${PROMPT_SUFFIX-__DEFAULT__}"
+# System-prompt style: think (default, <think> tags) | freecot (no tags) | reason |
+# none, or a raw string. Match how the checkpoint was trained (OPD_PROMPT_STYLE).
+OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
 
 # Greedy single-sample by default (the canonical MMVP setting). If you set
 # PASS_K>1 for a robustness read, also raise GEN_TEMPERATURE (>0) or every sample
@@ -78,6 +81,7 @@ CMD=(
   --limit-images "$VLLM_LIMIT_IMAGES"
   --dtype "$DTYPE"
   --tokenizer-mode "$TOKENIZER_MODE"
+  --system-prompt "$OPD_PROMPT_STYLE"
 )
 
 if [[ "$PROMPT_SUFFIX" != "__DEFAULT__" ]]; then

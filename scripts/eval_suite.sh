@@ -28,6 +28,10 @@ cd "$ROOT_DIR"
 : "${MODEL_PATH:?Set MODEL_PATH to a model dir or HuggingFace model id.}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+# System-prompt style, forwarded to both the judged (eval_opd.sh) and deterministic
+# (eval_vqa.sh) groups so the whole suite stays on one prompt: think (default) |
+# freecot (no tags) | reason | none, or a raw string. Match the checkpoint's training.
+export OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-eval_outputs/suite_${RUN_ID}}"
 MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"

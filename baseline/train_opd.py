@@ -38,7 +38,7 @@ from transformers import (
 )
 
 import vigos.dataset_utils as dataset_utils
-from baseline.opd_data_collator import OPDDataCollator
+from baseline.opd_data_collator import OPDDataCollator, resolve_opd_system_prompt
 from baseline.opd_trainer import OPDTrainer
 from vigos.train_vigos import (
     DEFAULT_LEARNING_RATE,
@@ -89,6 +89,11 @@ class OPDScriptArguments:
     answer_field: str = "answer"
     # Format instruction now lives in the unified system prompt; user = raw question.
     opd_prompt_suffix: str = ""
+    # System-prompt style for the rollout (the frozen teacher is scored on the same
+    # prompt, so this also controls it): "think" (default, <think></think> tags) |
+    # "freecot" (OPD-main free-text CoT, no tags) | "reason" (<reason></reason> tags) |
+    # "none", or a raw system-prompt string. See opd_data_collator.OPD_SYSTEM_PROMPTS.
+    opd_system_prompt: str = "think"
     generation_temperature: float = 1.1
     generation_top_p: float = 0.95
     generation_top_k: int = 20
@@ -212,6 +217,10 @@ def main() -> None:
         print(f"Dataset name: {script_args.dataset_name}")
         print(f"Answer/reference field: {script_args.answer_field}")
         print(f"OPD prompt suffix: {script_args.opd_prompt_suffix!r}")
+        print(
+            f"OPD system prompt: style={script_args.opd_system_prompt!r} -> "
+            f"{resolve_opd_system_prompt(script_args.opd_system_prompt)!r}"
+        )
         print(
             "Rollout sampling: "
             f"temperature={script_args.generation_temperature}, "
@@ -383,6 +392,7 @@ def main() -> None:
         max_prompt_length=script_args.max_prompt_length,
         answer_field=script_args.answer_field,
         opd_prompt_suffix=script_args.opd_prompt_suffix,
+        system_prompt=resolve_opd_system_prompt(script_args.opd_system_prompt),
     )
 
     # --- Trainer ------------------------------------------------------------------
@@ -459,6 +469,7 @@ def main() -> None:
                     "opd_kl_direction": script_args.opd_kl_direction,
                     "opd_top_k": script_args.opd_top_k,
                     "opd_prompt_suffix": script_args.opd_prompt_suffix,
+                    "opd_system_prompt": script_args.opd_system_prompt,
                     "opd_max_prompt_length": script_args.max_prompt_length,
                     "opd_max_completion_length": script_args.max_completion_length,
                 }

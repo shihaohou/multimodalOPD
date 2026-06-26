@@ -49,9 +49,12 @@ def build_general_eval_prompt(
     problem: str,
     images: list[Image.Image],
     *,
+    system_prompt: str = OPD_SYSTEM_PROMPT,
     suffix: str = "",
 ) -> str:
-    messages = build_general_eval_messages(problem, images, suffix=suffix)
+    messages = build_general_eval_messages(
+        problem, images, system_prompt=system_prompt, suffix=suffix
+    )
     # No assistant prefill: the model generates freely (matches OPD training).
     return processor.apply_chat_template(
         messages,

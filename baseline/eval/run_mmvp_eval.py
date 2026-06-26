@@ -89,6 +89,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--limit", type=int, default=None, help="Max questions (smoke test).")
     p.add_argument("--prompt-suffix", default=MMVP_PROMPT_SUFFIX)
+    p.add_argument(
+        "--system-prompt",
+        default="think",
+        help="System-prompt style: think (default) | freecot (no tags) | reason | none, "
+        "or a raw string. Must match how the checkpoint was trained.",
+    )
     # generation (greedy MCQ by default; bump temperature if you set --pass-k>1)
     p.add_argument("--pass-k", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=0,

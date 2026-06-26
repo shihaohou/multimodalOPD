@@ -103,6 +103,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override the per-benchmark answer-format suffix (default: per-benchmark).",
     )
+    p.add_argument(
+        "--system-prompt",
+        default="think",
+        help="System-prompt style: think (default) | freecot (no tags) | reason | none, "
+        "or a raw string. Must match how the checkpoint was trained.",
+    )
     # generation (greedy single-sample by default, the canonical setting)
     p.add_argument("--pass-k", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=0,

@@ -83,6 +83,10 @@ ANSWER_FIELD="${ANSWER_FIELD:-answer}"
 # Format instruction lives in the unified system prompt (baseline/opd_data_collator
 # OPD_SYSTEM_PROMPT); the user turn is just the question, so no suffix by default.
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
+# System-prompt style: think (default, <think></think> tags) | freecot (OPD-main
+# free-text CoT, no tags -> direct reasoning then \boxed{}) | reason (<reason> tags)
+# | none, or a raw system-prompt string. Keep this in sync with the eval scripts.
+OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
 # Paper (Table 4) rollout: temperature 1.0, top_p 1.0, no top-k (0 -> vLLM -1).
 GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.0}"
 GENERATION_TOP_P="${GENERATION_TOP_P:-1.0}"
@@ -191,6 +195,7 @@ uv run accelerate launch \
   --min_image_size "$MIN_IMAGE_SIZE" \
   --answer_field "$ANSWER_FIELD" \
   --opd_prompt_suffix "$OPD_PROMPT_SUFFIX" \
+  --opd_system_prompt "$OPD_PROMPT_STYLE" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "opd_qwen25_3b_${RUN_ID}" \
   --run_config "$RUN_CONFIG" \

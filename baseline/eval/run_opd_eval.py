@@ -56,7 +56,8 @@ from baseline.eval.opd_eval_prompt import (
     GENERAL_PROMPT_DESCRIPTION,
     build_general_eval_prompt,
 )
-# (system prompt is baked into baseline.eval.opd_eval_prompt; suffix defaults empty)
+from baseline.opd_data_collator import resolve_opd_system_prompt
+# (system-prompt style is selectable via --system-prompt; suffix defaults empty)
 
 
 # --------------------------------------------------------------------------- CLI
@@ -70,6 +71,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--default-split", default="test")
     p.add_argument("--limit", type=int, default=None, help="Max samples per source.")
     p.add_argument("--prompt-suffix", default="")
+    p.add_argument(
+        "--system-prompt",
+        default="think",
+        help="System-prompt style: think (default, <think> tags) | freecot (no tags, "
+        "direct CoT + \\boxed) | reason (<reason> tags) | none, or a raw string. Must "
+        "match how the checkpoint was trained.",
+    )
     # generation
     p.add_argument("--pass-k", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=0,
@@ -230,10 +238,15 @@ def generate_records(
     # every boundary (the slowest sequence stalled the next window), which was the
     # main reason eval crawled. batch_size<=0 (default) -> one call with everything;
     # set batch_size>0 only to bound host memory on very large datasets.
+    system_prompt = resolve_opd_system_prompt(getattr(args, "system_prompt", None))
     requests = [
         vllm_request(
             build_general_eval_prompt(
-                processor, sample.problem, sample.images, suffix=args.prompt_suffix
+                processor,
+                sample.problem,
+                sample.images,
+                system_prompt=system_prompt,
+                suffix=args.prompt_suffix,
             ),
             sample.images,
         )
@@ -654,6 +667,7 @@ def main() -> None:
         "grader": args.grader,
         "prompt": GENERAL_PROMPT_DESCRIPTION,
         "prompt_suffix": args.prompt_suffix,
+        "system_prompt": getattr(args, "system_prompt", "think"),
         "generation": {
             "max_tokens": args.max_tokens,
             "temperature": args.temperature,
