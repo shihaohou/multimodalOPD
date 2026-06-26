@@ -33,7 +33,8 @@ export no_proxy="${no_proxy:+${no_proxy},}127.0.0.1,localhost,0.0.0.0"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_gpu_8.yaml}"
-OUTPUT_DIR="${OUTPUT_DIR:-runs/opd_evidence_qwen25_3b_${RUN_ID}}"
+# OUTPUT_DIR is derived from the (date-stamped) RUN_CONFIG below unless set here.
+OUTPUT_DIR="${OUTPUT_DIR:-}"
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen2.5-VL-3B-Instruct}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-sdpa}"
@@ -155,7 +156,13 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
-RUN_CONFIG="${RUN_CONFIG:-opd_ev_qwen25_3b_lev${LAMBDA_EVIDENCE}_top${EVIDENCE_TOP_RATIO}_np${NUM_PROCESSES}}"
+# Dataset basename into RUN_CONFIG (-> output dir AND wandb run_name) so runs on
+# different training sets never collide. Date-stamped so re-runs never overwrite,
+# and OUTPUT_DIR is derived from it (mirrors scripts/train_opd.sh).
+DATASET_TAG="$(basename "${DATASET_NAME%/}")"
+DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
+RUN_CONFIG="${RUN_CONFIG:-opd_evidence_${DATASET_TAG}}_${RUN_ID}"
+OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
   --config_file "$ACCELERATE_CONFIG" \
