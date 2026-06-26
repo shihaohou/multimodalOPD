@@ -67,7 +67,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prompt-suffix", default="")
     # generation
     p.add_argument("--pass-k", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=8, help="Questions per vLLM call.")
+    p.add_argument("--batch-size", type=int, default=0,
+                   help="0 = feed all prompts to vLLM in one call (recommended; its "
+                   "continuous batching saturates the GPU). >0 = chunk size (only to "
+                   "bound host memory on very large datasets).")
     p.add_argument("--max-tokens", type=int, default=4096)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=0.9)
@@ -152,6 +155,10 @@ def benchmark_samples(task: Any, limit: int | None) -> list[EvalSample]:
 
 # ------------------------------------------------------------------- generation
 def make_engine(args: argparse.Namespace):
+    # vLLM v1 launches its EngineCore in a subprocess; if the parent has already
+    # touched CUDA, a *forked* child dies with "Cannot re-initialize CUDA in forked
+    # subprocess". Force spawn so the child starts from a clean interpreter.
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import LLM
 
     kwargs: dict[str, Any] = dict(
@@ -190,16 +197,28 @@ def generate_records(
     args: argparse.Namespace,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
-    batch = max(1, args.batch_size)
-    for start in range(0, len(samples), batch):
-        window = samples[start : start + batch]
-        requests = []
-        for sample in window:
-            prompt = build_general_eval_prompt(
+    # Build every request up front and feed vLLM in as FEW generate() calls as
+    # possible — its continuous batching then keeps the GPU saturated. The old
+    # per-window loop throttled concurrency to batch_size and drained the batch at
+    # every boundary (the slowest sequence stalled the next window), which was the
+    # main reason eval crawled. batch_size<=0 (default) -> one call with everything;
+    # set batch_size>0 only to bound host memory on very large datasets.
+    requests = [
+        vllm_request(
+            build_general_eval_prompt(
                 processor, sample.problem, sample.images, suffix=args.prompt_suffix
-            )
-            requests.append(vllm_request(prompt, sample.images))
-        outputs = engine.generate(requests, sampling_params, use_tqdm=False)
+            ),
+            sample.images,
+        )
+        for sample in samples
+    ]
+    batch = getattr(args, "batch_size", 0) or 0
+    chunk = len(samples) if batch <= 0 else batch
+    for start in range(0, len(samples), max(1, chunk)):
+        window = samples[start : start + chunk]
+        outputs = engine.generate(
+            requests[start : start + chunk], sampling_params, use_tqdm=True
+        )
         for sample, output in zip(window, outputs, strict=True):
             attempts = []
             for idx, candidate in enumerate(output.outputs):

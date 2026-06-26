@@ -15,6 +15,8 @@ cd "$ROOT_DIR"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TRANSFORMERS_NO_TF=1
 export TOKENIZERS_PARALLELISM=false
+# vLLM v1 forks its EngineCore; force spawn so a CUDA-initialized parent can't break it.
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/opd_${RUN_ID}}"
@@ -27,7 +29,7 @@ LIMIT="${LIMIT:-}"
 # OPD_SYSTEM_PROMPT); the user turn is just the question, so no suffix by default.
 PROMPT_SUFFIX="${PROMPT_SUFFIX:-}"
 PASS_K="${PASS_K:-5}"
-BATCH_SIZE="${BATCH_SIZE:-8}"
+BATCH_SIZE="${BATCH_SIZE:-0}"   # 0 = feed all prompts to vLLM at once (fastest)
 MAX_TOKENS="${MAX_TOKENS:-4096}"
 GEN_TEMPERATURE="${GEN_TEMPERATURE:-1.0}"
 GEN_TOP_P="${GEN_TOP_P:-0.9}"

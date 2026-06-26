@@ -25,6 +25,8 @@ cd "$ROOT_DIR"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export TRANSFORMERS_NO_TF=1
 export TOKENIZERS_PARALLELISM=false
+# vLLM v1 forks its EngineCore; force spawn so a CUDA-initialized parent can't break it.
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/vqa_${RUN_ID}}"
@@ -54,7 +56,7 @@ PROMPT_SUFFIX="${PROMPT_SUFFIX-__DEFAULT__}"
 # Greedy single-sample by default (the canonical setting for all three). If you set
 # PASS_K>1 for a robustness read, also raise GEN_TEMPERATURE (>0).
 PASS_K="${PASS_K:-1}"
-BATCH_SIZE="${BATCH_SIZE:-16}"
+BATCH_SIZE="${BATCH_SIZE:-0}"   # 0 = feed all prompts to vLLM at once (fastest)
 MAX_TOKENS="${MAX_TOKENS:-2048}"
 GEN_TEMPERATURE="${GEN_TEMPERATURE:-0.0}"
 GEN_TOP_P="${GEN_TOP_P:-1.0}"

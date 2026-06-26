@@ -105,7 +105,9 @@ def parse_args() -> argparse.Namespace:
     )
     # generation (greedy single-sample by default, the canonical setting)
     p.add_argument("--pass-k", type=int, default=1)
-    p.add_argument("--batch-size", type=int, default=16, help="Questions per vLLM call.")
+    p.add_argument("--batch-size", type=int, default=0,
+                   help="0 = feed all prompts to vLLM in one call (recommended). "
+                   ">0 = chunk size (bound host memory).")
     p.add_argument("--max-tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--top-p", type=float, default=1.0)
