@@ -73,72 +73,26 @@ def format_opd_student_prompt(
     return problem_text
 
 
-# System prompt for the student OPD rollout AND eval. In OPD the frozen teacher scores
-# the student's sampled tokens under this SAME prompt (one prompt is built; see
-# OPDTrainer.compute_loss), so the prompt should match the format the *teacher* emits.
+# Short system prompt for the student OPD rollout AND eval. In OPD the frozen teacher
+# scores the student's sampled tokens under this SAME prompt (one prompt is built; see
+# OPDTrainer.compute_loss), so it must match the format the teacher emits -- keep teacher
+# GRPO + student + eval on this one prompt.
 #
-# Default = the official Vero teacher's own training prompt, copied verbatim from
-# vero-rl/examples/prompts/system_prompt_chatting.txt: free-flowing CoT in <think>…</think>
-# then a self-contained <answer>…</answer> carrying the \boxed{} result. We align to Vero
-# deliberately: Vero (Qwen3-VL-8B-Instruct, GSPO-trained with a 0.5-weight <think>/<answer>
-# format reward) reliably emits this format, so giving the student the same prompt keeps the
-# teacher on-distribution and lets its strong format preference pull the non-thinking 2B
-# student into <think>/<answer> consistently under reverse KL. Both Qwen3-VL-Instruct
-# distillation references use a prompt-instructed <think> channel (Vero: <think>/<answer>
-# +\boxed; ViCuR: <think>+\boxed) — neither uses bare free-CoT. \boxed{} stays extractable
-# (it sits inside <answer>; extract_boxed_content scans the whole completion text).
+# Deliberately minimal: a single <think>...</think> reasoning channel + a \boxed{} final
+# answer (OPD-main / ViCuR convention). We dropped the long Vero-style instructions and the
+# <answer> tags because the tags are not load-bearing here: the OPD loss is full-completion
+# reverse KL (it does NOT slice the <think>/<answer> spans, unlike ViGOS), and answer
+# extraction keys on \boxed{} everywhere (extract_boxed_content scans the whole completion;
+# <answer> is only an eval fallback).
 #
 # Swap-in alternatives for ablations / a different teacher:
-#   OPD_SYSTEM_PROMPT_FREECOT     — OPD-main free-CoT + \boxed, no tags (pair with a
+#   OPD_SYSTEM_PROMPT_FREECOT     - OPD-main free-CoT + \boxed, no tags (pair with a
 #                                   non-format teacher, e.g. stock Qwen3-VL-8B-Instruct)
-#   OPD_SYSTEM_PROMPT_REASON_TAGS — the earlier <reason></reason> + \boxed variant
-OPD_SYSTEM_PROMPT = r"""You are a helpful, conversational assistant tasked with answering a question about an image.
-
-Your response must include two parts:
-
-1. **Reasoning**: A detailed, free-flowing chain of thought enclosed in `<think>` and `</think>` tags.
-2. **Final Answer**: A clear, conversational response enclosed in `<answer>` and `</answer>` tags, using \boxed{} notation when the question has a definitive answer.
-
----
-
-### Reasoning Instructions
-
-* The reasoning section must be inside `<think>` … `</think>` tags.
-* The reasoning should resemble a stream of consciousness: explore, test hypotheses, backtrack if necessary, reflect, and refine.
-* Let the reasoning flow naturally while progressing toward a conclusion.
-* Use reasoning strategies such as:
-  * **Planning** – outline possible approaches before committing.
-  * **Exploration** – consider multiple image regions or interpretations, even unlikely ones.
-  * **Evaluation** – compare alternatives and verify against visual evidence.
-  * **Reflection** – revisit earlier ideas if they may still be viable.
-* Thoroughly examine and cross-check relevant image regions before narrowing down.
-* If the image is ambiguous, make a reasonable inference based on visual and contextual cues.
-* End the reasoning once you are confident in the conclusion.
-
----
-
-### Final Answer Instructions
-
-* The answer section must be enclosed in `<answer>` … `</answer>` tags.
-* The `<answer>` section should stand on its own as a response to the user: it must provide necessary context and justification so that a reader can understand and verify the conclusion without reading `<think>`.
-  - Do NOT refer to the `<think>` section (avoid phrases like “as explained above” or “from the reasoning”).
-* Boxed result:
-    * If the question has a definitive, concise answer (a number, word, phrase, or label), include a conversational, natural response followed by exactly one boxed result using LaTeX: \boxed{final_result}.
-    * If the question is open-ended, subjective, or does not yield a concise final result, omit the boxed notation.
-
----
-
-### Format Example
-
-```
-<think>
-Detailed reasoning goes here...
-</think>
-<answer>
-Self-contained response goes here...
-Following the response, if a concise final result exists, include: \boxed{final_result}. If open-ended or no concise result, respond naturally without \boxed.
-</answer>
-```"""
+#   OPD_SYSTEM_PROMPT_REASON_TAGS - the earlier <reason></reason> + \boxed variant
+OPD_SYSTEM_PROMPT = (
+    "You are a helpful assistant. First think step by step inside "
+    "<think> </think> tags, then give the final answer in \\boxed{}."
+)
 
 # OPD-main / DeepSeek-R1 convention: free-text CoT + \boxed{}, no rigid tags. Pair with a
 # non-format-trained teacher (the student then has no strong tag signal to learn from).
