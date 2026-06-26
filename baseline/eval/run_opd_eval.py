@@ -9,6 +9,10 @@ Pipeline per source (HF dataset or registered benchmark):
   load samples -> vLLM generate pass@k -> extract \\boxed answers ->
   LLM-judge (OpenAI-compatible) -> pass@k / avg@k -> write jsonl + summary.json
 
+``--grader both`` grades the same generations with the rule grader AND the LLM
+judge and writes a per-sample rule-vs-llm comparison (judgments_rule/,
+comparison/<stem>.jsonl, summary['comparison']) so the two can be diffed.
+
 Example:
   MODEL_PATH=runs/opd_qwen25_3b_<run> bash scripts/eval_opd.sh
 """
@@ -30,6 +34,7 @@ if __package__ is None or __package__ == "":
 
 from vigos.eval_benchmarks import (
     avg_at_k_fields,
+    is_correct_judgment,
     load_benchmark_tasks,
     read_jsonl,
     score_benchmark,
@@ -85,9 +90,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--grader",
         default="llm",
-        choices=["rule", "llm"],
+        choices=["rule", "llm", "both"],
         help="llm = OpenAI-compatible LLM judge (default, same as ViGOS); "
-        "rule = mathruler + option/exact match (no API, deterministic/reproducible).",
+        "rule = mathruler + option/exact match (no API, deterministic/reproducible); "
+        "both = grade the SAME generations with rule AND llm, then write a per-sample "
+        "rule-vs-llm comparison (judgments_rule/, comparison/, summary['comparison']).",
     )
     p.add_argument("--skip-judge", action="store_true")
     p.add_argument(
@@ -383,6 +390,158 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+# ----------------------------------------------------------- rule-vs-llm compare
+def _compare_judgments(
+    records: list[dict[str, Any]],
+    judg_llm: list[dict[str, Any]],
+    judg_rule: list[dict[str, Any]],
+    source: dict[str, Any],
+    stem: str,
+    output_dir: Path,
+) -> dict[str, Any]:
+    """Compare two judgment lists graded over the SAME records (same order).
+
+    Verdicts are compared at the sample (pass@k) level via ``is_correct_judgment``;
+    every disagreeing sample is written to comparison/<stem>.jsonl with both verdicts,
+    the extracted answer, the judge's reasoning and a response snippet so the
+    rule-vs-llm gap can be eyeballed. Returns a one-row summary (2x2 confusion + the
+    two pass@k + agreement rate).
+    """
+    both_correct = both_incorrect = llm_only = rule_only = 0
+    disagreements: list[dict[str, Any]] = []
+    for rec, jl, jr in zip(records, judg_llm, judg_rule, strict=True):
+        cl = is_correct_judgment(jl)
+        cr = is_correct_judgment(jr)
+        if cl and cr:
+            both_correct += 1
+        elif not cl and not cr:
+            both_incorrect += 1
+        elif cl:
+            llm_only += 1
+        else:
+            rule_only += 1
+        if cl != cr:
+            disagreements.append(
+                {
+                    "sample_id": rec.get("sample_id"),
+                    "ground_truth": rec.get("ground_truth"),
+                    "extracted_answer": rec.get("extracted_answer", ""),
+                    "llm_verdict": "correct" if cl else "incorrect",
+                    "rule_verdict": "correct" if cr else "incorrect",
+                    "llm_reasoning": (jl.get("judge_reasoning") or "")[:800],
+                    "problem": (rec.get("problem") or "")[:800],
+                    "response": (rec.get("response") or "")[:2000],
+                }
+            )
+    n = len(records)
+    comparison_file = output_dir / "comparison" / f"{stem}.jsonl"
+    write_jsonl(comparison_file, disagreements)
+    agree = both_correct + both_incorrect
+    return {
+        "dataset": source["name"],
+        "safe_name": stem,
+        "samples": n,
+        "llm_pass_at_k": (sum(is_correct_judgment(j) for j in judg_llm) / n) if n else 0.0,
+        "rule_pass_at_k": (sum(is_correct_judgment(j) for j in judg_rule) / n) if n else 0.0,
+        "agreement": (agree / n) if n else 0.0,
+        "n_disagree": n - agree,
+        "both_correct": both_correct,
+        "both_incorrect": both_incorrect,
+        "llm_correct_rule_incorrect": llm_only,
+        "rule_correct_llm_incorrect": rule_only,
+        "comparison_file": str(comparison_file),
+    }
+
+
+def grade_and_summarize(
+    records: list[dict[str, Any]],
+    args: argparse.Namespace,
+    source: dict[str, Any],
+    output_dir: Path,
+    summary: dict[str, Any],
+) -> None:
+    """Grade one source's records (rule / llm / both) and append the score(s) to
+    ``summary``. Shared by the generate path (main) and the --judge-only path so
+    every grader behaves identically in both. For ``both``, the LLM judge stays the
+    primary result (written to judgments/, appended to summary[datasets|benchmarks]
+    exactly as before — downstream aggregation is unaffected); the rule pass is
+    written alongside (judgments_rule/) and a comparison is appended to
+    summary['comparison'].
+    """
+    stem = sanitize_dataset_name(source["stem"])
+    response_file = output_dir / "responses" / f"{stem}.jsonl"
+
+    def _grade(grader: str) -> list[dict[str, Any]]:
+        if grader == "rule":
+            return grade_records_rule(records)
+        return judge_records(
+            records, args, desc=f"judge {os.path.basename(str(source['name']).rstrip('/'))}"
+        )
+
+    def _emit_primary(judgments: list[dict[str, Any]]) -> None:
+        judgment_file = output_dir / "judgments" / f"{stem}.jsonl"
+        write_jsonl(judgment_file, judgments)
+        if source["kind"] == "benchmark":
+            result = score_benchmark(source["name"], response_file, judgment_file, output_dir)
+            result["benchmark"] = source["name"]
+            summary["benchmarks"].append(result)
+            print(
+                f"[{source['name']}] pass@k={result.get('pass_at_k')} "
+                f"avg@k={result.get('avg_at_k')}"
+            )
+        else:
+            scores = avg_at_k_fields(judgments)
+            scores.update(
+                {
+                    "dataset": source["name"],
+                    "split": source.get("split"),
+                    "safe_name": stem,
+                    "samples": len(judgments),
+                    "response_file": str(response_file),
+                    "judgment_file": str(judgment_file),
+                }
+            )
+            summary["datasets"].append(scores)
+            print(
+                f"[{source['name']}] pass@k={scores.get('pass_at_k')} "
+                f"avg@k={scores.get('avg_at_k')}"
+            )
+
+    if args.grader == "both":
+        judg_llm = _grade("llm")
+        judg_rule = _grade("rule")
+        _emit_primary(judg_llm)  # llm = primary (back-compat with existing summary)
+        write_jsonl(output_dir / "judgments_rule" / f"{stem}.jsonl", judg_rule)
+        entry = _compare_judgments(records, judg_llm, judg_rule, source, stem, output_dir)
+        summary.setdefault("comparison", []).append(entry)
+        print(
+            f"[{source['name']}] rule-vs-llm agreement={entry['agreement']:.3f} "
+            f"(llm {entry['llm_pass_at_k']:.3f} / rule {entry['rule_pass_at_k']:.3f}, "
+            f"{entry['n_disagree']} disagree)"
+        )
+    else:
+        _emit_primary(_grade(args.grader))
+
+
+def print_comparison_table(summary: dict[str, Any]) -> None:
+    rows = summary.get("comparison") or []
+    if not rows:
+        return
+    width = max([len(str(r["dataset"])) for r in rows] + [16])
+    print("\n=== rule vs LLM-judge (graded over the SAME generations) ===")
+    print(
+        f"{'dataset':<{width}} {'llm':>8} {'rule':>8} {'llm-rule':>9} "
+        f"{'agree':>7} {'disagree':>9}"
+    )
+    for r in rows:
+        print(
+            f"{str(r['dataset']):<{width}} "
+            f"{r['llm_pass_at_k']:>8.4f} {r['rule_pass_at_k']:>8.4f} "
+            f"{r['llm_pass_at_k'] - r['rule_pass_at_k']:>+9.4f} "
+            f"{r['agreement']:>7.4f} {r['n_disagree']:>9d}"
+        )
+
+
 def judge_existing_responses(args: argparse.Namespace, output_dir: Path) -> None:
     """Judge previously-saved responses/*.jsonl with NO generation / GPU.
 
@@ -418,40 +577,14 @@ def judge_existing_responses(args: argparse.Namespace, output_dir: Path) -> None
     for source in sources:
         stem = sanitize_dataset_name(source["stem"])
         response_file = output_dir / "responses" / f"{stem}.jsonl"
-        judgment_file = output_dir / "judgments" / f"{stem}.jsonl"
         records = read_jsonl(response_file)
         if not records:
             print(f"[{source['name']}] no responses at {response_file}; skipped")
             continue
+        print(f"[{source['name']}] judging {len(records)} saved responses")
+        grade_and_summarize(records, args, source, output_dir, summary)
 
-        if args.grader == "rule":
-            judgments = grade_records_rule(records)
-        else:
-            judgments = judge_records(
-                records, args, desc=f"judge {os.path.basename(str(source['name']).rstrip('/'))}"
-            )
-        write_jsonl(judgment_file, judgments)
-
-        if source["kind"] == "benchmark":
-            result = score_benchmark(source["name"], response_file, judgment_file, output_dir)
-            result["benchmark"] = source["name"]
-            summary["benchmarks"].append(result)
-            print(f"[{source['name']}] judged {len(records)} -> pass@k={result.get('pass_at_k')}")
-        else:
-            scores = avg_at_k_fields(read_jsonl(judgment_file))
-            scores.update(
-                {
-                    "dataset": source["name"],
-                    "split": source.get("split"),
-                    "safe_name": stem,
-                    "samples": len(records),
-                    "response_file": str(response_file),
-                    "judgment_file": str(judgment_file),
-                }
-            )
-            summary["datasets"].append(scores)
-            print(f"[{source['name']}] judged {len(records)} -> pass@k={scores.get('pass_at_k')}")
-
+    print_comparison_table(summary)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
@@ -521,7 +654,6 @@ def main() -> None:
     for source in sources:
         stem = sanitize_dataset_name(source["stem"])
         response_file = output_dir / "responses" / f"{stem}.jsonl"
-        judgment_file = output_dir / "judgments" / f"{stem}.jsonl"
 
         records = generate_records(
             engine, processor, sampling_params, source["samples"], args
@@ -532,40 +664,9 @@ def main() -> None:
         if args.skip_judge:
             continue
 
-        if args.grader == "rule":
-            judgments = grade_records_rule(records)
-        else:
-            judgments = judge_records(
-                records, args, desc=f"judge {os.path.basename(str(source['name']).rstrip('/'))}"
-            )
-        write_jsonl(judgment_file, judgments)
+        grade_and_summarize(records, args, source, output_dir, summary)
 
-        if source["kind"] == "benchmark":
-            result = score_benchmark(source["name"], response_file, judgment_file, output_dir)
-            result["benchmark"] = source["name"]
-            summary["benchmarks"].append(result)
-            print(
-                f"[{source['name']}] pass@k={result.get('pass_at_k')} "
-                f"avg@k={result.get('avg_at_k')}"
-            )
-        else:
-            scores = avg_at_k_fields(read_jsonl(judgment_file))
-            scores.update(
-                {
-                    "dataset": source["name"],
-                    "split": source.get("split"),
-                    "safe_name": stem,
-                    "samples": len(records),
-                    "response_file": str(response_file),
-                    "judgment_file": str(judgment_file),
-                }
-            )
-            summary["datasets"].append(scores)
-            print(
-                f"[{source['name']}] pass@k={scores.get('pass_at_k')} "
-                f"avg@k={scores.get('avg_at_k')}"
-            )
-
+    print_comparison_table(summary)
     (output_dir / "summary.json").write_text(
         json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )

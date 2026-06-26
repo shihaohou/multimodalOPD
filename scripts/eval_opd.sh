@@ -44,7 +44,9 @@ VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-}"
 VLLM_LIMIT_IMAGES="${VLLM_LIMIT_IMAGES:-16}"
 DTYPE="${DTYPE:-auto}"
 # Grading: llm = LLM judge (default, same as ViGOS); rule = mathruler + option/exact
-# match (no API, deterministic/reproducible).
+# match (no API, deterministic/reproducible); both = grade the SAME generations with
+# rule AND llm, then write a per-sample rule-vs-llm comparison (judgments_rule/,
+# comparison/, summary['comparison'] + a printed table). 'both' needs a judge key.
 GRADER="${GRADER:-llm}"
 SKIP_JUDGE="${SKIP_JUDGE:-false}"
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-v4-flash}"

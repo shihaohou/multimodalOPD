@@ -64,7 +64,7 @@ SAMPLED_TEMPERATURE="${SAMPLED_TEMPERATURE:-1.0}"
 SAMPLED_TOP_P="${SAMPLED_TOP_P:-0.9}"
 
 # Fail early with a helpful message if the judged group has no judge configured.
-if [[ "$GRADER" == "llm" && "$SKIP_JUDGE" != "true" ]]; then
+if [[ ( "$GRADER" == "llm" || "$GRADER" == "both" ) && "$SKIP_JUDGE" != "true" ]]; then
   if [[ -z "${!JUDGE_KEY_ENV:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
     echo "ERROR: the judged group needs an LLM judge API key in \$$JUDGE_KEY_ENV (or \$OPENAI_API_KEY)." >&2
     echo "  Point the harness at your 32B judge, e.g.:" >&2
