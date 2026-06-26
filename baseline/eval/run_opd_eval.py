@@ -90,6 +90,13 @@ def parse_args() -> argparse.Namespace:
         "rule = mathruler + option/exact match (no API, deterministic/reproducible).",
     )
     p.add_argument("--skip-judge", action="store_true")
+    p.add_argument(
+        "--judge-only",
+        action="store_true",
+        help="Skip generation entirely; judge existing responses/*.jsonl (NO GPU). Pair "
+        "with a prior --skip-judge run to decouple GPU rollout from the judge — one "
+        "controlled --judge-workers pool, not a per-GPU fan-out that swamps the judge.",
+    )
     p.add_argument("--judge-model", default="deepseek-v4-flash")
     p.add_argument("--judge-api-url", default="https://api.deepseek.com")
     p.add_argument("--judge-key-env", default="DEEPSEEK_API_KEY")
@@ -360,11 +367,88 @@ def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def judge_existing_responses(args: argparse.Namespace, output_dir: Path) -> None:
+    """Judge previously-saved responses/*.jsonl with NO generation / GPU.
+
+    Decouples the GPU-bound rollout from the network-bound judge: generate once on all
+    GPUs with --skip-judge, then judge here in a SINGLE process whose concurrency is
+    just --judge-workers (no per-GPU fan-out multiplying it), so the judge can't be
+    swamped. Reads the same --datasets/--benchmarks to know which response stems to score.
+    """
+    sources: list[dict[str, Any]] = []
+    for spec in parse_dataset_specs(args.datasets, args.default_split):
+        sources.append(
+            {"kind": "dataset", "name": spec.path, "stem": spec.safe_name, "split": spec.split}
+        )
+    for task in load_benchmark_tasks(args.benchmarks) if args.benchmarks.strip() else []:
+        sources.append(
+            {"kind": "benchmark", "name": task.name, "stem": task.response_stem, "source": task.source}
+        )
+
+    summary: dict[str, Any] = {
+        "model_path": args.model_path,
+        "model_name": args.model_name
+        or os.path.basename(str(args.model_path or "").rstrip("/"))
+        or "model",
+        "output_dir": str(output_dir),
+        "pass_k": max(1, args.pass_k),
+        "grader": args.grader,
+        "prompt": GENERAL_PROMPT_DESCRIPTION,
+        "judge_only": True,
+        "datasets": [],
+        "benchmarks": [],
+    }
+
+    for source in sources:
+        stem = sanitize_dataset_name(source["stem"])
+        response_file = output_dir / "responses" / f"{stem}.jsonl"
+        judgment_file = output_dir / "judgments" / f"{stem}.jsonl"
+        records = read_jsonl(response_file)
+        if not records:
+            print(f"[{source['name']}] no responses at {response_file}; skipped")
+            continue
+
+        if args.grader == "rule":
+            judgments = grade_records_rule(records)
+        else:
+            judgments = judge_records(records, args)
+        write_jsonl(judgment_file, judgments)
+
+        if source["kind"] == "benchmark":
+            result = score_benchmark(source["name"], response_file, judgment_file, output_dir)
+            result["benchmark"] = source["name"]
+            summary["benchmarks"].append(result)
+            print(f"[{source['name']}] judged {len(records)} -> pass@k={result.get('pass_at_k')}")
+        else:
+            scores = avg_at_k_fields(read_jsonl(judgment_file))
+            scores.update(
+                {
+                    "dataset": source["name"],
+                    "split": source.get("split"),
+                    "safe_name": stem,
+                    "samples": len(records),
+                    "response_file": str(response_file),
+                    "judgment_file": str(judgment_file),
+                }
+            )
+            summary["datasets"].append(scores)
+            print(f"[{source['name']}] judged {len(records)} -> pass@k={scores.get('pass_at_k')}")
+
+    (output_dir / "summary.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    print(f"Wrote {output_dir / 'summary.json'}")
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     (output_dir / "responses").mkdir(parents=True, exist_ok=True)
     (output_dir / "judgments").mkdir(parents=True, exist_ok=True)
+
+    if args.judge_only:
+        judge_existing_responses(args, output_dir)
+        return
 
     from transformers import AutoProcessor
 
