@@ -165,8 +165,11 @@ fi
 DATASET_TAG="$(basename "${DATASET_NAME%/}")"
 DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
 # Date-stamp RUN_CONFIG (and thus the derived OUTPUT_DIR + wandb run_name) so
-# re-runs never overwrite. Appended even to a user-supplied RUN_CONFIG.
-RUN_CONFIG="${RUN_CONFIG:-opd_${DATASET_TAG}_gen${MAX_COMPLETION_LENGTH}_mb${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_np${NUM_PROCESSES}}_${RUN_ID}"
+# re-runs never overwrite. Appended even to a user-supplied RUN_CONFIG. Kept short
+# (method + dataset + date): the entry point already appends _lr<lr>_bs<eff> to the
+# wandb run_name, so batch/gen knobs would just be noise here. Set RUN_CONFIG
+# explicitly to tag a non-default gen length / batch when you actually vary them.
+RUN_CONFIG="${RUN_CONFIG:-opd_${DATASET_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
