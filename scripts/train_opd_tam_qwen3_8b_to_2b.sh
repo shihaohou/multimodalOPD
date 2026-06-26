@@ -215,7 +215,12 @@ GATE_TAG=$([[ "$TAM_GATE" == "true" ]] && echo "" || echo "_nogate")
 # default 'hard') so hard-RGF / gaussian-grad / detach_sigma runs are distinct.
 GRAD_TAG=""
 [[ "$TAM_DENOISE" == "rgf" && "$TAM_RGF_GRAD" != "hard" ]] && GRAD_TAG="_${TAM_RGF_GRAD}grad"
-RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GRAD_TAG}${GATE_TAG}_${VIT_TAG}}_${RUN_ID}"
+# Dataset basename into RUN_CONFIG (-> output dir AND wandb run_name) so runs on
+# different training sets (Vision-SR1-47K vs ViRL39K vs ...) never collide.
+# Sanitized to [A-Za-z0-9._-] for path/wandb safety.
+DATASET_TAG="$(basename "${DATASET_NAME%/}")"
+DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
+RUN_CONFIG="${RUN_CONFIG:-opd_tam_qwen3_8b_to_2b_${DATASET_TAG}_ltam${LAMBDA_TAM}_${TAM_DIVERGENCE}_${TAM_DENOISE}${GRAD_TAG}${GATE_TAG}_${VIT_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \

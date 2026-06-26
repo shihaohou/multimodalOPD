@@ -159,9 +159,14 @@ if [[ -n "$VLLM_SERVER_REQUEST_BATCH_SIZE" ]]; then
   VLLM_SERVER_ARGS+=(--vllm_server_request_batch_size "$VLLM_SERVER_REQUEST_BATCH_SIZE")
 fi
 
+# Dataset basename into RUN_CONFIG (-> output dir AND wandb run_name) so runs on
+# different training sets (Vision-SR1-47K vs ViRL39K vs ...) never collide.
+# Sanitized to [A-Za-z0-9._-] for path/wandb safety.
+DATASET_TAG="$(basename "${DATASET_NAME%/}")"
+DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
 # Date-stamp RUN_CONFIG (and thus the derived OUTPUT_DIR + wandb run_name) so
 # re-runs never overwrite. Appended even to a user-supplied RUN_CONFIG.
-RUN_CONFIG="${RUN_CONFIG:-opd_gen${MAX_COMPLETION_LENGTH}_mb${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_np${NUM_PROCESSES}}_${RUN_ID}"
+RUN_CONFIG="${RUN_CONFIG:-opd_${DATASET_TAG}_gen${MAX_COMPLETION_LENGTH}_mb${PER_DEVICE_TRAIN_BATCH_SIZE}_ga${GRADIENT_ACCUMULATION_STEPS}_np${NUM_PROCESSES}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
