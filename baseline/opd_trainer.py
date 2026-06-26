@@ -410,9 +410,15 @@ class OPDTrainer(ViGOSTrainer):
         records = []
         for row_idx in range(batch_size):
             valid_length = int(completion_attention[row_idx].sum().item())
+            # skip_special_tokens=False on purpose: Qwen3 registers <think>/</think>
+            # as single special tokens, so skipping them would strip the exact format
+            # markers we want to inspect (does the student emit <think>...</think> +
+            # \boxed{}?). Slicing to valid_length keeps only attended tokens, so no
+            # pad leaks in; a trailing <|im_end|>/EOS stays visible (signals a clean
+            # stop vs a length-truncated rollout).
             completion_text = self._decode_token_ids(
                 completion_ids[row_idx, :valid_length],
-                skip_special_tokens=True,
+                skip_special_tokens=False,
             )
             answer_correct = self._answers_match(
                 extract_boxed_content(completion_text),
