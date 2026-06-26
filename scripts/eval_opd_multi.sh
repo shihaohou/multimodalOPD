@@ -3,12 +3,22 @@ set -euo pipefail
 
 # Multi-model x multi-dataset fan-out over N GPUs for the general OPD eval.
 #
-# Each (model, dataset) pair is ONE `scripts/eval_opd.sh` run pinned to ONE GPU;
-# up to NGPU run concurrently (a free-card scheduler keeps every card busy). This
-# saturates an 8-GPU box far better than running one job per model. eval_opd.sh is
-# reused verbatim, so the LLM judge / pass@k / generation knobs are its usual env
-# vars (JUDGE_API_URL, JUDGE_MODEL, JUDGE_KEY_ENV / OPENAI_API_KEY, PASS_K,
+# Each (model, dataset) pair is ONE `scripts/eval_opd.sh` run. eval_opd.sh is reused
+# verbatim, so the LLM judge / pass@k / generation knobs are its usual env vars
+# (JUDGE_API_URL, JUDGE_MODEL, JUDGE_KEY_ENV / OPENAI_API_KEY, PASS_K,
 # GEN_TEMPERATURE, ...) and are inherited by every job.
+#
+# PHASE (default 'all') splits generation from judging so you can saturate the GPUs
+# first and stand up a judge model only afterwards:
+#   PHASE=generate : sample + SAVE responses only (SKIP_JUDGE), one job pinned per
+#                    GPU, up to NGPU concurrent (free-card scheduler keeps every card
+#                    busy). NO judge needed. Multiple ckpts in MODELS just add jobs to
+#                    the queue -> as a card frees it picks up the next (ckpt,dataset).
+#   PHASE=judge    : judge the SAVED responses (JUDGE_ONLY, no GPU), ONE benchmark at
+#                    a time (each call already drives JUDGE_WORKERS concurrent requests)
+#                    so the log says exactly which benchmark is judging and a single
+#                    controlled pool can't swamp the judge. Reuse the SAME OUTPUT_ROOT.
+#   PHASE=all      : generate + judge inline per job (the original behavior).
 #
 # Required:
 #   MODELS="tag1=path1;tag2=path2;..."   (tag becomes MODEL_NAME + output subdir)
@@ -17,10 +27,24 @@ set -euo pipefail
 #   DATASET_DIRS="/abs/d1,/abs/d2,..."            (explicit full paths)
 # Optional: NGPU (8), GPUS="0,1,2,..." (overrides NGPU), OUTPUT_ROOT, RUN_ID, DRYRUN=1.
 #
-# Example (3 models, Acc@1 greedy, all 8 cards):
+# Two-phase example (saturate 8 cards, then judge with a model you deploy later):
+#   # 1) generate everything across all 8 GPUs (multiple ckpts run back-to-back):
+#   OUTPUT_ROOT=eval_outputs/bench_myrun PHASE=generate NGPU=8 \
+#   MODELS="ckptA=runs/a/checkpoint-100;ckptB=runs/b/checkpoint-100" \
+#   DSROOT=$D/zli12321 DATASETS="mathvista mathverse MMMU mmmu_pro_10options mmstar hallusionbench" \
+#   PASS_K=1 GEN_TEMPERATURE=0 bash scripts/eval_opd_multi.sh
+#   # 2) ...deploy your judge on the 8 GPUs (OpenAI-compatible server)...
+#   # 3) judge the saved responses (SAME OUTPUT_ROOT/MODELS/DATASETS), clean per-bench log:
+#   OUTPUT_ROOT=eval_outputs/bench_myrun PHASE=judge \
+#   JUDGE_API_URL=http://127.0.0.1:8000/v1 JUDGE_MODEL=<served> OPENAI_API_KEY=x \
+#   MODELS="ckptA=runs/a/checkpoint-100;ckptB=runs/b/checkpoint-100" \
+#   DSROOT=$D/zli12321 DATASETS="mathvista mathverse MMMU mmmu_pro_10options mmstar hallusionbench" \
+#   bash scripts/eval_opd_multi.sh
+#
+# One-shot example (generate + judge inline, all 8 cards):
 #   export JUDGE_API_URL=... JUDGE_MODEL=... OPENAI_API_KEY=...
-#   MODELS="before=$M/Qwen3-VL-2B-Instruct;after=runs/opd_qwen3_8b_to_2b/checkpoint-65;teacher=$M/Qwen3-VL-8B-Instruct" \
-#   DSROOT=$D/zli12321 DATASETS="mm-vet MMMU mmmu_pro_10options mmmu-pro-vision mathvista mathverse MMSI realWorldQA" \
+#   MODELS="before=$M/Qwen3-VL-2B-Instruct;after=runs/opd_qwen3_8b_to_2b/checkpoint-65" \
+#   DSROOT=$D/zli12321 DATASETS="mm-vet MMMU mathvista mathverse MMSI realWorldQA" \
 #   PASS_K=1 GEN_TEMPERATURE=0 NGPU=8 bash scripts/eval_opd_multi.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -38,6 +62,31 @@ NGPU=${#CARDS[@]}
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-eval_outputs/bench_${RUN_ID}}"
 DRYRUN="${DRYRUN:-0}"
+PHASE="${PHASE:-all}"   # generate | judge | all
+
+case "$PHASE" in
+  generate|judge|all) ;;
+  *) echo "ERROR: PHASE must be generate|judge|all (got '$PHASE')." >&2; exit 1 ;;
+esac
+
+# The judge phase reads what the generate phase saved -> it MUST reuse the same dir.
+# OUTPUT_ROOT defaults to a fresh timestamp, so pin it (or RUN_ID) across both phases.
+if [[ "$PHASE" == "judge" && ! -d "$OUTPUT_ROOT" ]]; then
+  echo "ERROR: PHASE=judge needs the responses from a prior PHASE=generate run, but" >&2
+  echo "  OUTPUT_ROOT='$OUTPUT_ROOT' does not exist. Set OUTPUT_ROOT (or RUN_ID) to the" >&2
+  echo "  directory your generate phase printed." >&2
+  exit 1
+fi
+
+# Fail early if the judging phases have no judge configured (unless rule-grading).
+if [[ "$PHASE" != "generate" && "${GRADER:-llm}" != "rule" ]]; then
+  JUDGE_KEY_ENV="${JUDGE_KEY_ENV:-DEEPSEEK_API_KEY}"
+  if [[ -z "${!JUDGE_KEY_ENV:-}" && -z "${OPENAI_API_KEY:-}" ]]; then
+    echo "ERROR: PHASE=$PHASE needs an LLM judge key in \$$JUDGE_KEY_ENV or \$OPENAI_API_KEY" >&2
+    echo "  (point JUDGE_API_URL/JUDGE_MODEL at your deployed judge), or rule-grade with GRADER=rule." >&2
+    exit 1
+  fi
+fi
 
 # ---- dataset dir list ----
 DATASET_LIST=()
@@ -75,44 +124,82 @@ run_job() {  # card tag model ddir
   local safe out
   safe="$(basename "$ddir" | tr -c 'A-Za-z0-9_.-' '_')"
   out="$OUTPUT_ROOT/$tag/$safe"
-  CUDA_VISIBLE_DEVICES="$card" MODEL_PATH="$model" MODEL_NAME="$tag" \
-    EVAL_DATASETS="$ddir" OUTPUT_DIR="$out" \
-    bash scripts/eval_opd.sh > "$OUTPUT_ROOT/logs/${tag}_${safe}.log" 2>&1
+  local -a job_env=(MODEL_PATH="$model" MODEL_NAME="$tag" EVAL_DATASETS="$ddir" OUTPUT_DIR="$out")
+  case "$PHASE" in
+    generate) job_env+=(CUDA_VISIBLE_DEVICES="$card" SKIP_JUDGE=true) ;;
+    judge)    job_env+=(JUDGE_ONLY=true) ;;               # no GPU; judge server is remote
+    *)        job_env+=(CUDA_VISIBLE_DEVICES="$card") ;;  # all: generate + judge inline
+  esac
+  env "${job_env[@]}" bash scripts/eval_opd.sh > "$OUTPUT_ROOT/logs/${PHASE}_${tag}_${safe}.log" 2>&1
 }
 
 if [[ "$DRYRUN" == "1" ]]; then
-  echo "--- DRYRUN: planned jobs (card shown is indicative round-robin) ---"
+  echo "--- DRYRUN: PHASE=$PHASE planned jobs ---"
   i=0
   for spec in "${SPECS[@]}"; do
     IFS='|' read -r tag model ddir <<< "$spec"
-    echo "card ${CARDS[$((i % NGPU))]} | ${tag} | $(basename "$ddir") | $model"
+    if [[ "$PHASE" == "judge" ]]; then
+      echo "judge (no GPU) | ${tag} | $(basename "$ddir") | $model"
+    else
+      echo "card ${CARDS[$((i % NGPU))]} | ${tag} | $(basename "$ddir") | $model"
+    fi
     i=$((i + 1))
   done
   exit 0
 fi
 
-# ---- scheduler: <=NGPU concurrent, one job pinned per free card ----
-declare -A SLOT  # SLOT[card]=pid of the job currently on that card
-for spec in "${SPECS[@]}"; do
-  card=""
-  while [[ -z "$card" ]]; do
-    for c in "${CARDS[@]}"; do
-      pid="${SLOT[$c]:-}"
-      if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
-        card="$c"
-        break
-      fi
-    done
-    # All cards busy: block until any job exits (tolerate its exit code).
-    [[ -z "$card" ]] && { wait -n 2>/dev/null || sleep 3; }
+if [[ "$PHASE" == "judge" ]]; then
+  # ---- judge phase: network-bound, run ONE benchmark at a time (readable log) ----
+  i=0
+  for spec in "${SPECS[@]}"; do
+    IFS='|' read -r tag model ddir <<< "$spec"
+    i=$((i + 1))
+    echo "[judge ${i}/${#SPECS[@]}] ${tag} | $(basename "$ddir")"
+    run_job "" "$tag" "$model" "$ddir" || echo "  (job exited non-zero; see log)"
   done
-  IFS='|' read -r tag model ddir <<< "$spec"
-  echo "[launch] card ${card} | ${tag} | $(basename "$ddir")"
-  run_job "$card" "$tag" "$model" "$ddir" &
-  SLOT[$card]=$!
-done
-wait
-echo "All ${#SPECS[@]} jobs finished. Logs in ${OUTPUT_ROOT}/logs/"
+  echo "All ${#SPECS[@]} judge jobs finished. Logs in ${OUTPUT_ROOT}/logs/"
+else
+  # ---- generate / all: <=NGPU concurrent, one job pinned per free card ----
+  declare -A SLOT  # SLOT[card]=pid of the job currently on that card
+  for spec in "${SPECS[@]}"; do
+    card=""
+    while [[ -z "$card" ]]; do
+      for c in "${CARDS[@]}"; do
+        pid="${SLOT[$c]:-}"
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+          card="$c"
+          break
+        fi
+      done
+      # All cards busy: block until any job exits (tolerate its exit code).
+      [[ -z "$card" ]] && { wait -n 2>/dev/null || sleep 3; }
+    done
+    IFS='|' read -r tag model ddir <<< "$spec"
+    echo "[launch] card ${card} | ${tag} | $(basename "$ddir")"
+    run_job "$card" "$tag" "$model" "$ddir" &
+    SLOT[$card]=$!
+  done
+  wait
+  echo "All ${#SPECS[@]} jobs finished. Logs in ${OUTPUT_ROOT}/logs/"
+fi
+
+# Generate phase saves responses only (no scores yet) -> skip aggregation, print the
+# exact judge-phase command to run once a judge is deployed.
+if [[ "$PHASE" == "generate" ]]; then
+  echo
+  echo "Phase 1 (generate) complete -> responses under ${OUTPUT_ROOT}/<tag>/<dataset>/responses/"
+  echo "Deploy your judge, then judge with the SAME output root:"
+  echo "  OUTPUT_ROOT=${OUTPUT_ROOT} PHASE=judge \\"
+  echo "  JUDGE_API_URL=<url> JUDGE_MODEL=<served> OPENAI_API_KEY=<key> \\"
+  echo "  MODELS='${MODELS}' \\"
+  if [[ -n "${DATASET_DIRS:-}" ]]; then
+    echo "  DATASET_DIRS='${DATASET_DIRS}' \\"
+  else
+    echo "  DSROOT='${DSROOT}' DATASETS='${DATASETS}' \\"
+  fi
+  echo "  bash scripts/eval_opd_multi.sh"
+  exit 0
+fi
 
 # ---- aggregate per (tag x dataset) into a comparison matrix (stdlib only) ----
 python3 - "$OUTPUT_ROOT" <<'PY' || echo "(aggregation skipped; read $OUTPUT_ROOT/*/*/summary.json)"

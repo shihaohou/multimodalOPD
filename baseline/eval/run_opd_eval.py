@@ -338,17 +338,22 @@ def judge_records(
             "benchmark_meta": record.get("benchmark_meta"),
         }
 
-    try:
-        from tqdm import tqdm
-    except ImportError:  # progress bar is optional
-        def tqdm(iterable, **_kwargs):
-            return iterable
-
+    # No progress bar (a tqdm bar redraws thousands of lines into a saved log and is
+    # unreadable after the fact). Print one start + one done line per benchmark
+    # instead, so a tailed log shows exactly which source is being judged.
+    workers = max(1, args.judge_workers)
+    print(f"[{desc}] judging {len(records)} responses with {workers} workers ...", flush=True)
     results: list[dict[str, Any]] = [{} for _ in records]
-    with ThreadPoolExecutor(max_workers=max(1, args.judge_workers)) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(judge_one, record): index for index, record in enumerate(records)}
-        for future in tqdm(as_completed(futures), total=len(records), desc=desc, unit="q"):
+        for future in as_completed(futures):
             results[futures[future]] = future.result()
+    n_err = sum(1 for r in results if r.get("judge_error"))
+    print(
+        f"[{desc}] judged {len(records)} responses"
+        + (f" ({n_err} errored)" if n_err else ""),
+        flush=True,
+    )
     return results
 
 

@@ -49,6 +49,10 @@ DTYPE="${DTYPE:-auto}"
 # comparison/, summary['comparison'] + a printed table). 'both' needs a judge key.
 GRADER="${GRADER:-llm}"
 SKIP_JUDGE="${SKIP_JUDGE:-false}"
+# Two-phase eval: SKIP_JUDGE=true generates + saves responses/ only (no judge, GPU
+# phase); JUDGE_ONLY=true skips generation entirely and judges the responses/ already
+# in OUTPUT_DIR (no GPU — point this at a prior SKIP_JUDGE run once a judge is up).
+JUDGE_ONLY="${JUDGE_ONLY:-false}"
 JUDGE_MODEL="${JUDGE_MODEL:-deepseek-v4-flash}"
 JUDGE_API_URL="${JUDGE_API_URL:-https://api.deepseek.com}"
 JUDGE_KEY_ENV="${JUDGE_KEY_ENV:-DEEPSEEK_API_KEY}"
@@ -101,6 +105,9 @@ if [[ -n "$VLLM_MAX_MODEL_LEN" ]]; then
 fi
 if [[ "$SKIP_JUDGE" == "true" ]]; then
   CMD+=(--skip-judge)
+fi
+if [[ "$JUDGE_ONLY" == "true" ]]; then
+  CMD+=(--judge-only)
 fi
 
 "${CMD[@]}"
