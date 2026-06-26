@@ -48,7 +48,9 @@ set -euo pipefail
 #       to eval_vqa.sh regardless of DSROOT.
 #   DATASET_DIRS="/abs/d1,/abs/d2,..."   explicit JUDGED dirs only (no det routing).
 # Optional: NGPU (8), GPUS="0,1,2,..." (overrides NGPU), OUTPUT_ROOT, RUN_ID, DRYRUN=1,
-#   RESUME=1 (rerun the same command -> only the failed/missing jobs are redone).
+#   RESUME=1 (rerun the same command -> only the failed/missing jobs are redone),
+#   LAUNCH_STAGGER=30 (seconds between job launches; spreads the CPU-bound image
+#   preprocessing so 8 jobs don't thrash the CPU while the GPUs idle).
 #
 # Two-phase example (saturate 8 cards on everything, judge with a model you deploy later):
 #   # 1) generate judged + fully score the deterministic group, across all 8 GPUs:
@@ -92,6 +94,11 @@ case "$(printf '%s' "${RESUME:-}" | tr '[:upper:]' '[:lower:]')" in
   1|true|yes|on) RESUME=true ;;
   *) RESUME=false ;;
 esac
+# Seconds to wait between launching jobs. The per-dataset "Adding requests" phase is
+# CPU-bound (VL image preprocessing); launching all NGPU jobs at once makes them
+# thrash the CPU while the GPUs idle. A stagger (e.g. 20-40) offsets their CPU-heavy
+# phases against each other's GPU-heavy phases -> better CPU/GPU overlap. 0 = off.
+LAUNCH_STAGGER="${LAUNCH_STAGGER:-0}"
 
 # Default benchmark set (override DATASETS to run a subset). Judged group + the three
 # deterministic benchmarks (matched by name and routed to eval_vqa.sh).
@@ -306,6 +313,8 @@ else
     echo "[launch] card ${card} | ${tag} | $(spec_label "$kind" "$tag" "$payload")"
     run_job "$kind" "$card" "$tag" "$model" "$payload" &
     SLOT[$card]=$!
+    # Offset the next job's CPU-heavy preprocessing from this one's (better CPU/GPU overlap).
+    [[ "$LAUNCH_STAGGER" != "0" ]] && sleep "$LAUNCH_STAGGER"
   done
   wait
   echo "All ${#SPECS[@]} jobs finished. Per-job log: <id>/<dataset>/${PHASE}.log under ${OUTPUT_ROOT}/"
