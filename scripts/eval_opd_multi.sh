@@ -51,8 +51,8 @@ set -euo pipefail
 #   RESUME=1 (rerun the same command -> only the failed/missing jobs are redone),
 #   LAUNCH_STAGGER=30 (seconds between job launches; spreads the CPU-bound image
 #   preprocessing so 8 jobs don't thrash the CPU while the GPUs idle),
-#   DET_SPLIT=1 (run pope/chartqa/vqav2 as 3 separate scheduler jobs -> 3 cards,
-#   instead of one job doing all three on a single card).
+#   DET_SPLIT (default ON: pope/chartqa/vqav2 run as 3 separate scheduler jobs -> 3
+#   cards; set DET_SPLIT=0 to pack all three onto one card with a single model load).
 #
 # Two-phase example (saturate 8 cards on everything, judge with a model you deploy later):
 #   # 1) generate judged + fully score the deterministic group, across all 8 GPUs:
@@ -101,13 +101,13 @@ esac
 # thrash the CPU while the GPUs idle. A stagger (e.g. 20-40) offsets their CPU-heavy
 # phases against each other's GPU-heavy phases -> better CPU/GPU overlap. 0 = off.
 LAUNCH_STAGGER="${LAUNCH_STAGGER:-0}"
-# DET_SPLIT -> run each deterministic benchmark (pope/chartqa/vqav2) as its OWN job
-# (its own card via the scheduler), instead of one job per ckpt that runs all three in
-# turn on a single card. More parallelism (uses spare cards) at the cost of reloading
-# the model once per benchmark. Accept 1/true/yes/on.
-case "$(printf '%s' "${DET_SPLIT:-}" | tr '[:upper:]' '[:lower:]')" in
-  1|true|yes|on) DET_SPLIT=true ;;
-  *) DET_SPLIT=false ;;
+# DET_SPLIT (DEFAULT on) -> run each deterministic benchmark (pope/chartqa/vqav2) as
+# its OWN job (its own card via the scheduler), so they fan out across free cards
+# instead of one job per ckpt running all three in turn on a single card. Costs one
+# model reload per benchmark. Opt out with DET_SPLIT=0 to pack all three onto one card.
+case "$(printf '%s' "${DET_SPLIT:-1}" | tr '[:upper:]' '[:lower:]')" in
+  0|false|no|off) DET_SPLIT=false ;;
+  *) DET_SPLIT=true ;;
 esac
 
 # Default benchmark set (override DATASETS to run a subset). Judged group + the three
