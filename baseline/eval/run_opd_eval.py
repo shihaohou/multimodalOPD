@@ -180,6 +180,10 @@ def make_engine(args: argparse.Namespace):
     )
     if args.max_model_len is not None:
         kwargs["max_model_len"] = args.max_model_len
+    # Escape hatch for models that crash vLLM's CUDA-graph/torch.compile path with an
+    # "illegal memory access" (seen on some finetuned Qwen3-VL checkpoints): run eager.
+    if os.environ.get("VLLM_ENFORCE_EAGER", "").strip().lower() in {"1", "true", "yes"}:
+        kwargs["enforce_eager"] = True
     return LLM(**kwargs)
 
 
