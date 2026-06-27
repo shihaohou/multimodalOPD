@@ -32,12 +32,15 @@ from transformers import AutoProcessor, HfArgumentParser, TrainingArguments, set
 import vigos.dataset_utils as dataset_utils
 from baseline.evidence.opd_evidence_trainer import OPDEvidenceTrainer
 from baseline.opd_data_collator import OPDDataCollator
-from baseline.train_opd import OPDScriptArguments, _OPDWandBConfigCallback
+from baseline.train_opd import (
+    OPDScriptArguments,
+    _OPDWandBConfigCallback,
+    _opd_model_class_for_checkpoint,
+)
 from vigos.train_vigos import (
     DEFAULT_LEARNING_RATE,
     _cli_arg_was_provided,
     _dtype,
-    _model_class_for_checkpoint,
     _reporting_to_wandb,
 )
 
@@ -175,7 +178,7 @@ def main() -> None:
                 )
 
     # --- Student ----------------------------------------------------------------
-    model_class, _ = _model_class_for_checkpoint(
+    model_class, _ = _opd_model_class_for_checkpoint(
         script_args.model_name_or_path, trust_remote_code=script_args.trust_remote_code
     )
     model = model_class.from_pretrained(
@@ -214,7 +217,7 @@ def main() -> None:
         raise ValueError(f"Unknown finetuning_mode {script_args.finetuning_mode!r}.")
 
     # --- Teacher (local_hf, frozen) --------------------------------------------
-    teacher_class, _ = _model_class_for_checkpoint(
+    teacher_class, _ = _opd_model_class_for_checkpoint(
         script_args.teacher_model_name_or_path,
         trust_remote_code=script_args.trust_remote_code,
     )

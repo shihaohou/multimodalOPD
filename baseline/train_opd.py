@@ -30,8 +30,11 @@ if __package__ is None or __package__ == "":
 import torch
 from peft import LoraConfig, TaskType, get_peft_model
 from transformers import (
+    AutoConfig,
     AutoProcessor,
     HfArgumentParser,
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
     TrainerCallback,
     TrainingArguments,
     set_seed,
@@ -49,6 +52,36 @@ from vigos.train_vigos import (
 )
 
 from baseline.opd_dataset import load_opd_dataset
+
+
+def _opd_model_class_for_checkpoint(
+    model_name_or_path: str,
+    trust_remote_code: bool = True,
+):
+    """Resolve the VL model class, tolerating a ``*_text`` top-level ``model_type``.
+
+    ``vigos._model_class_for_checkpoint`` only accepts the full VL model_type
+    (``qwen2_5_vl`` / ``qwen3_vl``). Some checkpoints report the **text sub-config's**
+    type at the top level instead — e.g. ``Saliency-R1-7B`` (and ms-swift / re-saved
+    merges) come up as ``qwen2_5_vl_text`` — even though the checkpoint is still a
+    full VL model (vision tower included). Strip a trailing ``_text`` and resolve by
+    family; the concrete class's ``from_pretrained`` then parses the *full*
+    config.json (vision_config and all) via its own ``config_class``, so the
+    mislabeled ``model_type`` string is cosmetic. Unknown types defer to the strict
+    vigos resolver so its error message/contract is preserved.
+
+    (Lives in the OPD layer so ``vigos/`` stays untouched.)
+    """
+    config = AutoConfig.from_pretrained(
+        model_name_or_path, trust_remote_code=trust_remote_code
+    )
+    model_type = getattr(config, "model_type", "") or ""
+    base = model_type[: -len("_text")] if model_type.endswith("_text") else model_type
+    if base == "qwen2_5_vl":
+        return Qwen2_5_VLForConditionalGeneration, model_type
+    if base == "qwen3_vl":
+        return Qwen3VLForConditionalGeneration, model_type
+    return _model_class_for_checkpoint(model_name_or_path, trust_remote_code)
 
 # ViRL39K-aware loader (local parquet -> problem/image/answer); falls through to
 # vigos.dataset_utils.load_vigos_dataset for HuggingFace ids / canonical datasets.
@@ -275,7 +308,7 @@ def main() -> None:
         "attn_implementation": script_args.attn_implementation,
         "dtype": _dtype(script_args.torch_dtype),
     }
-    model_class, model_type = _model_class_for_checkpoint(
+    model_class, model_type = _opd_model_class_for_checkpoint(
         script_args.model_name_or_path,
         trust_remote_code=script_args.trust_remote_code,
     )
@@ -345,7 +378,7 @@ def main() -> None:
     teacher_model = None
     teacher_client = None
     if script_args.teacher_source == "local_hf":
-        teacher_class, teacher_type = _model_class_for_checkpoint(
+        teacher_class, teacher_type = _opd_model_class_for_checkpoint(
             script_args.teacher_model_name_or_path,
             trust_remote_code=script_args.trust_remote_code,
         )
