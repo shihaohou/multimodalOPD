@@ -64,7 +64,7 @@ _CONFIG_KEYS = (
     "dataset", "split", "subsets", "limit", "max_bbox_area", "schemes", "coord_mode",
     "bbox_hint", "draw_color", "draw_width", "system_prompt", "prompt_suffix",
     "max_new_tokens", "do_sample", "temperature", "top_p", "top_k", "seed",
-    "dtype", "gpu_mem_util", "limit_images", "grader",
+    "dtype", "gpu_mem_util", "limit_images", "grader", "batch_size", "max_image_side",
 )
 
 
@@ -112,6 +112,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dtype", default="bfloat16")
     p.add_argument("--gpu-mem-util", type=float, default=0.90)
     p.add_argument("--limit-images", type=int, default=4)
+    # streaming / memory safety (prevents host-RAM blow-up on the full dataset)
+    p.add_argument("--batch-size", type=int, default=64,
+                   help="Samples decoded+generated per chunk. Bounds host RAM; raise for throughput.")
+    p.add_argument("--max-image-side", type=int, default=1536,
+                   help="Downscale any image whose longest side exceeds this (0 = off). Qwen-VL "
+                   "smart-resizes anyway, so this mainly caps RAM/preproc on huge DocVQA scans.")
     # grading
     p.add_argument("--grader", default="rule", choices=["rule", "llm"],
                    help="rule = mathruler+exact (no API); llm = DeepSeek judge ($DEEPSEEK_API_KEY).")
@@ -160,21 +166,20 @@ def format_coords(bbox_norm, image_size, mode: str) -> tuple[str, str]:
     return f"[{pts[0]}, {pts[1]}, {pts[2]}, {pts[3]}]", note
 
 
-def build_scheme(sample, scheme: str, args):
-    """(problem_text, image) for a scheme. plain/bbox keep the original image; draw
-    burns the GT box into the image and leaves the question unchanged."""
+def build_scheme_item(problem: str, bbox_norm, image, scheme: str, args):
+    """(problem_text, image) for a scheme, given an already-decoded image. plain/bbox
+    keep the image; draw burns the GT box into a copy and keeps the question."""
     from PIL import ImageDraw
 
-    problem, image = sample.problem, sample.image
     if scheme == "plain":
         return problem, image
     if scheme == "bbox":
-        coords, note = format_coords(sample.bbox_norm, image.size, args.coord_mode)
+        coords, note = format_coords(bbox_norm, image.size, args.coord_mode)
         return f"{problem}\n{args.bbox_hint.format(coords=coords, note=note)}", image
     if scheme == "draw":
         img = image.convert("RGB").copy()
         w, h = img.size
-        x1, y1, x2, y2 = sample.bbox_norm
+        x1, y1, x2, y2 = bbox_norm
         ImageDraw.Draw(img).rectangle(
             [x1 * w, y1 * h, x2 * w, y2 * h], outline=args.draw_color, width=args.draw_width
         )
@@ -182,10 +187,68 @@ def build_scheme(sample, scheme: str, args):
     raise ValueError(f"unknown scheme {scheme!r}")
 
 
+def build_index(args):
+    """Lazily build the sample list WITHOUT decoding any image (filter on text/bbox
+    columns only), so host RAM does not scale with dataset size. Returns
+    ``(data, image_column, kept, counts)`` where ``data`` still decodes images on
+    demand (``data[row][image_column]``) one chunk at a time during generation."""
+    from baseline.probe.saliency_data import _load_hf_split, bbox_area, parse_bbox_norm
+
+    data = _load_hf_split(args.dataset, args.split)
+    cols = list(data.column_names)
+    image_column = "image" if "image" in cols else ("images" if "images" in cols else None)
+    text_cols = [c for c in cols if c != image_column]
+    meta = data.select_columns(text_cols)  # arrow view; no image bytes materialized
+    n = len(meta)
+
+    def col(name, default=None):
+        return meta[name] if name in text_cols else [default] * n
+
+    subsets_col, problems_col = col("dataset", "unknown"), col("problem", "")
+    solutions_col, bboxes_col, ids_col = col("solution", ""), col("bbox"), col("question_id")
+    subset_filter = {s.strip().lower() for s in args.subsets.split(",")} if args.subsets else None
+    limit = None if (args.limit is not None and args.limit < 0) else args.limit
+
+    kept: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for i in range(n):
+        subset = str(subsets_col[i] or "").strip() or "unknown"
+        if subset_filter is not None and subset.lower() not in subset_filter:
+            continue
+        if limit is not None and counts.get(subset, 0) >= limit:
+            continue
+        bbox = parse_bbox_norm(bboxes_col[i])
+        if bbox is None:
+            continue
+        if args.max_bbox_area is not None and bbox_area(bbox) > args.max_bbox_area:
+            continue
+        problem = str(problems_col[i] or "").strip()
+        solution = str(solutions_col[i] or "").strip()
+        if not problem or not solution:
+            continue
+        kept.append({"row": i, "id": str(ids_col[i] if ids_col[i] is not None else i),
+                     "subset": subset, "problem": problem, "solution": solution, "bbox": bbox})
+        counts[subset] = counts.get(subset, 0) + 1
+    return data, image_column, kept, counts
+
+
+def decode_image(data, image_column, row_index: int, max_side: int):
+    """Decode ONE image and downscale it if its longest side exceeds ``max_side``."""
+    from baseline.probe.saliency_data import _to_pil
+
+    image = _to_pil(data[row_index][image_column])
+    if max_side and max(image.size) > max_side:
+        image = image.copy()
+        image.thumbnail((max_side, max_side))
+    return image
+
+
 # ------------------------------------------------------- worker: one model in vLLM
 def run_worker(args) -> None:
     """Deploy ONE model in vLLM (TP=args.tp on the visible GPUs) and generate over the
-    whole dataset under every scheme; write per-sample records to args.worker_out."""
+    whole dataset under every scheme, STREAMING in chunks so host RAM stays bounded
+    (images are decoded a chunk at a time, not all up front). Writes per-sample
+    records to args.worker_out incrementally."""
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from transformers import AutoProcessor
     from vllm import LLM, SamplingParams
@@ -193,19 +256,19 @@ def run_worker(args) -> None:
     from baseline.eval.grading import attempt_correct
     from baseline.eval.opd_eval_prompt import build_general_eval_prompt
     from baseline.opd_data_collator import resolve_opd_system_prompt
-    from baseline.probe.saliency_data import load_saliency_samples
     from vigos.eval_utils import extract_model_answer, vllm_request
 
     name, path = args.model.split("=", 1)
     schemes = [s.strip() for s in args.schemes.split(",") if s.strip()]
-    subsets = [s.strip() for s in args.subsets.split(",")] if args.subsets else None
-    limit = None if args.limit is not None and args.limit < 0 else args.limit
     system_prompt = resolve_opd_system_prompt(args.system_prompt)
 
-    samples = load_saliency_samples(
-        args.dataset, args.split, limit=limit, subsets=subsets, max_bbox_area=args.max_bbox_area
-    )
-    print(f"[worker:{name}] {len(samples)} samples; schemes={schemes}; TP={args.tp}", flush=True)
+    data, image_column, kept, counts = build_index(args)
+    summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(none)"
+    total = len(kept)
+    print(f"[worker:{name}] {total} samples ({summary}); schemes={schemes}; TP={args.tp}; "
+          f"batch_size={args.batch_size}; max_image_side={args.max_image_side}", flush=True)
+    if total == 0:
+        raise SystemExit(f"[worker:{name}] no samples after filtering.")
 
     processor = AutoProcessor.from_pretrained(path, trust_remote_code=True, use_fast=False)
     engine = LLM(
@@ -221,42 +284,46 @@ def run_worker(args) -> None:
         max_tokens=args.max_new_tokens, seed=args.seed,
     )
 
-    # Build every (sample x scheme) request up front; vLLM continuous-batches them all.
-    requests, meta = [], []
-    for s in samples:
-        for sc in schemes:
-            problem_text, image = build_scheme(s, sc, args)
-            prompt = build_general_eval_prompt(
-                processor, problem_text, [image], system_prompt=system_prompt, suffix=args.prompt_suffix
-            )
-            requests.append(vllm_request(prompt, [image]))
-            meta.append((s, sc, problem_text))
-
+    bs = max(1, args.batch_size)
+    n_correct = {sc: 0 for sc in schemes}
+    n_seen = {sc: 0 for sc in schemes}
     t0 = time.time()
-    outputs = engine.generate(requests, sp, use_tqdm=True)
-    print(f"[worker:{name}] generated {len(outputs)} in {time.time() - t0:.0f}s", flush=True)
-
-    records = []
-    for (s, sc, problem_text), out in zip(meta, outputs):
-        response = out.outputs[0].text
-        extracted = extract_model_answer(response)
-        correct = attempt_correct(response, s.solution) if args.grader == "rule" else None
-        records.append({
-            "model": name, "sample_id": s.sample_id, "subset": s.subset, "scheme": sc,
-            "problem_text": problem_text, "bbox_norm": list(s.bbox_norm), "solution": s.solution,
-            "response": response, "extracted_answer": extracted, "correct": correct,
-        })
-
-    with open(args.worker_out, "w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    with open(args.worker_out, "w", encoding="utf-8") as out_fh:
+        for start in range(0, total, bs):
+            chunk = kept[start:start + bs]
+            requests, meta = [], []
+            for item in chunk:  # decode only this chunk's images (then let them be freed)
+                image = decode_image(data, image_column, item["row"], args.max_image_side)
+                for sc in schemes:
+                    problem_text, img = build_scheme_item(item["problem"], item["bbox"], image, sc, args)
+                    prompt = build_general_eval_prompt(
+                        processor, problem_text, [img], system_prompt=system_prompt, suffix=args.prompt_suffix
+                    )
+                    requests.append(vllm_request(prompt, [img]))
+                    meta.append((item, sc, problem_text))
+            outputs = engine.generate(requests, sp, use_tqdm=False)
+            for (item, sc, problem_text), out in zip(meta, outputs):
+                response = out.outputs[0].text
+                correct = attempt_correct(response, item["solution"]) if args.grader == "rule" else None
+                out_fh.write(json.dumps({
+                    "model": name, "sample_id": item["id"], "subset": item["subset"], "scheme": sc,
+                    "problem_text": problem_text, "bbox_norm": list(item["bbox"]),
+                    "solution": item["solution"], "response": response,
+                    "extracted_answer": extract_model_answer(response), "correct": correct,
+                }, ensure_ascii=False) + "\n")
+                n_seen[sc] += 1
+                if correct:
+                    n_correct[sc] += 1
+            out_fh.flush()
+            done = min(start + bs, total)
+            rate = done / max(1e-9, time.time() - t0)
+            print(f"[worker:{name}] {done}/{total} samples ({rate:.1f}/s)", flush=True)
 
     if args.grader == "rule":  # quick local readout per worker
         for sc in schemes:
-            rows = [r for r in records if r["scheme"] == sc]
-            acc = sum(r["correct"] for r in rows) / len(rows) if rows else float("nan")
-            print(f"[worker:{name}] acc[{sc}] = {acc:.3f}  (n={len(rows)})", flush=True)
-    print(f"[worker:{name}] wrote {args.worker_out}", flush=True)
+            acc = n_correct[sc] / n_seen[sc] if n_seen[sc] else float("nan")
+            print(f"[worker:{name}] acc[{sc}] = {acc:.3f}  (n={n_seen[sc]})", flush=True)
+    print(f"[worker:{name}] wrote {args.worker_out} in {time.time() - t0:.0f}s", flush=True)
 
 
 # -------------------------------------------------------------------------- grading

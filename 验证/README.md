@@ -36,6 +36,9 @@ uv run python 验证/compare_bbox_prompt.py \
   不一定会用 `\boxed{}` 包答案**，rule 判分可能低估；建议加 `--grader llm`（DeepSeek 评判，需 `DEEPSEEK_API_KEY`，
   对 DocVQA 自由文本更准）。无论哪种，`Δ(bbox)` 都有意义（两方案偏差对称）。
 - `--coord-mode normalized`(默认，0–1 坐标) / `pixel`；`--bbox-hint` 可改提示语模板。
+- **内存安全**：按 `--batch-size`(默认 64)**分块**解码+生成，图片即用即放，RAM 不随数据量增长（全量 8K 也稳）；
+  `--max-image-side`(默认 1536) 把超大图(如 DocVQA 扫描件)降采样，进一步压低 RAM/预处理开销。记录是**逐块写盘**的，
+  中途挂了也保留已完成部分。若手动中断了主程序，记得 `nvidia-smi` 看一眼并 `pkill -f compare_bbox_prompt` 清理残留 worker。
 
 ---
 
