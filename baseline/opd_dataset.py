@@ -251,9 +251,23 @@ def _build_viscot_image_index(root: str, *, verbose: bool = True) -> dict[str, s
             f"under {root}.",
             flush=True,
         )
+    # Atomic write (temp + os.replace): on shared storage several DDP ranks / both
+    # machines may build the index at once; a reader must see the old or the complete
+    # new file, never a partially written one.
     try:
-        with open(cache_path, "w", encoding="utf-8") as handle:
-            json.dump(index, handle)
+        import tempfile
+
+        fd, tmp = tempfile.mkstemp(dir=root, prefix=".viscot_idx_", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(index, handle)
+            os.replace(tmp, cache_path)
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
     except Exception:  # noqa: BLE001 - cache is best-effort
         pass
     return index
