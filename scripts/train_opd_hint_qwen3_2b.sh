@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # Grounding-Hint Distillation (GHD): on-policy reverse-KL distillation where the
-# frozen teacher — and ONLY the teacher — sees the GT evidence bounding box as a
-# text coordinate hint appended to the question. The student rolls out from, and
-# is scored on, the plain (image, question) prompt and never sees the box. The
-# image is not cropped/upsampled: the teacher gets direction (where to look), not
-# extra pixels, so the KL distils grounding. Spine experiment: does this move the
-# student's visual-search accuracy (V*Bench)?
+# frozen teacher — and ONLY the teacher — is privileged with the GT evidence box.
+# The student rolls out from, and is scored on, the plain (image, question) prompt
+# and never sees the box. Two privilege channels (TEACHER_PRIVILEGE_MODE):
+#   hint  (default) full image + box as TEXT coords (direction: where to look).
+#   crop            image CROPPED to the box, no text (zoom: a sharper evidence view).
+# Spine question: does this move the student's visual-search accuracy (V*Bench)?
 #
 # Required:
 #   TEACHER_MODEL  Path/id of the frozen, stronger, SAME-FAMILY VLM teacher.
@@ -20,11 +20,12 @@ set -euo pipefail
 #   PER_DEVICE_TRAIN_BATCH_SIZE=8 GRADIENT_ACCUMULATION_STEPS=8 FREEZE_VISION_TOWER=false \
 #   MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct TEACHER_MODEL=$M/Vero-Qwen3I-8B \
 #   DATASET_NAME=$D/saliency-r1-8k ANSWER_FIELD=solution \
-#   RUN_CONFIG=opd_hint_qwen3_vero_8b2b_fullft_saliency-r1-8k \
-#   bash scripts/train_opd_hint_qwen3_2b.sh
+#   bash scripts/train_opd_hint_qwen3_2b.sh                 # add TEACHER_PRIVILEGE_MODE=crop for zoom
 #
-# NOTE: saliency-r1-8k is small (~8k boxed rows). At eff-batch 512 that is ~16
-# steps/epoch — bump NUM_TRAIN_EPOCHS (e.g. 3-5) or lower the batch to get a curve.
+# A/B PARITY: defaults (epochs/batch/lr/gen) match scripts/train_opd.sh so GHD vs
+# vanilla OPD differ ONLY in the teacher's privilege. saliency-r1-8k is small (~8k
+# boxed rows) -> ~16 steps/epoch at eff-batch 512; if you raise NUM_TRAIN_EPOCHS,
+# raise it on the OPD baseline too so the two stay comparable.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
@@ -57,7 +58,9 @@ MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-}"
 FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
-NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3}"
+# Default 1 epoch == scripts/train_opd.sh, so GHD and the vanilla-OPD baseline run
+# the SAME number of steps (clean A/B). Raise on BOTH together for a longer curve.
+NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-8}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
@@ -72,15 +75,20 @@ MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
 ANSWER_FIELD="${ANSWER_FIELD:-solution}"
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
 OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
-# --- Grounding-hint knobs ---------------------------------------------------
+# --- Grounding-privilege knobs ----------------------------------------------
+# How the teacher is privileged with the box: hint (full image + text coords, the
+# default) | crop (image cropped to the box, no text — a zoomed evidence view).
+TEACHER_PRIVILEGE_MODE="${TEACHER_PRIVILEGE_MODE:-hint}"
 # Dataset column with the GT evidence box; "[x1,y1,x2,y2]" normalized to [0,1].
 BBOX_FIELD="${BBOX_FIELD:-bbox}"
-# Drop rows without a parseable box (default true => every row hints the teacher).
+# Drop rows without a parseable box (default true => every row privileges the teacher).
 FILTER_NO_BBOX="${FILTER_NO_BBOX:-true}"
-# Decimal places for the hint coordinates (e.g. 2 -> [0.12, 0.34, 0.55, 0.78]).
+# hint mode: decimal places for the hint coordinates (e.g. 2 -> [0.12, 0.34, ...]).
 HINT_COORD_DECIMALS="${HINT_COORD_DECIMALS:-2}"
-# Optional: override the hint sentence (must contain '{bbox}'). Unset => default.
+# hint mode: optional override of the hint sentence (must contain '{bbox}').
 HINT_TEMPLATE="${HINT_TEMPLATE:-}"
+# crop mode: context padding around the box (fraction of box w/h per side; 0=tight).
+CROP_PADDING="${CROP_PADDING:-0.0}"
 # ---------------------------------------------------------------------------
 GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.0}"
 GENERATION_TOP_P="${GENERATION_TOP_P:-1.0}"
@@ -140,7 +148,8 @@ fi
 
 DATASET_TAG="$(basename "${DATASET_NAME%/}")"
 DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
-RUN_CONFIG="${RUN_CONFIG:-opd_hint_${DATASET_TAG}}_${RUN_ID}"
+# Mode in the tag (opd_hint_… vs opd_crop_…) so hint/crop runs never collide.
+RUN_CONFIG="${RUN_CONFIG:-opd_${TEACHER_PRIVILEGE_MODE}_${DATASET_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
 uv run accelerate launch \
@@ -160,9 +169,11 @@ uv run accelerate launch \
   --filter_tiny_images "$FILTER_TINY_IMAGES" \
   --min_image_size "$MIN_IMAGE_SIZE" \
   --answer_field "$ANSWER_FIELD" \
+  --teacher_privilege_mode "$TEACHER_PRIVILEGE_MODE" \
   --bbox_field "$BBOX_FIELD" \
   --filter_no_bbox "$FILTER_NO_BBOX" \
   --hint_coord_decimals "$HINT_COORD_DECIMALS" \
+  --crop_padding "$CROP_PADDING" \
   "${HINT_TEMPLATE_ARGS[@]}" \
   --opd_prompt_suffix "$OPD_PROMPT_SUFFIX" \
   --opd_system_prompt "$OPD_PROMPT_STYLE" \

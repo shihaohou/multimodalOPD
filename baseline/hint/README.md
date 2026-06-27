@@ -1,29 +1,36 @@
 # Grounding-Hint Distillation (GHD)
 
 **Privileged-bbox On-Policy Distillation.** Vanilla OPD, but the frozen teacher —
-and only the teacher — is handed the GT evidence bounding box as a *text
-coordinate hint* appended to the question. The student rolls out from, and is
-scored on, the plain `(image, question)` prompt and **never sees the box**, at
-train time or at inference.
+and only the teacher — is privileged with the GT evidence bounding box. The student
+rolls out from, and is scored on, the plain `(image, question)` prompt and **never
+sees the box**, at train time or inference. Two privilege channels
+(`TEACHER_PRIVILEGE_MODE`):
 
-The image is **not cropped or upsampled** for the teacher. It gets *direction*
-("look at region `[x1,y1,x2,y2]`"), not *information* (a sharper view). So any
-per-token gap the teacher opens up over the student is attributable to
-**grounding** — knowing where the answer lives — which is exactly what we want the
-un-hinted student to internalize for visual-search benchmarks (V\*Bench).
+| mode | teacher input | privilege | knob |
+|------|---------------|-----------|------|
+| `hint` (default) | full image + box as **text coords** appended to the question | *direction* — where to look (not a sharper view) | — |
+| `crop` | image **cropped to the box** (no text) | *zoom* — a higher-res view of the evidence region; real extra detail on high-res inputs | `CROP_PADDING` |
+
+Both use the **GT** box, so the crop/hint is fixed and the student forward backprops
+normally — **no RL needed** (that caveat only applies to a *student-generated* box).
+The per-token gap the teacher opens up is attributable to grounding, which is what we
+want the un-privileged student to internalize for visual-search (V\*Bench).
+`hint` is the conservative spine (closest to what the student can do); `crop` is the
+stronger-privilege sibling (bigger student↔teacher gap, more upside and more risk of
+overshooting what the student can resolve in the full image).
 
 ## One training step
 
 | stage | what happens |
 |-------|--------------|
-| 0. prompts | student = `system + user(image, question)`; teacher = `system + user(image, question, ` **bbox hint** `)`. Same image, same resolution. |
+| 0. prompts | student = `system + user(image, question)`; teacher = `system + user(`**privileged image**`, question` [`+ hint`]`)`. `hint`: same image + text coords. `crop`: image cropped to the box. |
 | 1. rollout | the **student** samples `y` on `(image, question)` — `no_grad`. On-policy: the loss lands on the tokens the student would actually emit. |
-| 2. two forwards | teacher forwards `(image, question, bbox, y)` → grounded `p_T` (`no_grad`); student forwards `(image, question, y)` → `p_S` (with grad). |
-| 3. distill | per-token `KL(student‖teacher)` over the completion, pulling the un-hinted student toward the grounded teacher. Backward into the student only. |
+| 2. two forwards | teacher forwards `(privileged image, question, y)` → grounded `p_T` (`no_grad`); student forwards `(image, question, y)` → `p_S` (with grad). |
+| 3. distill | per-token `KL(student‖teacher)` over the completion, pulling the un-privileged student toward the grounded teacher. Backward into the student only. |
 
 The completion is identical in both forwards; `_completion_logits` slices it from
-the *end* of each sequence, so the teacher's longer (hint-bearing) prefix never
-misaligns the per-token KL.
+the *end* of each sequence, so the teacher's different prefix (longer hint text, or a
+different-size cropped image → different #visual tokens) never misaligns the per-token KL.
 
 > **Gating (deferred).** A natural next step is to apply the KL only on tokens
 > where `logprob_teacher > logprob_student` — exactly the evidence-dependent
@@ -35,11 +42,12 @@ misaligns the per-token KL.
 
 | file | role |
 |------|------|
-| `opd_hint_collator.py` | `OPDHintDataCollator` (+ `HINT_TEMPLATE`, `format_bbox_hint`, `build_hint_teacher_messages`). Builds the student prompt (via `OPDDataCollator`) **and** the privileged `teacher_prompt_*`. |
-| `opd_hint_trainer.py`  | `OPDHintTrainer(OPDTrainer)` — overrides `compute_loss` to score the teacher on the privileged prompt; everything else inherited. `local_hf` teacher only. |
-| `../train_opd_hint.py` | entry point (`OPDHintScriptArguments` adds `--bbox_field` / `--filter_no_bbox` / `--hint_template` / `--hint_coord_decimals`). |
-| `../../scripts/train_opd_hint_qwen3_2b.sh` | launcher (same env-var knobs as `train_opd.sh`). |
-| `sanity_check.py` | collation sanity check (hint lands on the teacher only; same image both sides). |
+| `opd_hint_collator.py` | `OPDHintDataCollator` (+ `HINT_TEMPLATE`, `format_bbox_hint`, `build_hint_teacher_messages`, `crop_to_bbox`). Builds the student prompt (via `OPDDataCollator`) **and** the privileged `teacher_prompt_*` (text hint or cropped image per `teacher_privilege_mode`). |
+| `opd_hint_trainer.py`  | `OPDHintTrainer(OPDTrainer)` — overrides `compute_loss` to score the teacher on the privileged prompt; everything else inherited. Mode-agnostic. `local_hf` teacher only. |
+| `../train_opd_hint.py` | entry point (`OPDHintScriptArguments` adds `--teacher_privilege_mode` / `--bbox_field` / `--filter_no_bbox` / `--hint_template` / `--hint_coord_decimals` / `--crop_padding`). |
+| `../../scripts/train_opd_hint_qwen3_2b.sh` | launcher (same env-var knobs as `train_opd.sh` + `TEACHER_PRIVILEGE_MODE` / `CROP_PADDING`). |
+| `inspect_dataset.py` | schema sniffer — columns, bbox shape (normalized vs pixel), image storage; suggests `ANSWER_FIELD` / `BBOX_FIELD`. |
+| `sanity_check.py` | collation sanity check (hint/crop lands on the teacher only; crop geometry). |
 
 Nothing in `vigos/` or the vanilla OPD files is modified — GHD is purely additive.
 
@@ -57,41 +65,47 @@ curve reports the fraction of each batch that was actually privileged.
 
 ```bash
 export M=/path/to/models D=/path/to/datasets
+# hint mode (default)
 PER_DEVICE_TRAIN_BATCH_SIZE=8 GRADIENT_ACCUMULATION_STEPS=8 FREEZE_VISION_TOWER=false \
 MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct TEACHER_MODEL=$M/Vero-Qwen3I-8B \
 DATASET_NAME=$D/saliency-r1-8k ANSWER_FIELD=solution \
-RUN_CONFIG=opd_hint_qwen3_vero_8b2b_fullft_saliency-r1-8k \
 bash scripts/train_opd_hint_qwen3_2b.sh
+# crop mode (same command + one knob)
+TEACHER_PRIVILEGE_MODE=crop ...same env... bash scripts/train_opd_hint_qwen3_2b.sh
 ```
 
-`saliency-r1-8k` is small (~8k boxed rows). At eff-batch 512 that is ~16
-steps/epoch, so `NUM_TRAIN_EPOCHS` defaults to 3 here — raise it (or lower the
-batch) for a longer curve.
+The run tag auto-encodes the mode (`opd_hint_…` / `opd_crop_…`) so the two never
+collide. Defaults (epochs/batch/lr/gen) **match `scripts/train_opd.sh`**, so GHD and
+the vanilla-OPD baseline run the same number of steps — a clean A/B. `saliency-r1-8k`
+is small (~8k boxed rows → ~16 steps/epoch at eff-batch 512); if you raise
+`NUM_TRAIN_EPOCHS`, raise it on the OPD baseline too.
 
-## The A/B that makes the point
+## The A/B/C that makes the point
 
-GHD's claim is "the privileged *where-to-look* hint on the teacher buys student
-grounding." Test it against vanilla OPD on the **same data and schedule** — the
-only difference is whether the teacher sees the box:
+The claim is "privileging the teacher with the box buys student grounding." Test it
+against vanilla OPD on the **same data, schedule and teacher** — the only difference
+is the teacher's privilege:
 
 ```bash
-# GHD (privileged teacher)
-DATASET_NAME=$D/saliency-r1-8k ANSWER_FIELD=solution TEACHER_MODEL=$M/Vero-Qwen3I-8B \
-  bash scripts/train_opd_hint_qwen3_2b.sh
-# vanilla OPD (same teacher, no box) — the control
+# vanilla OPD (control: same teacher, no box)
 DATASET_NAME=$D/saliency-r1-8k ANSWER_FIELD=solution TEACHER_MODEL=$M/Vero-Qwen3I-8B \
   MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct bash scripts/train_opd.sh
+# GHD hint (direction)
+DATASET_NAME=$D/saliency-r1-8k ANSWER_FIELD=solution TEACHER_MODEL=$M/Vero-Qwen3I-8B \
+  bash scripts/train_opd_hint_qwen3_2b.sh
+# GHD crop (zoom)
+DATASET_NAME=$D/saliency-r1-8k ANSWER_FIELD=solution TEACHER_MODEL=$M/Vero-Qwen3I-8B \
+  TEACHER_PRIVILEGE_MODE=crop bash scripts/train_opd_hint_qwen3_2b.sh
 ```
 
-Then eval both (and the untrained base) on **V\*Bench** with the deterministic
+Then eval all (and the untrained base) on **V\*Bench** with the deterministic
 harness, plus the general suite to check for regressions:
 
 ```bash
-MODEL_PATH=runs/<ghd_run>  bash scripts/eval_vstar.sh
-MODEL_PATH=runs/<opd_run>  bash scripts/eval_vstar.sh
+MODEL_PATH=runs/<run>  bash scripts/eval_vstar.sh
 ```
 
-GHD works iff it beats vanilla OPD on V\*Bench without regressing the suite.
+GHD works iff hint and/or crop beat vanilla OPD on V\*Bench without regressing the suite.
 
 ## Sanity check
 

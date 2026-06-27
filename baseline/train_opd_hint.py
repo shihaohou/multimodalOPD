@@ -63,18 +63,23 @@ _filter_tiny_image_samples = dataset_utils.filter_tiny_image_samples
 
 @dataclass
 class OPDHintScriptArguments(OPDScriptArguments):
-    """Vanilla OPD knobs (inherited) + grounding-hint knobs."""
+    """Vanilla OPD knobs (inherited) + grounding-privilege knobs."""
 
+    # How the teacher is privileged with the box: "hint" = full image + text coords
+    # (direction); "crop" = image cropped to the box, no text (zoom).
+    teacher_privilege_mode: str = "hint"
     # Dataset column holding the GT evidence box (string "[x1,y1,x2,y2]" in [0,1],
     # or a list/tuple; parse_bbox_norm order-normalizes / clamps / drops degenerate).
     bbox_field: str = "bbox"
     # Drop rows whose bbox does not parse (default on): every kept row then gives the
-    # teacher a real privileged hint. Set false to keep all rows (no-bbox rows fall
+    # teacher a real privileged signal. Set false to keep all rows (no-bbox rows fall
     # back to the plain prompt => vanilla OPD for those rows).
     filter_no_bbox: bool = True
-    # The hint sentence ('{bbox}' is filled per sample). Override for ablations.
+    # hint mode: the hint sentence ('{bbox}' is filled per sample). Override for ablations.
     hint_template: str = HINT_TEMPLATE
     hint_coord_decimals: int = 2
+    # crop mode: context padding around the box (fraction of box w/h per side).
+    crop_padding: float = 0.0
 
 
 def _filter_samples_without_bbox(dataset, bbox_field: str):
@@ -138,11 +143,17 @@ def main() -> None:
         print(f"Dataset name: {script_args.dataset_name}")
         print(f"Answer/reference field: {script_args.answer_field}")
         print(
+            f"Teacher privilege mode: {script_args.teacher_privilege_mode!r} "
+            f"({'cropped evidence image (zoom)' if script_args.teacher_privilege_mode == 'crop' else 'text coordinate hint (direction)'})"
+        )
+        print(
             f"Bbox field: {script_args.bbox_field!r}  "
             f"filter_no_bbox={script_args.filter_no_bbox}  "
-            f"coord_decimals={script_args.hint_coord_decimals}"
+            f"coord_decimals={script_args.hint_coord_decimals}  "
+            f"crop_padding={script_args.crop_padding}"
         )
-        print(f"Hint template: {script_args.hint_template!r}")
+        if script_args.teacher_privilege_mode == "hint":
+            print(f"Hint template: {script_args.hint_template!r}")
         print(
             f"OPD system prompt: style={script_args.opd_system_prompt!r} -> "
             f"{resolve_opd_system_prompt(script_args.opd_system_prompt)!r}"
@@ -287,9 +298,11 @@ def main() -> None:
         answer_field=script_args.answer_field,
         opd_prompt_suffix=script_args.opd_prompt_suffix,
         system_prompt=resolve_opd_system_prompt(script_args.opd_system_prompt),
+        teacher_privilege_mode=script_args.teacher_privilege_mode,
         bbox_field=script_args.bbox_field,
         hint_template=script_args.hint_template,
         hint_coord_decimals=script_args.hint_coord_decimals,
+        crop_padding=script_args.crop_padding,
     )
 
     # --- Trainer ----------------------------------------------------------------
@@ -336,7 +349,7 @@ def main() -> None:
         trainer.add_callback(
             _OPDWandBConfigCallback(
                 {
-                    "opd_method": "ghd",
+                    "opd_method": f"ghd_{script_args.teacher_privilege_mode}",
                     "opd_finetuning_mode": script_args.finetuning_mode,
                     "opd_student_model": script_args.model_name_or_path,
                     "opd_teacher_model": script_args.teacher_model_name_or_path,
@@ -346,10 +359,12 @@ def main() -> None:
                     "opd_loss_mode": script_args.opd_loss_mode,
                     "opd_kl_direction": script_args.opd_kl_direction,
                     "opd_top_k": script_args.opd_top_k,
+                    "ghd_teacher_privilege_mode": script_args.teacher_privilege_mode,
                     "ghd_bbox_field": script_args.bbox_field,
                     "ghd_filter_no_bbox": script_args.filter_no_bbox,
                     "ghd_hint_template": script_args.hint_template,
                     "ghd_hint_coord_decimals": script_args.hint_coord_decimals,
+                    "ghd_crop_padding": script_args.crop_padding,
                 }
             )
         )

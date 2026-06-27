@@ -1,26 +1,29 @@
 """Data collation for Grounding-Hint Distillation (GHD).
 
-GHD = vanilla OPD with a *spatially privileged* teacher. The student is scored on
-the plain ``(image, question)`` prompt (exactly :class:`OPDDataCollator`); the
-frozen teacher is additionally handed the GT **evidence bounding box as a text
-coordinate hint** appended to the question — "pay attention to region
-``[x1,y1,x2,y2]``". The image itself is **not** cropped or upsampled: the teacher
-gets *direction* (where to look), not *information* (a sharper view), so any KL
-gap it opens up is attributable to grounding, not to extra pixels.
+GHD = vanilla OPD with a *spatially privileged* teacher. The student is always
+scored on the plain ``(image, question)`` prompt (exactly :class:`OPDDataCollator`);
+the frozen teacher is additionally handed the GT evidence bounding box through one
+of two privilege channels (``teacher_privilege_mode``):
 
-This collator therefore builds **two** prompts per sample:
+* ``hint`` (default) — **direction.** Full image + the box as a *text coordinate
+  hint* appended to the question ("pay attention to region ``[x1,y1,x2,y2]``"). The
+  image is not cropped/upsampled, so the KL gap is attributable to *where to look*,
+  not extra pixels.
+* ``crop`` — **zoom.** The image is cropped to the box (no text hint), so the
+  teacher sees the evidence region at higher effective resolution — genuinely more
+  *information* on high-res inputs (the V*Bench regime). Uses the GT box, so the
+  crop is fixed and the student forward backprops normally (no RL needed).
 
-* ``student_prompt_*`` — system + user(image + question). Identical to
-  :class:`~baseline.opd_data_collator.OPDDataCollator`; this is what the policy
-  rolls out from and what the student forward scores.
-* ``teacher_prompt_*`` — system + user(image + question + **bbox hint**). The
-  frozen teacher scores the student's completion under *this* privileged prefix.
+This collator builds **two** prompts per sample:
 
-Both encode the **same** ``_safe_rgb_image`` at the same resolution, so the only
-difference fed to the two forwards is the extra hint text. Samples whose ``bbox``
-field is missing / unparseable get an empty hint, so the teacher prompt degrades
-to the student prompt for that row (vanilla OPD) instead of crashing — the
-``has_hint`` flag records which rows were actually privileged.
+* ``student_prompt_*`` — system + user(full image + question). What the policy
+  rolls out from and what the student forward scores. Identical in both modes.
+* ``teacher_prompt_*`` — system + user(privileged image + question [+ hint]). The
+  frozen teacher scores the student's completion under this privileged prefix.
+
+Samples whose ``bbox`` field is missing / unparseable degrade to the plain student
+prompt for that row (vanilla OPD) instead of crashing — the ``has_hint`` flag
+records which rows were actually privileged (``hint_coverage`` curve).
 """
 
 from __future__ import annotations
@@ -33,6 +36,7 @@ import torch
 from baseline.opd_data_collator import (
     OPD_SYSTEM_PROMPT,
     OPDDataCollator,
+    _safe_rgb_image,
     format_opd_student_prompt,
 )
 from baseline.probe.saliency_data import BoxNorm, parse_bbox_norm
@@ -59,6 +63,31 @@ def format_bbox_hint(
     """Render a normalized ``(x1,y1,x2,y2)`` box into the hint sentence."""
     coords = "[" + ", ".join(f"{v:.{decimals}f}" for v in bbox) + "]"
     return template.format(bbox=coords)
+
+
+def crop_to_bbox(image: Any, bbox: BoxNorm, *, padding: float = 0.0) -> Any:
+    """Crop a PIL image to a normalized ``(x1,y1,x2,y2)`` box (top-left origin).
+
+    ``padding`` (fraction of the box's own width/height) expands the crop on every
+    side for a little context — 0.0 is a tight crop. Returns the original image
+    unchanged if the box collapses to <1px after rounding (degenerate → no zoom).
+    The caller re-runs ``_safe_rgb_image`` on the result so a tiny crop is padded
+    up to the processor's minimum side instead of crashing it.
+    """
+    width, height = image.size
+    x1, y1, x2, y2 = bbox
+    left, top, right, bottom = x1 * width, y1 * height, x2 * width, y2 * height
+    if padding > 0:
+        pad_w = (right - left) * padding
+        pad_h = (bottom - top) * padding
+        left, top, right, bottom = left - pad_w, top - pad_h, right + pad_w, bottom + pad_h
+    left = max(0, int(round(left)))
+    top = max(0, int(round(top)))
+    right = min(width, int(round(right)))
+    bottom = min(height, int(round(bottom)))
+    if right <= left or bottom <= top:
+        return image
+    return image.crop((left, top, right, bottom))
 
 
 def build_hint_teacher_messages(
@@ -94,14 +123,27 @@ def build_hint_teacher_messages(
 
 @dataclass
 class OPDHintDataCollator(OPDDataCollator):
-    """OPD student prompt + a privileged teacher prompt carrying the bbox hint."""
+    """OPD student prompt + a privileged teacher prompt (text hint or image crop)."""
 
+    # How the teacher is privileged with the box: "hint" = full image + text coords
+    # (direction); "crop" = image cropped to the box, no text (zoom).
+    teacher_privilege_mode: str = "hint"
     # Column on the dataset row holding the evidence box. saliency-r1-8k ships it
     # as a string ``"[x1, y1, x2, y2]"`` normalized to [0,1]; parse_bbox_norm also
     # accepts a list/tuple and order-normalizes / clamps / drops degenerate boxes.
     bbox_field: str = "bbox"
     hint_template: str = HINT_TEMPLATE
     hint_coord_decimals: int = 2
+    # crop mode only: context padding around the box (fraction of box w/h per side).
+    crop_padding: float = 0.0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.teacher_privilege_mode not in {"hint", "crop"}:
+            raise ValueError(
+                f"Unknown teacher_privilege_mode {self.teacher_privilege_mode!r}; "
+                "use 'hint' (text coordinates) or 'crop' (cropped evidence image)."
+            )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         # Build everything the vanilla OPD collator does (student prompt + the
@@ -116,16 +158,30 @@ class OPDHintDataCollator(OPDDataCollator):
         has_hint: list[int] = []
         for feature, image, problem in zip(features, images, problems):
             bbox = parse_bbox_norm(feature.get(self.bbox_field))
-            hint = (
-                format_bbox_hint(
-                    bbox, self.hint_template, decimals=self.hint_coord_decimals
+            if self.teacher_privilege_mode == "crop":
+                # ZOOM: teacher sees the box cropped from the full image, no hint
+                # text. Re-run _safe_rgb_image so a tiny crop is padded, not crashed.
+                teacher_image = (
+                    _safe_rgb_image(crop_to_bbox(image, bbox, padding=self.crop_padding))
+                    if bbox is not None
+                    else image
                 )
-                if bbox is not None
-                else ""
-            )
+                hint = ""
+                privileged = bbox is not None
+            else:
+                # DIRECTION: full image + the box as a text coordinate hint.
+                teacher_image = image
+                hint = (
+                    format_bbox_hint(
+                        bbox, self.hint_template, decimals=self.hint_coord_decimals
+                    )
+                    if bbox is not None
+                    else ""
+                )
+                privileged = bool(hint)
             message = build_hint_teacher_messages(
                 problem,
-                image,
+                teacher_image,
                 hint,
                 system_prompt=self.system_prompt,
                 suffix=self.opd_prompt_suffix,

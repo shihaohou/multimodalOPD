@@ -27,6 +27,7 @@ from PIL import Image
 from baseline.hint.opd_hint_collator import (
     HINT_TEMPLATE,
     build_hint_teacher_messages,
+    crop_to_bbox,
     format_bbox_hint,
 )
 from baseline.opd_data_collator import OPD_SYSTEM_PROMPT
@@ -64,6 +65,21 @@ def check_hint_text() -> None:
     # 3-decimal rendering knob.
     assert "[0.120, 0.340, 0.550, 0.780]" in format_bbox_hint(box, decimals=3)
     print("[ghd-sanity] check_hint_text OK")
+
+
+def check_crop_geometry() -> None:
+    img = Image.new("RGB", (1000, 500), (127, 127, 127))  # W=1000, H=500
+    # box [0.1, 0.2, 0.5, 0.8] -> px (100,100,500,400) -> 400x300 crop
+    crop = crop_to_bbox(img, (0.1, 0.2, 0.5, 0.8))
+    assert crop.size == (400, 300), crop.size
+    # padding 0.25 expands each side by 0.25*box -> x:[0,600] y:[25,475] -> 600x450
+    padded = crop_to_bbox(img, (0.1, 0.2, 0.5, 0.8), padding=0.25)
+    assert padded.size == (600, 450), padded.size
+    # degenerate (zero-width) box -> original image, not a crash
+    assert crop_to_bbox(img, (0.5, 0.2, 0.5, 0.8)).size == (1000, 500)
+    # clamp to image bounds (box partly outside)
+    assert crop_to_bbox(img, (0.8, 0.8, 1.0, 1.0)).size == (200, 100)
+    print("[ghd-sanity] check_crop_geometry OK (400x300 / padded 600x450 / clamped)")
 
 
 def check_collator(model: str) -> None:
@@ -122,10 +138,34 @@ def check_collator(model: str) -> None:
         ), "teacher/student image grids differ — the teacher got a different image!"
 
     print(
-        f"[ghd-sanity] check_collator OK  "
+        f"[ghd-sanity] check_collator(hint) OK  "
         f"(row0 student={s_len0} -> teacher={t_len0} tokens, +{t_len0 - s_len0} hint; "
         f"row1 box-less student==teacher={t_len1})"
     )
+
+    # --- crop mode: teacher sees the cropped evidence image, NO hint text -------
+    crop_collator = OPDHintDataCollator(
+        processor=processor,
+        max_prompt_length=4096,
+        answer_field="solution",
+        system_prompt=OPD_SYSTEM_PROMPT,
+        bbox_field="bbox",
+        teacher_privilege_mode="crop",
+    )
+    cout = crop_collator(features)
+    assert torch.equal(cout["has_hint"], torch.tensor([1, 0])), cout["has_hint"]
+    assert "bounding box" not in cout["teacher_prompt_texts"][0], "crop mode added hint text!"
+    if "student_prompt_image_grid_thw" in cout:
+        s_grid = cout["student_prompt_image_grid_thw"]
+        t_grid = cout["teacher_prompt_image_grid_thw"]
+        # box-less row uses the full image on both sides -> identical grid.
+        assert torch.equal(s_grid[1], t_grid[1]), "box-less row got a cropped teacher image!"
+        print(
+            f"[ghd-sanity] check_collator(crop) OK  (row0 cropped grid "
+            f"student={s_grid[0].tolist()} -> teacher={t_grid[0].tolist()}; row1 full==full)"
+        )
+    else:
+        print("[ghd-sanity] check_collator(crop) OK (no image_grid_thw to compare)")
 
 
 def main() -> None:
@@ -137,6 +177,7 @@ def main() -> None:
     )
     args = ap.parse_args()
     check_hint_text()
+    check_crop_geometry()
     if args.model:
         check_collator(args.model)
     else:
