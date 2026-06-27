@@ -465,3 +465,10 @@ out = os.path.join(root, "matrix.json")
 json.dump({"tags": tags, "matrix": matrix, "per_model": per_model}, open(out, "w"), indent=2, ensure_ascii=False)
 print(f"\nWrote {out}")
 PY
+
+# Final shareable report: methods (rows) x benchmarks (cols), metrics as PERCENTAGES,
+# written as report.md + report.csv (+ report.xlsx if openpyxl) under OUTPUT_ROOT.
+# Pure stdlib transpose of the matrix above; safe to re-run any time on this root:
+#   python3 baseline/eval/make_report.py "$OUTPUT_ROOT"
+python3 baseline/eval/make_report.py "$OUTPUT_ROOT" \
+  || echo "(report skipped; rerun: python3 baseline/eval/make_report.py $OUTPUT_ROOT)"
