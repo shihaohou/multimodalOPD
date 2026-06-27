@@ -2,6 +2,45 @@
 
 按数据集 **ID** 抽取「图片 + Prompt」，并对比不同模型 / 检查点的输出 —— 从数据层面验证模型效果。
 
+本目录两个工具：
+- `validate_by_id.ipynb` —— **交互逐样本**：挑一个 ID，看图片 + Prompt，逐模型对比输出（见下文）。
+- `compare_bbox_prompt.py` —— **批量评测**：vLLM 部署两个模型（各 4 卡），在 saliency-r1-8k 上跑
+  「给 / 不给 GT bounding box 提示」两种 prompt，算最终正确率。
+
+---
+
+## compare_bbox_prompt.py（vLLM 双模型 A/B 测评）
+
+一条命令在 8 卡上**并发部署两个模型**（每模型 `tensor_parallel_size=4`），各自跑两种 prompt，最后汇总正确率：
+
+- **方案① plain**：原始图片 + 问题。
+- **方案② bbox**：同样的图片 + 问题，外加一句英文提示，并把该样本的 GT 证据框坐标填进去
+  （“Pay special attention to the region inside the bounding box [...]”）。
+- （可选 **draw**：把框直接画在图上。）
+
+```bash
+M=/home/web_server/antispam/project/houshihao/models
+uv run python 验证/compare_bbox_prompt.py \
+    --models capcurriculum-8b=$M/CapCurriculum-8B,qwen3vl-8b=$M/Qwen3-VL-8B-Instruct \
+    --gpu-groups "0,1,2,3;4,5,6,7" \
+    --subsets docvqa --limit 200 \
+    --output-dir eval_outputs/bbox_ab
+```
+
+（以上两个模型已是脚本默认值，直接 `uv run python 验证/compare_bbox_prompt.py` 也行。）
+
+- `--limit` 是**每个子集**的样本上限；去掉 `--subsets`/`--limit` 跑全量。默认贪心解码。
+- 产出：`eval_outputs/bbox_ab/summary.json`（每模型 × 每方案的正确率 + `Δ(bbox)`）、`records.jsonl`
+  （逐样本：图片对应的 prompt、模型输出、抽取答案、对错）、`worker_*.log`（各模型 vLLM 日志，可 `tail -f`）。
+- **判分**：默认 `--grader rule`（mathruler + 归一化精确匹配，无需 API）。**这两个是非 OPD 的 base 指令模型，
+  不一定会用 `\boxed{}` 包答案**，rule 判分可能低估；建议加 `--grader llm`（DeepSeek 评判，需 `DEEPSEEK_API_KEY`，
+  对 DocVQA 自由文本更准）。无论哪种，`Δ(bbox)` 都有意义（两方案偏差对称）。
+- `--coord-mode normalized`(默认，0–1 坐标) / `pixel`；`--bbox-hint` 可改提示语模板。
+
+---
+
+## validate_by_id.ipynb（交互逐样本）
+
 ## 用法
 
 在 GPU 机器上、用 OPD 的 uv 环境启动 Jupyter，打开 `validate_by_id.ipynb`：

@@ -1,0 +1,436 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+r"""Deploy two models with vLLM (4 GPUs each) and compare two prompt schemes on
+saliency-r1-8k, then report a final accuracy per model x scheme.
+
+Each sample in saliency-r1-8k has a GT *evidence* bounding box. We test whether
+handing the model that box in the prompt helps it answer:
+
+  * scheme ``plain`` — original image + question.                      [方案① 原始图片+prompt]
+  * scheme ``bbox``  — same, plus an English hint naming the GT box,    [方案② 加 bbox 提示]
+                       e.g. "Pay special attention to the region inside
+                       the bounding box [x1, y1, x2, y2] ...".
+  * scheme ``draw``  — (optional) the GT box drawn on the image.
+
+Deployment: one command launches TWO worker subprocesses, each pinned to its own
+4-GPU group (``CUDA_VISIBLE_DEVICES``) running vLLM with ``tensor_parallel_size=4``,
+so both models serve concurrently on an 8-GPU box. Each worker generates over the
+whole dataset under every scheme, grades the \boxed answer, and writes a JSONL; the
+parent merges them and prints the final accuracy table.
+
+Run on the box, in the OPD uv env:
+
+    M=/home/web_server/antispam/project/houshihao/models
+    uv run python 验证/compare_bbox_prompt.py \
+        --models base=$M/Qwen2.5-VL-3B-Instruct,opd=runs/opd_qwen25_3b_xxx/checkpoint-200 \
+        --gpu-groups "0,1,2,3;4,5,6,7" \
+        --dataset /home/web_server/antispam/project/houshihao/datasets/saliency-r1-8k \
+        --subsets docvqa --limit 200 --output-dir eval_outputs/bbox_ab
+
+``--limit`` is a PER-SUBSET cap (drop it to run the full set). Greedy decoding by
+default. Grading is rule-based (mathruler + exact, no API); ``--grader llm`` uses the
+DeepSeek judge (better for free-form DocVQA answers; needs $DEEPSEEK_API_KEY).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+# --- make the repo importable as a library (this file lives in <repo>/验证/) -----
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+_DEFAULT_MODELS_DIR = "/home/web_server/antispam/project/houshihao/models"
+_DEFAULT_DATASET = "/home/web_server/antispam/project/houshihao/datasets/saliency-r1-8k"
+
+# English hint appended to the question for the `bbox` scheme. {coords}/{note} filled in.
+_DEFAULT_HINT = (
+    "Hint: pay special attention to the region of the image inside the bounding "
+    "box {coords} ({note}). The evidence needed to answer the question is located there."
+)
+
+# Shared eval settings the parent passes to each worker via config.json (everything
+# EXCEPT the per-worker model / gpu / output, so both workers run identically).
+_CONFIG_KEYS = (
+    "dataset", "split", "subsets", "limit", "max_bbox_area", "schemes", "coord_mode",
+    "bbox_hint", "draw_color", "draw_width", "system_prompt", "prompt_suffix",
+    "max_new_tokens", "do_sample", "temperature", "top_p", "top_k", "seed",
+    "dtype", "gpu_mem_util", "limit_images", "grader",
+)
+
+
+# --------------------------------------------------------------------------- CLI
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Two vLLM models x two prompt schemes (bbox vs not) on saliency-r1-8k.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # orchestration
+    p.add_argument(
+        "--models",
+        default=(
+            f"capcurriculum-8b={_DEFAULT_MODELS_DIR}/CapCurriculum-8B,"
+            f"qwen3vl-8b={_DEFAULT_MODELS_DIR}/Qwen3-VL-8B-Instruct"
+        ),
+        help="Comma-separated name=path pairs (the models to deploy).",
+    )
+    p.add_argument("--gpu-groups", default="0,1,2,3;4,5,6,7",
+                   help="';'-separated GPU groups, one per model (4 GPUs each here).")
+    p.add_argument("--output-dir", default="eval_outputs/bbox_ab")
+    # data
+    p.add_argument("--dataset", default=_DEFAULT_DATASET, help="Local dir or HF id.")
+    p.add_argument("--split", default="train")
+    p.add_argument("--subsets", default=None, help="Comma list, e.g. docvqa,textvqa (default: all).")
+    p.add_argument("--limit", type=int, default=200, help="PER-SUBSET sample cap (None-like: pass -1).")
+    p.add_argument("--max-bbox-area", type=float, default=None, help="Drop boxes larger than this (fraction).")
+    # schemes / hint
+    p.add_argument("--schemes", default="plain,bbox", help="Subset of: plain,bbox,draw.")
+    p.add_argument("--coord-mode", default="normalized", choices=["normalized", "pixel"],
+                   help="How the bbox coords are written into the hint.")
+    p.add_argument("--bbox-hint", default=_DEFAULT_HINT, help="Hint template; needs {coords} (+ optional {note}).")
+    p.add_argument("--draw-color", default="red")
+    p.add_argument("--draw-width", type=int, default=4)
+    # prompt / generation
+    p.add_argument("--system-prompt", default="think", help="think|freecot|reason|none (match training).")
+    p.add_argument("--prompt-suffix", default="")
+    p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument("--do-sample", action="store_true", help="Default off = greedy (reproducible).")
+    p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument("--top-p", type=float, default=0.9)
+    p.add_argument("--top-k", type=int, default=50)
+    p.add_argument("--seed", type=int, default=42)
+    # vLLM
+    p.add_argument("--dtype", default="bfloat16")
+    p.add_argument("--gpu-mem-util", type=float, default=0.90)
+    p.add_argument("--limit-images", type=int, default=4)
+    # grading
+    p.add_argument("--grader", default="rule", choices=["rule", "llm"],
+                   help="rule = mathruler+exact (no API); llm = DeepSeek judge ($DEEPSEEK_API_KEY).")
+    p.add_argument("--judge-model", default="deepseek-v4-flash")
+    p.add_argument("--judge-api-url", default="https://api.deepseek.com")
+    p.add_argument("--judge-key-env", default="DEEPSEEK_API_KEY")
+    p.add_argument("--judge-workers", type=int, default=32)
+    # internal worker mode
+    p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--model", default=None, help=argparse.SUPPRESS)        # one name=path
+    p.add_argument("--tp", type=int, default=4, help=argparse.SUPPRESS)
+    p.add_argument("--worker-out", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--config", default=None, help=argparse.SUPPRESS)
+    return p.parse_args()
+
+
+def _safe(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "model"
+
+
+def parse_models(spec: str) -> list[tuple[str, str]]:
+    out = []
+    for part in spec.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"--models entry must be name=path, got {item!r}")
+        name, path = item.split("=", 1)
+        out.append((name.strip(), path.strip()))
+    if not out:
+        raise ValueError("No models given. Pass --models name=path,name=path.")
+    return out
+
+
+# ------------------------------------------------------------------ prompt schemes
+def format_coords(bbox_norm, image_size, mode: str) -> tuple[str, str]:
+    x1, y1, x2, y2 = bbox_norm
+    if mode == "pixel":
+        w, h = image_size
+        pts = [round(x1 * w), round(y1 * h), round(x2 * w), round(y2 * h)]
+        note = f"in pixels; image size {w}x{h}, top-left origin, [x1, y1, x2, y2]"
+    else:
+        pts = [round(v, 3) for v in (x1, y1, x2, y2)]
+        note = "normalized to [0, 1], top-left origin, [x1, y1, x2, y2]"
+    return f"[{pts[0]}, {pts[1]}, {pts[2]}, {pts[3]}]", note
+
+
+def build_scheme(sample, scheme: str, args):
+    """(problem_text, image) for a scheme. plain/bbox keep the original image; draw
+    burns the GT box into the image and leaves the question unchanged."""
+    from PIL import ImageDraw
+
+    problem, image = sample.problem, sample.image
+    if scheme == "plain":
+        return problem, image
+    if scheme == "bbox":
+        coords, note = format_coords(sample.bbox_norm, image.size, args.coord_mode)
+        return f"{problem}\n{args.bbox_hint.format(coords=coords, note=note)}", image
+    if scheme == "draw":
+        img = image.convert("RGB").copy()
+        w, h = img.size
+        x1, y1, x2, y2 = sample.bbox_norm
+        ImageDraw.Draw(img).rectangle(
+            [x1 * w, y1 * h, x2 * w, y2 * h], outline=args.draw_color, width=args.draw_width
+        )
+        return problem, img
+    raise ValueError(f"unknown scheme {scheme!r}")
+
+
+# ------------------------------------------------------- worker: one model in vLLM
+def run_worker(args) -> None:
+    """Deploy ONE model in vLLM (TP=args.tp on the visible GPUs) and generate over the
+    whole dataset under every scheme; write per-sample records to args.worker_out."""
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    from transformers import AutoProcessor
+    from vllm import LLM, SamplingParams
+
+    from baseline.eval.grading import attempt_correct
+    from baseline.eval.opd_eval_prompt import build_general_eval_prompt
+    from baseline.opd_data_collator import resolve_opd_system_prompt
+    from baseline.probe.saliency_data import load_saliency_samples
+    from vigos.eval_utils import extract_model_answer, vllm_request
+
+    name, path = args.model.split("=", 1)
+    schemes = [s.strip() for s in args.schemes.split(",") if s.strip()]
+    subsets = [s.strip() for s in args.subsets.split(",")] if args.subsets else None
+    limit = None if args.limit is not None and args.limit < 0 else args.limit
+    system_prompt = resolve_opd_system_prompt(args.system_prompt)
+
+    samples = load_saliency_samples(
+        args.dataset, args.split, limit=limit, subsets=subsets, max_bbox_area=args.max_bbox_area
+    )
+    print(f"[worker:{name}] {len(samples)} samples; schemes={schemes}; TP={args.tp}", flush=True)
+
+    processor = AutoProcessor.from_pretrained(path, trust_remote_code=True, use_fast=False)
+    engine = LLM(
+        model=path, tensor_parallel_size=args.tp, gpu_memory_utilization=args.gpu_mem_util,
+        limit_mm_per_prompt={"image": args.limit_images}, trust_remote_code=True,
+        dtype=args.dtype, seed=args.seed,
+    )
+    sp = SamplingParams(
+        n=1,
+        temperature=(args.temperature if args.do_sample else 0.0),
+        top_p=(args.top_p if args.do_sample else 1.0),
+        top_k=(args.top_k if (args.do_sample and args.top_k > 0) else -1),
+        max_tokens=args.max_new_tokens, seed=args.seed,
+    )
+
+    # Build every (sample x scheme) request up front; vLLM continuous-batches them all.
+    requests, meta = [], []
+    for s in samples:
+        for sc in schemes:
+            problem_text, image = build_scheme(s, sc, args)
+            prompt = build_general_eval_prompt(
+                processor, problem_text, [image], system_prompt=system_prompt, suffix=args.prompt_suffix
+            )
+            requests.append(vllm_request(prompt, [image]))
+            meta.append((s, sc, problem_text))
+
+    t0 = time.time()
+    outputs = engine.generate(requests, sp, use_tqdm=True)
+    print(f"[worker:{name}] generated {len(outputs)} in {time.time() - t0:.0f}s", flush=True)
+
+    records = []
+    for (s, sc, problem_text), out in zip(meta, outputs):
+        response = out.outputs[0].text
+        extracted = extract_model_answer(response)
+        correct = attempt_correct(response, s.solution) if args.grader == "rule" else None
+        records.append({
+            "model": name, "sample_id": s.sample_id, "subset": s.subset, "scheme": sc,
+            "problem_text": problem_text, "bbox_norm": list(s.bbox_norm), "solution": s.solution,
+            "response": response, "extracted_answer": extracted, "correct": correct,
+        })
+
+    with open(args.worker_out, "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    if args.grader == "rule":  # quick local readout per worker
+        for sc in schemes:
+            rows = [r for r in records if r["scheme"] == sc]
+            acc = sum(r["correct"] for r in rows) / len(rows) if rows else float("nan")
+            print(f"[worker:{name}] acc[{sc}] = {acc:.3f}  (n={len(rows)})", flush=True)
+    print(f"[worker:{name}] wrote {args.worker_out}", flush=True)
+
+
+# -------------------------------------------------------------------------- grading
+def grade_llm(records: list[dict[str, Any]], args) -> None:
+    """Fill record['correct'] via the DeepSeek judge (same prompts as run_opd_eval)."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from openai import OpenAI
+
+    from vigos.eval_utils import build_judge_messages, parse_judge_output
+
+    key = os.environ.get(args.judge_key_env) or os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise RuntimeError(f"--grader llm needs ${args.judge_key_env} (or $OPENAI_API_KEY).")
+    client = OpenAI(base_url=args.judge_api_url, api_key=key)
+
+    def judge_one(rec):
+        msgs = build_judge_messages(rec["extracted_answer"], rec["solution"], rec["problem_text"])
+        try:
+            resp = client.chat.completions.create(
+                model=args.judge_model, messages=msgs, temperature=0.0, max_tokens=2048, timeout=120
+            )
+            return parse_judge_output(resp.choices[0].message.content).get("verdict") == "correct"
+        except Exception as exc:  # noqa: BLE001
+            print(f"[judge] error on {rec.get('sample_id')}: {exc}")
+            return False
+
+    print(f"[bbox-ab] grading {len(records)} responses with the LLM judge ...", flush=True)
+    with ThreadPoolExecutor(max_workers=max(1, args.judge_workers)) as pool:
+        for rec, ok in zip(records, pool.map(judge_one, records)):
+            rec["correct"] = bool(ok)
+
+
+# ------------------------------------------------------------------------- reporting
+def accuracy(rows: list[dict[str, Any]]):
+    rows = [r for r in rows if r.get("correct") is not None]
+    return (sum(bool(r["correct"]) for r in rows) / len(rows)) if rows else None
+
+
+def summarize(records, model_names, schemes) -> dict[str, Any]:
+    results = {}
+    for name in model_names:
+        per_scheme = {sc: {"n": len([r for r in records if r["model"] == name and r["scheme"] == sc]),
+                           "acc": accuracy([r for r in records if r["model"] == name and r["scheme"] == sc])}
+                      for sc in schemes}
+        entry = {"schemes": per_scheme}
+        if "plain" in per_scheme and "bbox" in per_scheme:
+            a0, a1 = per_scheme["plain"]["acc"], per_scheme["bbox"]["acc"]
+            entry["delta_bbox_minus_plain"] = (a1 - a0) if (a0 is not None and a1 is not None) else None
+        results[name] = entry
+    return results
+
+
+def print_table(results, schemes) -> None:
+    print("\n" + "=" * 74)
+    print("Final answer accuracy  (model x prompt scheme)")
+    print("=" * 74)
+    head = f"{'model':<16}" + "".join(f"{sc:>12}" for sc in schemes)
+    if "plain" in schemes and "bbox" in schemes:
+        head += f"{'Δ(bbox)':>12}"
+    print(head)
+    print("-" * len(head))
+    for name, entry in results.items():
+        row = f"{name:<16}"
+        for sc in schemes:
+            a = entry["schemes"][sc]["acc"]
+            row += f"{(f'{a:.3f}' if a is not None else '—'):>12}"
+        if "delta_bbox_minus_plain" in entry:
+            d = entry["delta_bbox_minus_plain"]
+            row += f"{(f'{d:+.3f}' if d is not None else '—'):>12}"
+        print(row)
+    print("-" * len(head))
+    if "plain" in schemes and "bbox" in schemes:
+        print("Δ(bbox) = acc(bbox hint) − acc(plain); > 0 means the GT box hint helped.")
+
+
+# ----------------------------------------------------------------- orchestrator
+def run_orchestrator(args) -> None:
+    models = parse_models(args.models)
+    groups = [g.strip() for g in args.gpu_groups.split(";") if g.strip()]
+    if len(groups) != len(models):
+        raise SystemExit(f"{len(models)} models but {len(groups)} GPU groups — they must match "
+                         f"(e.g. --models a=..,b=.. --gpu-groups '0,1,2,3;4,5,6,7').")
+    schemes = [s.strip() for s in args.schemes.split(",") if s.strip()]
+    bad = [s for s in schemes if s not in {"plain", "bbox", "draw"}]
+    if bad:
+        raise SystemExit(f"unknown scheme(s) {bad}; pick from plain,bbox,draw")
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cfg_path = out_dir / "config.json"
+    cfg_path.write_text(json.dumps({k: getattr(args, k) for k in _CONFIG_KEYS}, ensure_ascii=False, indent=2))
+
+    # Launch one worker subprocess per model, each pinned to its 4-GPU group.
+    procs = []
+    for (name, path), gpus in zip(models, groups):
+        tp = len([g for g in gpus.split(",") if g.strip()])
+        wout = out_dir / f"worker_{_safe(name)}.jsonl"
+        wlog = out_dir / f"worker_{_safe(name)}.log"
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=gpus)
+        env.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+        cmd = [sys.executable, os.path.abspath(__file__), "--worker",
+               "--config", str(cfg_path), "--model", f"{name}={path}",
+               "--tp", str(tp), "--worker-out", str(wout)]
+        print(f"[bbox-ab] deploy '{name}'  GPUs={gpus} (TP={tp})  ->  log: {wlog}", flush=True)
+        log_fh = open(wlog, "w", encoding="utf-8")
+        procs.append({"name": name, "out": wout, "log": wlog, "fh": log_fh,
+                      "p": subprocess.Popen(cmd, env=env, stdout=log_fh, stderr=subprocess.STDOUT)})
+
+    print(f"[bbox-ab] both models deploying concurrently; waiting ... (tail -f {out_dir}/worker_*.log)", flush=True)
+    failed = []
+    for d in procs:
+        rc = d["p"].wait()
+        d["fh"].close()
+        status = "ok" if rc == 0 else f"FAILED (exit {rc})"
+        print(f"[bbox-ab] worker '{d['name']}' {status}", flush=True)
+        if rc != 0:
+            failed.append(d)
+
+    for d in failed:
+        print(f"\n----- last 30 lines of {d['log']} -----")
+        try:
+            print("".join(d["log"].read_text(encoding='utf-8').splitlines(keepends=True)[-30:]))
+        except Exception:
+            pass
+    if failed:
+        raise SystemExit("[bbox-ab] one or more workers failed; see logs above.")
+
+    # Merge worker JSONLs and report.
+    records: list[dict[str, Any]] = []
+    for d in procs:
+        with open(d["out"], encoding="utf-8") as fh:
+            records.extend(json.loads(line) for line in fh if line.strip())
+    if args.grader == "llm":
+        grade_llm(records, args)
+
+    model_names = [n for n, _ in models]
+    results = summarize(records, model_names, schemes)
+    subsets_seen = sorted({r["subset"] for r in records})
+    per_subset = {sub: summarize([r for r in records if r["subset"] == sub], model_names, schemes)
+                  for sub in subsets_seen}
+
+    with open(out_dir / "records.jsonl", "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    summary = {
+        "dataset": args.dataset, "split": args.split, "subsets": args.subsets,
+        "models": [{"name": n, "path": p, "gpus": g} for (n, p), g in zip(models, groups)],
+        "schemes": schemes, "coord_mode": args.coord_mode, "bbox_hint": args.bbox_hint,
+        "grader": args.grader, "system_prompt": args.system_prompt,
+        "generation": {"max_new_tokens": args.max_new_tokens, "do_sample": args.do_sample,
+                       "temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k},
+        "results": results, "per_subset": per_subset,
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+    print_table(results, schemes)
+    print(f"\n[bbox-ab] wrote {out_dir / 'records.jsonl'} and {out_dir / 'summary.json'}")
+
+
+# ------------------------------------------------------------------------------ main
+def main() -> None:
+    args = parse_args()
+    if args.worker:
+        if args.config:  # inherit the parent's shared eval settings
+            cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+            for k, v in cfg.items():
+                setattr(args, k, v)
+        if not args.model or not args.worker_out:
+            raise SystemExit("--worker needs --model name=path and --worker-out.")
+        run_worker(args)
+    else:
+        run_orchestrator(args)
+
+
+if __name__ == "__main__":
+    main()
