@@ -118,6 +118,82 @@ def _bbox_verdict(value) -> str:
     return f"{shape}; {norm}{'; MULTI-BOX (uses first)' if plural else ''}"
 
 
+def _raw_jsonl_probe(path: str) -> None:
+    """Fallback when ``load_dataset`` chokes on schema drift across files (Visual-CoT
+    ships per-domain JSONLs with mismatched columns). Reads the first line of each
+    JSONL raw, prints the per-file column sets + the columns common to ALL (the safe
+    schema for an adapter), a sample row, the bbox verdict, and — crucially — which
+    root the ``image`` path resolves under (so the adapter can locate the files)."""
+    import glob
+    import json
+
+    files = sorted(glob.glob(os.path.join(path, "**", "*.jsonl"), recursive=True))
+    if not files:
+        files = sorted(glob.glob(os.path.join(path, "**", "*.json"), recursive=True))
+    if not files:
+        print("  (no .jsonl/.json under the dir to raw-probe)")
+        return
+    print(f"  load_dataset failed (schema drift); raw-probing {len(files)} file(s).")
+    try:
+        print(f"  top-level dir: {sorted(os.listdir(path))[:25]}")
+    except OSError:
+        pass
+
+    colsets: dict[tuple, list] = {}
+    sample_row = sample_file = None
+    for f in files:
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                row = json.loads(fh.readline())
+        except Exception as exc:  # noqa: BLE001
+            print(f"    {os.path.relpath(f, path)}: !! {type(exc).__name__}")
+            continue
+        colsets.setdefault(tuple(sorted(row)), []).append(os.path.relpath(f, path))
+        if sample_row is None:
+            sample_row, sample_file = row, f
+
+    print("\n  -- column sets across files --")
+    for keys, fs in colsets.items():
+        print(f"    {list(keys)}  <- {len(fs)} file(s), e.g. {fs[0]}")
+    if colsets:
+        common = set.intersection(*[set(k) for k in colsets])
+        print(f"  -- columns COMMON to ALL files (safe adapter schema): {sorted(common)} --")
+    if sample_row is None:
+        return
+
+    print(f"\n  -- sample row ({os.path.relpath(sample_file, path)}) --")
+    for k, v in sample_row.items():
+        print(f"    {k:16s}: {_summarize(v, k)}")
+    for bk in [k for k in sample_row if k in _BBOX_CANDIDATES or "box" in k.lower()]:
+        print(f"  bbox field {bk!r}: {_bbox_verdict(sample_row[bk])}  raw={sample_row[bk]!r}")
+
+    img_key = next(
+        (k for k in ("image", "images", "image_path", "file_name") if k in sample_row),
+        None,
+    )
+    if img_key is not None:
+        val = sample_row[img_key]
+        if isinstance(val, (list, tuple)):
+            val = val[0] if val else None
+        print(f"\n  -- image field {img_key!r} value: {val!r} --")
+        if isinstance(val, str):
+            meta_dir = os.path.dirname(sample_file)
+            roots = [
+                path,
+                os.path.join(path, "images"),
+                os.path.join(path, "image"),
+                meta_dir,
+                os.path.dirname(meta_dir),
+            ]
+            hit = next((r for r in roots if os.path.exists(os.path.join(r, val))), None)
+            if hit:
+                print(f"  -> RESOLVES: <root>/{val}  with root = {hit}")
+            else:
+                print("  -> NOT found; tried (need the real image root):")
+                for r in roots:
+                    print(f"       {os.path.join(r, val)}")
+
+
 def inspect(path: str, split: str, n: int) -> None:
     print("\n" + "=" * 88)
     print(f"DATASET: {path}  (split={split})")
@@ -125,7 +201,9 @@ def inspect(path: str, split: str, n: int) -> None:
     try:
         ds = _load(path, split)
     except Exception as exc:  # noqa: BLE001
-        print(f"  !! failed to load: {type(exc).__name__}: {exc}")
+        print(f"  !! load_dataset failed: {type(exc).__name__}: {str(exc)[:200]}")
+        if os.path.isdir(path):
+            _raw_jsonl_probe(path)
         return
     cols = list(ds.column_names)
     print(f"rows={len(ds)}  columns={cols}")
