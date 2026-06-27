@@ -98,10 +98,16 @@ def load_opd_dataset(dataset_name: str, split: str = "train", *, verbose: bool =
     """Load an OPD training set, adapting ViRL39K-style local parquet on the way.
 
     A local ViRL39K parquet/dir is loaded via the parquet builder (avoiding the
-    imagefolder trap) and remapped to ``problem`` / ``image`` / ``answer``. Every
-    other ``dataset_name`` (HuggingFace id, canonical local dataset) defers to
+    imagefolder trap) and remapped to ``problem`` / ``image`` / ``answer``. A local
+    **Visual-CoT** dir (per-domain ``metadata/*.jsonl`` with ``bboxs``/``image``) is
+    remapped to ``problem`` / ``image`` / ``answer`` / ``bbox`` (pixel box normalized
+    to [0,1] — usable by the grounding-hint collator). Every other ``dataset_name``
+    (HuggingFace id, canonical local dataset) defers to
     :func:`vigos.dataset_utils.load_vigos_dataset`.
     """
+    if _looks_like_viscot(dataset_name):
+        return load_viscot_dataset(dataset_name, split, verbose=verbose)
+
     parquet_files, base_dir = _local_parquet_files(dataset_name)
     if parquet_files is None:
         from vigos.dataset_utils import load_vigos_dataset
@@ -161,3 +167,196 @@ def _adapt_virl39k(
             flush=True,
         )
     return dataset
+
+
+# --- Visual-CoT (deepcs233/Visual-CoT) --------------------------------------------
+# Per-domain ``metadata/*.jsonl`` with COMMON columns question / answer / bboxs /
+# dataset / image / width / height (other columns — reasoning/thought/full_answer/
+# possible_answers/multiple_choices — vary across files, so we load each file and
+# keep only the shared core). bboxs are NESTED PIXEL boxes ``[[x1,y1,x2,y2]]``;
+# image is a bare basename; the actual files live under the extracted image root.
+_VISCOT_CORE_COLS = ("question", "answer", "bboxs", "image", "width", "height")
+_VISCOT_IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif")
+
+
+def _viscot_jsonl_files(path: str) -> list[str]:
+    """All Visual-CoT per-domain JSONLs (the canonical ``metadata/`` 363k set)."""
+    import glob
+
+    return sorted(glob.glob(os.path.join(path, "metadata", "*.jsonl")))
+
+
+def _looks_like_viscot(dataset_name: str) -> bool:
+    """A local Visual-CoT dir = has ``metadata/*.jsonl`` or the ``viscot_363k.json``."""
+    if not isinstance(dataset_name, str) or not os.path.isdir(dataset_name):
+        return False
+    if os.path.exists(os.path.join(dataset_name, "viscot_363k.json")):
+        return True
+    return bool(_viscot_jsonl_files(dataset_name))
+
+
+def _normalize_viscot_bbox(boxes: Any, width: Any, height: Any) -> str:
+    """First pixel box ``[[x1,y1,x2,y2]]`` -> normalized ``"[x1, y1, x2, y2]"`` string
+    in [0,1] (the saliency-r1-8k bbox form parse_bbox_norm expects). ``""`` if the
+    box / dims are missing or degenerate (the collator then falls back to no hint)."""
+    try:
+        w, h = float(width), float(height)
+    except (TypeError, ValueError):
+        return ""
+    if w <= 0 or h <= 0 or not boxes:
+        return ""
+    box = boxes[0] if isinstance(boxes[0], (list, tuple)) else boxes
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return ""
+    try:
+        x1, y1, x2, y2 = (float(v) for v in box)
+    except (TypeError, ValueError):
+        return ""
+    x1, x2 = sorted((x1 / w, x2 / w))
+    y1, y2 = sorted((y1 / h, y2 / h))
+    clamp = lambda v: min(max(v, 0.0), 1.0)  # noqa: E731
+    x1, y1, x2, y2 = (clamp(v) for v in (x1, y1, x2, y2))
+    if (x2 - x1) <= 1e-3 or (y2 - y1) <= 1e-3:
+        return ""
+    return f"[{x1:.4f}, {y1:.4f}, {x2:.4f}, {y2:.4f}]"
+
+
+def _build_viscot_image_index(root: str, *, verbose: bool = True) -> dict[str, str]:
+    """``{basename: abspath}`` over the extracted image root (one os.walk, cached to
+    ``<root>/.viscot_basename_index.json``). Layout-agnostic: Visual-CoT extracts the
+    image tars into per-source subdirs, but the JSONL ``image`` is a bare basename, so
+    a basename index resolves it regardless of the exact subdir structure."""
+    import json
+
+    cache_path = os.path.join(root, ".viscot_basename_index.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as handle:
+                index = json.load(handle)
+            if verbose:
+                print(f"[viscot] loaded image index cache ({len(index)} basenames).")
+            return index
+        except Exception:  # noqa: BLE001 - rebuild on any cache read failure
+            pass
+    index: dict[str, str] = {}
+    total = 0
+    for dirpath, _dirs, filenames in os.walk(root):
+        for name in filenames:
+            if name.lower().endswith(_VISCOT_IMAGE_EXTS):
+                total += 1
+                index.setdefault(name, os.path.join(dirpath, name))
+    if verbose:
+        print(
+            f"[viscot] indexed {total} image files ({len(index)} unique basenames) "
+            f"under {root}.",
+            flush=True,
+        )
+    try:
+        with open(cache_path, "w", encoding="utf-8") as handle:
+            json.dump(index, handle)
+    except Exception:  # noqa: BLE001 - cache is best-effort
+        pass
+    return index
+
+
+def _resolve_viscot_image(
+    image_value: Any, dataset_name: Any, root: str, index: dict[str, str]
+) -> str | None:
+    """Resolve a Visual-CoT ``image`` to an absolute path: basename index first (no
+    stat), then the ``<root>/<dataset>/...`` source-subdir guesses as a fallback."""
+    if isinstance(image_value, (list, tuple)):
+        image_value = image_value[0] if image_value else None
+    if not isinstance(image_value, str) or not image_value:
+        return None
+    base = os.path.basename(image_value)
+    hit = index.get(base) or index.get(image_value)
+    if hit is not None:
+        return hit
+    candidates = [os.path.join(root, image_value)]
+    if isinstance(dataset_name, str) and dataset_name:
+        candidates += [
+            os.path.join(root, dataset_name, image_value),
+            os.path.join(root, dataset_name, base),
+            os.path.join(root, dataset_name, "images", base),
+        ]
+    return next((c for c in candidates if os.path.exists(c)), None)
+
+
+def load_viscot_dataset(
+    path: str,
+    split: str = "train",
+    *,
+    image_root: str | None = None,
+    verbose: bool = True,
+):
+    """Load Visual-CoT into the canonical OPD schema ``problem`` / ``image`` (PIL) /
+    ``answer`` / ``bbox`` (pixel box normalized to [0,1]).
+
+    The per-domain ``metadata/*.jsonl`` (the canonical 363k) are read as raw JSON and
+    folded into ONE ``Dataset.from_list`` — this sidesteps the schema-drift that makes
+    ``load_dataset`` choke (the files' *extra* columns differ) and any cross-file
+    feature-type mismatch. Per row: ``question``->``problem``; ``bboxs[0]`` (pixel) is
+    normalized by ``width``/``height``; ``image`` (a bare basename) is resolved against
+    ``image_root`` (env ``VISCOT_IMAGE_ROOT``, else the dataset dir). Rows whose image
+    can't be found are dropped (loudly if *all* are — i.e. images not extracted yet).
+    """
+    import json
+
+    from datasets import Dataset, Image
+
+    files = _viscot_jsonl_files(path)
+    if not files:
+        raise ValueError(
+            f"No metadata/*.jsonl under {path!r}; not a Visual-CoT dataset dir."
+        )
+    root = image_root or os.environ.get("VISCOT_IMAGE_ROOT") or path
+    index = _build_viscot_image_index(root, verbose=verbose)
+
+    records: list[dict[str, Any]] = []
+    n_total = n_resolved = n_box = 0
+    for jsonl in files:
+        with open(jsonl, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "question" not in row or "answer" not in row or "image" not in row:
+                    continue
+                n_total += 1
+                resolved = _resolve_viscot_image(
+                    row.get("image"), row.get("dataset"), root, index
+                )
+                if resolved is None:
+                    continue
+                n_resolved += 1
+                bbox = _normalize_viscot_bbox(
+                    row.get("bboxs"), row.get("width"), row.get("height")
+                )
+                if bbox:
+                    n_box += 1
+                records.append(
+                    {
+                        "problem": str(row.get("question", "")).strip(),
+                        "image": resolved,
+                        "answer": row.get("answer"),
+                        "bbox": bbox,
+                    }
+                )
+    if not records:
+        raise ValueError(
+            f"Visual-CoT: 0/{n_total} rows had a resolvable image under {root!r}. "
+            "Extract the image tars (cot_images_tar_split/) and point VISCOT_IMAGE_ROOT "
+            "at the directory that contains the image files."
+        )
+    if verbose:
+        print(
+            f"[viscot] {n_resolved}/{n_total} rows with a resolved image "
+            f"({n_box} with a usable evidence box) from {len(files)} metadata file(s); "
+            f"image_root={root}.",
+            flush=True,
+        )
+    return Dataset.from_list(records).cast_column("image", Image())

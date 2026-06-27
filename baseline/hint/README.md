@@ -53,13 +53,29 @@ Nothing in `vigos/` or the vanilla OPD files is modified — GHD is purely addit
 
 ## Data
 
-Needs an evidence-box column. **`peterant330/saliency-r1-8k`** ships
-`problem` / `solution` / `bbox` / `image`, where `bbox` is a string
-`"[x1, y1, x2, y2]"` normalized to `[0,1]` (reused via
-`baseline.probe.saliency_data.parse_bbox_norm`, which order-normalizes, clamps,
-and drops degenerate boxes). Set `ANSWER_FIELD=solution`. Rows without a parseable
-box are dropped by default (`--filter_no_bbox true`); the `hint_coverage` W&B
-curve reports the fraction of each batch that was actually privileged.
+Needs an evidence-box column. Two datasets are wired in:
+
+**`saliency-r1-8k`** (`peterant330/saliency-r1-8k`) — `problem` / `solution` /
+`bbox` / `image`, where `bbox` is a string `"[x1,y1,x2,y2]"` normalized to `[0,1]`.
+Set `ANSWER_FIELD=solution`. Loads as-is.
+
+**`Visual-CoT`** (`deepcs233/Visual-CoT`) — per-domain `metadata/*.jsonl` with
+`question` / `answer` / `bboxs` (nested **pixel** box) / `image` (basename) /
+`width` / `height` / `dataset`. `baseline.opd_dataset.load_viscot_dataset` (auto-
+detected by `load_opd_dataset`) folds the JSONLs into one dataset, renames
+`question→problem`, normalizes `bboxs[0]` by `width`/`height` → the `bbox` string,
+and resolves each image via a cached basename index over the **extracted** image
+root (`VISCOT_IMAGE_ROOT`, default the dataset dir). Set `ANSWER_FIELD=answer`.
+Extract the image tars first: `cd $D/Visual-CoT && cat cot_images_tar_split/* >
+cot_images.tar && tar xf cot_images.tar` (then optionally delete the tar). Pre-flight
+with `python -c "from baseline.opd_dataset import load_viscot_dataset as L;
+print(L('$D/Visual-CoT')[0])"`.
+
+`bbox` parsing is `baseline.probe.saliency_data.parse_bbox_norm` (order-normalizes,
+clamps, drops degenerate boxes). `--filter_no_bbox true` (default) drops boxless
+rows so every GHD step is privileged; set **`false` to keep parity** with a vanilla-OPD
+baseline on the same dataset (then unboxed rows fall back to plain OPD). The
+`hint_coverage` W&B curve reports the privileged fraction of each batch.
 
 ## Run
 
