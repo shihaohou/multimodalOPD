@@ -128,7 +128,16 @@ Difference from what this repo does today:
   `baseline/eval/run_mmvp_eval.py` + `scripts/eval_mmvp.sh` (MMVP pair accuracy);
   `baseline/eval/run_vqa_eval.py` + `baseline/eval/vqa_metrics.py` +
   `scripts/eval_vqa.sh` (POPE F1 / ChartQA relaxed accuracy / VQAv2 soft accuracy —
-  `BENCHMARKS=pope,chartqa,vqav2`, one engine load for all three).
+  `BENCHMARKS=pope,chartqa,vqav2`, one engine load for all three);
+  `baseline/eval/run_vstar_eval.py` + `scripts/eval_vstar.sh` (**V*Bench** visual
+  search, 191 high-res MCQs in `direct_attributes`/`relative_position`; overall +
+  per-category accuracy; reuses MMVP's `match_option_letter`/`parse_mmvp_options`).
+  V*Bench stores images as path-strings in `test_questions.jsonl` (NOT an embedded
+  image feature), so the loader `snapshot_download`s the repo and resolves paths,
+  like MMVP — `VSTAR_REPO=craigwu/vstar_bench` (id) or a local snapshot dir. Its
+  `summary.json` uses the deterministic-group shape (`benchmarks:{vstar:{metrics}}`)
+  so `make_report.py` folds it in (column `vstar (acc)`); opt into the matrix runner
+  with `eval_opd_multi.sh`'s `DATASETS="… vstar"` (OFF by default).
 - `scripts/eval_suite.sh` + `baseline/eval/aggregate_suite.py` — **one-command full
   suite**: runs the LLM-judged group (`eval_opd.sh`: MathVista/MathVerse/MathVision/
   MMMU/MMMU-Pro×2/MMStar/HallusionBench) and the deterministic group (`eval_vqa.sh`:

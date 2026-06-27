@@ -116,7 +116,9 @@ case "$(printf '%s' "${DET_SPLIT:-1}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 # Default benchmark set (override DATASETS to run a subset). Judged group + the three
-# deterministic benchmarks (matched by name and routed to eval_vqa.sh).
+# deterministic benchmarks (matched by name and routed to eval_vqa.sh). V*Bench is
+# deterministic too but OFF by default (it needs the vstar_bench snapshot / VSTAR_REPO);
+# opt in with  DATASETS="$JUDGED_DEFAULT $DET_DEFAULT vstar"  -> routed to eval_vstar.sh.
 JUDGED_DEFAULT="mathvista mathverse mathvision MMMU mmmu_pro_10options mmmu-pro-vision mmstar hallusionbench"
 DET_DEFAULT="pope chartqa vqav2"
 DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT}"
@@ -130,8 +132,11 @@ DSROOT="${DSROOT:-$D/zli12321}"
 export POPE_REPO="${POPE_REPO:-$D/POPE}"        # passed through to eval_vqa.sh (det group)
 export CHARTQA_REPO="${CHARTQA_REPO:-$D/ChartQA}"
 export VQAV2_REPO="${VQAV2_REPO:-$D/VQAv2}"
+export VSTAR_REPO="${VSTAR_REPO:-$D/vstar_bench}"  # passed to eval_vstar.sh (det-style MCQ, no judge)
 # Names (case-insensitive) that are deterministic -> eval_vqa.sh, never the judge.
 is_det() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in pope|chartqa|vqav2) return 0 ;; *) return 1 ;; esac; }
+# V*Bench: deterministic MCQ too, but its OWN evaluator (eval_vstar.sh), never the judge.
+is_vstar() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in vstar|vstar_bench|vstarbench|v-star) return 0 ;; *) return 1 ;; esac; }
 
 # A model's output-subdir + matrix label. Explicit "tag=path" in MODELS wins;
 # otherwise it is derived from the PATH. Usually the basename is descriptive enough
@@ -171,6 +176,7 @@ fi
 # ---- classify requested benchmarks into judged dirs + deterministic group ----
 JUDGED_DIRS=()      # absolute dirs for the judged group
 DET_GROUP=()        # lowercase det benchmark names (pope/chartqa/vqav2)
+VSTAR_REQUESTED=false   # V*Bench requested? routes to eval_vstar.sh (det-style, no judge)
 if [[ -n "${DATASET_DIRS:-}" ]]; then
   IFS=',' read -r -a _dirs <<< "$DATASET_DIRS"
   for d in "${_dirs[@]}"; do [[ -n "$d" ]] && JUDGED_DIRS+=("$d"); done
@@ -195,6 +201,18 @@ else
           fi ;;
       esac
       DET_GROUP+=("$lc")
+    elif is_vstar "$name"; then
+      # V*Bench: like the det group it needs no judge, but routes to eval_vstar.sh. A
+      # local-looking VSTAR_REPO that doesn't exist -> skip with a clear message (a bare
+      # hub id like craigwu/vstar_bench isn't path-checked; eval_vstar.sh fetches it).
+      case "$VSTAR_REPO" in
+        /*|./*|../*|"~"*)
+          if [[ ! -e "$VSTAR_REPO" ]]; then
+            echo "[skip] vstar repo not found: $VSTAR_REPO (set VSTAR_REPO to a snapshot dir, or a HF id)" >&2
+            continue
+          fi ;;
+      esac
+      VSTAR_REQUESTED=true
     else
       : "${DSROOT:?Set DSROOT (judged datasets join as DSROOT/name), or DATASET_DIRS.}"
       JUDGED_DIRS+=("$DSROOT/$name")
@@ -236,6 +254,10 @@ for tm in "${_models[@]}"; do
     SPECS+=("det|${tag}|${model}|${DET_CSV}")        # one job, all three on one card
     DET_N=$((DET_N + 1))
   fi
+  if [[ "$VSTAR_REQUESTED" == "true" ]]; then
+    SPECS+=("vstar|${tag}|${model}|${VSTAR_REPO}")   # its own card; needs no judge
+    DET_N=$((DET_N + 1))
+  fi
 done
 [[ ${#SPECS[@]} -eq 0 ]] && { echo "No jobs to run (check MODELS / datasets)."; exit 1; }
 
@@ -264,6 +286,8 @@ job_out() {  # kind tag payload
     else
       printf '%s/%s/_vqa_%s' "$OUTPUT_ROOT" "$2" "$3"
     fi
+  elif [[ "$1" == "vstar" ]]; then
+    printf '%s/%s/_vstar' "$OUTPUT_ROOT" "$2"
   else
     local s; s="$(basename "$3")"; s="${s//[^A-Za-z0-9_.-]/_}"
     printf '%s/%s/%s' "$OUTPUT_ROOT" "$2" "$s"
@@ -295,6 +319,12 @@ run_job() {  # kind card tag model payload
       bash scripts/eval_vqa.sh > "$logf" 2>&1
     return
   fi
+  if [[ "$kind" == "vstar" ]]; then
+    CUDA_VISIBLE_DEVICES="$card" MODEL_PATH="$model" MODEL_NAME="$tag" \
+      VSTAR_REPO="$payload" OUTPUT_DIR="$out" \
+      bash scripts/eval_vstar.sh > "$logf" 2>&1
+    return
+  fi
   local -a job_env=(MODEL_PATH="$model" MODEL_NAME="$tag" EVAL_DATASETS="$payload" OUTPUT_DIR="$out")
   case "$PHASE" in
     generate) job_env+=(CUDA_VISIBLE_DEVICES="$card" SKIP_JUDGE=true) ;;
@@ -306,7 +336,7 @@ run_job() {  # kind card tag model payload
 
 # Human label for a spec (kind|tag|model|payload).
 spec_label() { # kind tag payload
-  if [[ "$1" == "det" ]]; then echo "vqa[$3]"; else echo "$(basename "$3")"; fi
+  if [[ "$1" == "det" ]]; then echo "vqa[$3]"; elif [[ "$1" == "vstar" ]]; then echo "vstar"; else echo "$(basename "$3")"; fi
 }
 
 if [[ "$DRYRUN" == "1" ]]; then
@@ -315,11 +345,11 @@ if [[ "$DRYRUN" == "1" ]]; then
   for spec in "${SPECS[@]}"; do
     IFS='|' read -r kind tag model payload <<< "$spec"
     label="$(spec_label "$kind" "$tag" "$payload")"
-    if [[ "$RESUME" == "true" && ! ( "$PHASE" == "judge" && "$kind" == "det" ) ]] \
+    if [[ "$RESUME" == "true" && ! ( "$PHASE" == "judge" && ( "$kind" == "det" || "$kind" == "vstar" ) ) ]] \
        && job_done "$kind" "$(job_out "$kind" "$tag" "$payload")"; then
       echo "skip done (RESUME) | ${tag} | ${label}"
-    elif [[ "$PHASE" == "judge" && "$kind" == "det" ]]; then
-      echo "skip (det scored in generate) | ${tag} | ${label}"
+    elif [[ "$PHASE" == "judge" && ( "$kind" == "det" || "$kind" == "vstar" ) ]]; then
+      echo "skip (scored in generate) | ${tag} | ${label}"
     elif [[ "$PHASE" == "judge" ]]; then
       echo "judge (no GPU) | ${tag} | ${label} | $model"
     else
@@ -336,7 +366,7 @@ if [[ "$PHASE" == "judge" ]]; then
   i=0
   for spec in "${SPECS[@]}"; do
     IFS='|' read -r kind tag model payload <<< "$spec"
-    [[ "$kind" == "det" ]] && continue   # deterministic already scored in generate
+    [[ "$kind" == "det" || "$kind" == "vstar" ]] && continue   # deterministic already scored in generate
     i=$((i + 1))
     jout="$(job_out "$kind" "$tag" "$payload")"
     if [[ "$RESUME" == "true" ]] && job_done "$kind" "$jout"; then
@@ -412,6 +442,7 @@ DET_METRIC = {  # det benchmark -> (metric key in summary['benchmarks'][name]['m
     "pope": ("f1", "pope(F1)"),
     "chartqa": ("relaxed_accuracy", "chartqa(relax)"),
     "vqav2": ("vqa_accuracy", "vqav2(soft)"),
+    "vstar": ("accuracy", "vstar(acc)"),
 }
 matrix, tags = {}, set()
 # Recursive: a model's output folder may be nested (e.g. "<run>/checkpoint-93"), so

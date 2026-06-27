@@ -38,6 +38,7 @@ DET_METRIC = {
     "pope": ("f1", "pope (F1)"),
     "chartqa": ("relaxed_accuracy", "chartqa (relax)"),
     "vqav2": ("vqa_accuracy", "vqav2 (soft)"),
+    "vstar": ("accuracy", "vstar (acc)"),
 }
 
 # Preferred column order (the standard suite); unknown benchmarks sort alphabetically
@@ -46,7 +47,7 @@ BENCH_ORDER = [
     "mathvista", "mathverse", "mathvision",
     "MMMU", "mmmu_pro_10options", "mmmu-pro-vision",
     "mmstar", "hallusionbench",
-    "pope (F1)", "chartqa (relax)", "vqav2 (soft)",
+    "pope (F1)", "chartqa (relax)", "vqav2 (soft)", "vstar (acc)",
 ]
 
 AVG_LABEL = "Avg (judged)"
