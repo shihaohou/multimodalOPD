@@ -140,9 +140,26 @@ def clean_reasoning(text: str, max_chars: int) -> str:
 
 
 def build_locate_target(bbox, reasoning: str, answer: str, *, decimals: int) -> str:
+    """inject mode: wrap the (grounded, --gen_hint) reasoning, introducing the injected
+    GT box in a natural sentence (not a bare line) so it reads as part of the flow."""
     coords = "[" + ", ".join(f"{v:.{decimals}f}" for v in bbox) + "]"
-    reasoning = reasoning.strip() or "Looking at that region to answer the question."
-    return f"<think>\n<box>{coords}</box>\n{reasoning}\n</think>\n\\boxed{{{answer}}}"
+    intro = f"To answer this, I should focus on the region <box>{coords}</box>."
+    reasoning = reasoning.strip()
+    body = f"{intro}\n{reasoning}" if reasoning else intro
+    return f"<think>\n{body}\n</think>\n\\boxed{{{answer}}}"
+
+
+def build_natural_target(text: str, answer: str, *, max_chars: int) -> str:
+    """natural mode: wrap the teacher's box-woven reasoning into the locate format —
+    KEEP its ``<box>`` (woven in), drop the trailing ``\\boxed`` + any ``<think>`` tags,
+    re-wrap + the GT answer. (Unlike ``clean_reasoning``, does NOT strip ``<box>``.)"""
+    idx = text.find("\\boxed{")
+    if idx >= 0:
+        text = text[:idx]
+    text = text.replace("<think>", "").replace("</think>", "").strip()
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars].rsplit(" ", 1)[0].rstrip() + " ..."
+    return f"<think>\n{text}\n</think>\n\\boxed{{{answer}}}"
 
 
 def main() -> None:
@@ -258,26 +275,36 @@ def main() -> None:
 
     # --- rejection-filter + build targets ---------------------------------------
     records: list[dict[str, Any]] = []
-    n_correct_pool = 0
+    n_correct = 0  # samples with >=1 answer-correct candidate
+    n_box = 0      # (natural) correct samples whose candidate also has a parseable <box>
     natural = args.trace_mode == "natural"
     for sample, output in zip(samples, outputs, strict=True):
-        chosen_text = None
-        for cand in output.outputs:
-            if not _answer_matches(extract_boxed_content(cand.text), sample["answer"]):
-                continue
-            # natural: the verbatim trace must already be a clean, parseable locate trace.
-            if natural and (parse_student_box(cand.text) is None or "<think>" not in cand.text):
-                continue
-            chosen_text = cand.text
-            n_correct_pool += 1
-            break
-        if chosen_text is None:
-            # natural never force-keeps (the trace itself must be valid); inject may.
-            if natural or not args.keep_incorrect:
-                continue
-            chosen_text = output.outputs[0].text  # forced GT answer below
+        correct = [
+            cand.text
+            for cand in output.outputs
+            if _answer_matches(extract_boxed_content(cand.text), sample["answer"])
+        ]
+        if correct:
+            n_correct += 1
         if natural:
-            target = chosen_text.strip()  # teacher wrote the whole trace; use as-is
+            # natural needs the GENERATOR to emit a parseable <box> (no <think> required —
+            # build_natural_target re-wraps); inject injects the box, so a correct answer
+            # is enough (and --keep_incorrect can force one).
+            chosen_text = next((t for t in correct if parse_student_box(t) is not None), None)
+            if chosen_text is not None:
+                n_box += 1
+        elif correct:
+            chosen_text = correct[0]
+        elif args.keep_incorrect and output.outputs:
+            chosen_text = output.outputs[0].text
+        else:
+            chosen_text = None
+        if chosen_text is None:
+            continue
+        if natural:
+            target = build_natural_target(
+                chosen_text, sample["answer"], max_chars=args.max_reasoning_chars
+            )
         else:
             reasoning = clean_reasoning(chosen_text, args.max_reasoning_chars)
             target = build_locate_target(
@@ -285,20 +312,24 @@ def main() -> None:
             )
         records.append({"image": sample["image"], "problem": sample["problem"], "target": target})
 
+    total = len(samples)
+    print(f"[coldstart] {n_correct}/{total} samples had a correct answer.", flush=True)
+    if natural:
+        print(
+            f"[coldstart] of those, {n_box}/{total} also had a parseable <box>. If this is "
+            "~0 the generator is not emitting <box> tags (CapCurriculum writes coords in "
+            "prose) -> use TRACE_MODE=inject GEN_HINT=true (injects the box; needs only a "
+            "correct answer).",
+            flush=True,
+        )
     if not records:
         raise ValueError(
-            "0 cold-start traces kept. inject: lower the bar with --keep_incorrect / raise "
-            "--num_samples. natural: the teacher must emit a parseable <box> + <think> + "
-            "correct \\boxed{} — raise --num_samples, use a stronger --gen_model, or check "
-            "answer matching."
+            "0 cold-start traces kept (see counts above). Most robust fix: TRACE_MODE=inject "
+            "GEN_HINT=true (grounded reasoning + an injected <box>, only needs a correct "
+            "answer). Or raise --num_samples / --keep_incorrect / use a stronger --gen_model."
         )
     kept = len(records)
-    print(
-        f"[coldstart] kept {kept}/{len(samples)} traces "
-        f"(correct-attempt rate {n_correct_pool / max(1, len(samples)):.2f}; "
-        f"keep_incorrect={args.keep_incorrect}).",
-        flush=True,
-    )
+    print(f"[coldstart] kept {kept}/{total} traces (mode={args.trace_mode}).", flush=True)
     out = Dataset.from_list(records).cast_column("image", Image())
     out.save_to_disk(args.output_dir)
     print(f"[coldstart] saved {kept} traces -> {args.output_dir}", flush=True)

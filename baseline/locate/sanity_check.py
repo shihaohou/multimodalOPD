@@ -157,18 +157,28 @@ def check_pg_gradient() -> None:
 def check_coldstart() -> None:
     """Cold-start SFT plumbing: label assembly + the trace target round-trips through
     the RL box parser (so a cold-started student's boxes are parseable -> RL fires)."""
-    from baseline.locate.coldstart_build import build_locate_target, clean_reasoning
+    from baseline.locate.coldstart_build import (
+        build_locate_target,
+        build_natural_target,
+        clean_reasoning,
+    )
     from baseline.locate.coldstart_collator import IGNORE_INDEX, assemble_sft_row
 
     inp, lab = assemble_sft_row([1, 2, 3], [4, 5], eos_id=9)
     assert inp == [1, 2, 3, 4, 5, 9], inp
     assert lab == [IGNORE_INDEX] * 3 + [4, 5, 9], lab  # prompt masked, target+EOS supervised
 
+    # inject: clean_reasoning strips <box>; build_locate_target re-introduces it naturally.
     reasoning = clean_reasoning("The crown is brown. <think>x</think> \\boxed{No}", 0)
     assert "boxed" not in reasoning and "<think>" not in reasoning, reasoning
     target = build_locate_target((0.1, 0.2, 0.5, 0.6), reasoning, "No", decimals=2)
-    assert target.startswith("<think>\n<box>[0.10, 0.20, 0.50, 0.60]</box>"), target
+    assert target.startswith("<think>") and "<box>[0.10, 0.20, 0.50, 0.60]</box>" in target, target
     assert parse_student_box(target) == (0.1, 0.2, 0.5, 0.6), parse_student_box(target)
+    # natural: keep the teacher's woven box, re-wrap with <think> + GT answer.
+    woven = "I should look at <box>[0.30, 0.40, 0.70, 0.80]</box>, where ... \\boxed{x}"
+    nat = build_natural_target(woven, "Yes", max_chars=0)
+    assert parse_student_box(nat) == (0.3, 0.4, 0.7, 0.8), parse_student_box(nat)
+    assert nat.rstrip().endswith("\\boxed{Yes}") and "<box>" in nat, nat
     print("[log-sanity] check_coldstart OK")
 
 
