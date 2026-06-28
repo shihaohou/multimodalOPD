@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 from typing import Any
 
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -66,10 +67,11 @@ from vigos.answer_utils import extract_boxed_content, normalize_reference_answer
 # the cold-started student's reasoning is closer to the OPD target.
 NATURAL_GEN_TEMPLATE = (
     "Hint: the single most relevant region for this question is <box>{bbox}</box> "
-    "(coordinates normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Begin your "
-    "reasoning inside <think> by restating this region once as <box>{bbox}</box>, then "
-    "reason about what is in that region to answer the question, and give the final answer "
-    "in \\boxed{{}}."
+    "(coordinates normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Inside <think>, "
+    "first decide where to look in one short, natural sentence that weaves in this region "
+    "as <box>{bbox}</box> (for example: \"To answer this, I should focus on the region "
+    "<box>{bbox}</box>, where ...\"). Do NOT just paste the box on its own line. Then reason "
+    "about what is in that region, and give the final answer in \\boxed{{}}."
 )
 
 try:  # optional, better math/MCQ matching when available
@@ -87,7 +89,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--answer_field", default="answer")
     ap.add_argument("--bbox_field", default="bbox")
     ap.add_argument("--output_dir", required=True, help="save_to_disk target for the SFT dataset.")
-    ap.add_argument("--max_samples", type=int, default=4000, help="Prompts to draw from (boxed rows).")
+    ap.add_argument("--max_samples", type=int, default=4000, help="Prompts to draw from (boxed rows). Kept traces are fewer (rejection).")
+    ap.add_argument("--no_shuffle", action="store_true", help="Take the first max_samples boxed rows in dataset order instead of a seeded random draw (default: shuffle, for representative coverage across domains).")
     ap.add_argument("--num_samples", type=int, default=4, help="vLLM samples per prompt (rejection pool).")
     ap.add_argument("--temperature", type=float, default=0.8)
     ap.add_argument("--top_p", type=float, default=0.95)
@@ -155,8 +158,14 @@ def main() -> None:
 
     # --- collect boxed samples ---------------------------------------------------
     dataset = load_opd_dataset(args.dataset_name, args.dataset_split)
+    indices = list(range(len(dataset)))
+    if not args.no_shuffle:
+        # Representative draw: Visual-CoT is folded from per-domain JSONLs in order, so a
+        # first-N slice would be skewed to the first domain(s). Seeded for reproducibility.
+        random.Random(args.seed).shuffle(indices)
     samples: list[dict[str, Any]] = []
-    for row in dataset:
+    for idx in indices:
+        row = dataset[int(idx)]
         bbox = parse_bbox_norm(row.get(args.bbox_field))
         if bbox is None:
             continue
