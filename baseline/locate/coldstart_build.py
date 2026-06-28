@@ -26,7 +26,11 @@ Pipeline (self-distillation cold-start), per ``(image, question, GT answer, GT b
 Only the ``<think>``/``<box>`` scaffold + the GT box are injected; the reasoning is
 the model's own (in-distribution), so SFT teaches the FORMAT and box *prediction*
 (image+Q -> GT box) without rewriting the reasoning distribution. RL+OPD then refine
-grounding. ``--gen_model`` generates with a different/stronger model (e.g. the teacher).
+grounding. ``--gen_model`` generates with a different/stronger model (e.g. the teacher);
+``--gen_hint`` additionally feeds that generator the GT box via the OPD hidden-hint
+prompt (no-verbalize) so its reasoning is GROUNDED to the evidence region — the
+strongest cold-start. The box is GT-injected either way; these flags only change the
+quality/grounding of the *reasoning* text.
 
 Run (single GPU, vLLM):
     uv run python -m baseline.locate.coldstart_build \\
@@ -78,6 +82,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bbox_decimals", type=int, default=2)
     ap.add_argument("--keep_incorrect", action="store_true", help="If no attempt is correct, keep one anyway with the GT answer forced (more data, noisier).")
     ap.add_argument("--gen_system_prompt", default="think", help="System-prompt style for GENERATION (think/freecot/reason/none).")
+    ap.add_argument("--gen_hint", action="store_true", help="Generate with the hidden-hint teacher prompt (generator silently sees the GT box, forbidden to verbalize it) so the reasoning is GROUNDED to the evidence region. Use with --gen_model <teacher>.")
     # vLLM
     ap.add_argument("--tensor_parallel_size", type=int, default=1)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
@@ -173,12 +178,35 @@ def main() -> None:
         max_tokens=args.max_tokens,
         seed=args.seed,
     )
+    if args.gen_hint:
+        # GROUNDED traces: the generator (teacher) silently sees the GT box via the SAME
+        # hidden-hint prompt the OPD teacher uses (no-verbalize clause), so its reasoning
+        # is about the evidence region. The GT box is still injected at the head below.
+        # Lazy import (pulls the trainer stack via baseline.hint) so the module stays
+        # light for the CPU sanity check; only hit here, at runtime, when --gen_hint.
+        from baseline.hint.opd_hint_collator import (
+            HINT_TEMPLATE,
+            build_hint_teacher_messages,
+            format_bbox_hint,
+        )
+
+        def gen_messages(s: dict[str, Any]) -> list[dict[str, Any]]:
+            hint = format_bbox_hint(s["bbox"], HINT_TEMPLATE, decimals=args.bbox_decimals)
+            return build_hint_teacher_messages(
+                s["problem"], s["image"], hint, system_prompt=system_prompt, suffix=""
+            )
+
+        print("[coldstart] GROUNDED generation: generator sees the GT box (hidden hint).", flush=True)
+    else:
+        def gen_messages(s: dict[str, Any]) -> list[dict[str, Any]]:
+            return build_general_eval_messages(
+                s["problem"], [s["image"]], system_prompt=system_prompt
+            )
+
     requests = [
         {
             "prompt": processor.apply_chat_template(
-                build_general_eval_messages(s["problem"], [s["image"]], system_prompt=system_prompt),
-                tokenize=False,
-                add_generation_prompt=True,
+                gen_messages(s), tokenize=False, add_generation_prompt=True
             ),
             "multi_modal_data": {"image": s["image"]},
         }

@@ -50,12 +50,17 @@ GEN_TEMPERATURE="${GEN_TEMPERATURE:-0.8}"
 GEN_MAX_TOKENS="${GEN_MAX_TOKENS:-1024}"
 MAX_REASONING_CHARS="${MAX_REASONING_CHARS:-1500}"
 KEEP_INCORRECT="${KEEP_INCORRECT:-false}"
+# Grounded traces: generator (use GEN_MODEL=<teacher>) silently sees the GT box via the
+# hidden-hint prompt -> reasoning is about the evidence region (strongest cold-start).
+GEN_HINT="${GEN_HINT:-false}"
 GEN_GPU_MEM_UTIL="${GEN_GPU_MEM_UTIL:-0.9}"
 GEN_MAX_MODEL_LEN="${GEN_MAX_MODEL_LEN:-}"
 
 if [[ "$SKIP_BUILD" != "true" ]]; then
   KEEP_INCORRECT_ARG=()
   [[ "$KEEP_INCORRECT" == "true" ]] && KEEP_INCORRECT_ARG=(--keep_incorrect)
+  GEN_HINT_ARG=()
+  [[ "$GEN_HINT" == "true" ]] && GEN_HINT_ARG=(--gen_hint)
   GEN_MAX_MODEL_LEN_ARG=()
   [[ -n "$GEN_MAX_MODEL_LEN" ]] && GEN_MAX_MODEL_LEN_ARG=(--max_model_len "$GEN_MAX_MODEL_LEN")
   echo "[coldstart] Phase 1: building traces -> $TRACES_DIR (GPU $COLDSTART_GEN_GPU)"
@@ -74,6 +79,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     --max_reasoning_chars "$MAX_REASONING_CHARS" \
     --gpu_memory_utilization "$GEN_GPU_MEM_UTIL" \
     "${GEN_MAX_MODEL_LEN_ARG[@]}" \
+    "${GEN_HINT_ARG[@]}" \
     "${KEEP_INCORRECT_ARG[@]}"
 else
   echo "[coldstart] Phase 1 skipped (SKIP_BUILD=true); reusing $TRACES_DIR"
