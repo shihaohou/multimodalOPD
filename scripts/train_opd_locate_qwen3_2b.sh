@@ -58,7 +58,9 @@ TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-flash_attention_2}"
 FINETUNING_MODE="${FINETUNING_MODE:-full}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-}"
-FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
+# Off by default: the collator's _safe_rgb_image already pads degenerate/tiny images,
+# so the pre-filter is redundant; set true to drop sub-MIN_IMAGE_SIZE images instead.
+FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"

@@ -55,7 +55,8 @@ TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-flash_attention_2}"
 FINETUNING_MODE="${FINETUNING_MODE:-full}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-}"
-FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
+# Off by default (collator pads degenerate images; the pre-filter is redundant).
+FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 # Default 1 epoch == scripts/train_opd.sh, so GHD and the vanilla-OPD baseline run

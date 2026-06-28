@@ -76,9 +76,10 @@ FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-}"
 # Drop degenerate tiny images: a 1-3px side trips the Qwen image processor's
-# channel-axis inference -> "mean must have 1 elements" crash. On by default;
-# 28px = one Qwen merged patch. The collator also pads such images as a backstop.
-FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-true}"
+# channel-axis inference -> "mean must have 1 elements" crash. The collator's
+# _safe_rgb_image pads such images as a backstop, so this pre-filter is OFF by
+# default; set true to drop sub-MIN_IMAGE_SIZE images (28px = one Qwen merged patch).
+FILTER_TINY_IMAGES="${FILTER_TINY_IMAGES:-false}"
 MIN_IMAGE_SIZE="${MIN_IMAGE_SIZE:-28}"
 MAX_STEPS="${MAX_STEPS:-}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
