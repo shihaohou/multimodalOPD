@@ -4,7 +4,7 @@ Living status doc for the **On-Policy Distillation (OPD)** baseline (the
 `baseline/` package on top of the ViGOS framework). Read this first when picking
 up planning. See `README_OPD.md` for usage and `CLAUDE.md` for the architecture.
 
-_Last updated: 2026-06-24._
+_Last updated: 2026-06-28._
 
 ## Current status: training validated on GPU ✅
 
@@ -137,6 +137,38 @@ through the DeepSpeed-wrapped student double-reduces gradients
 `output_attentions` forward is the memory wall). `output_attentions` materializes
 all-layer `[H,S,S]` regardless of `EVIDENCE_LAYERS`, so only smaller S or a Stage-2
 custom autograd (recompute just the selected query rows) reduces it further.
+
+## Locate-Once Grounding (Fork A v2) — built 2026-06-28
+
+New additive package `baseline/locate/` (the GHD spine + an explicit, student-generated
+box trained by RL; vigos + vanilla OPD + GHD spine untouched apart from a
+backward-compatible `teacher_system_prompt` field on `OPDHintDataCollator`). One step,
+two **span-decoupled** gradients on a single student forward:
+`L = λ_opd·L_OPD(answer/reasoning span, box span MASKED) + λ_rl·L_RL(box coord span)`.
+
+- The **student** rolls out from a *locate-once* prompt — opens `<think>` with one
+  `<box>[x1,y1,x2,y2]</box>` (no crop), then reasons + `\boxed{}`. The **teacher** is
+  the *hidden-hint* GHD teacher (silently handed the GT box). OPD pulls the un-hinted
+  student toward the grounded teacher on the non-box tokens; the box span is **masked
+  out of OPD** (the hidden-hint teacher emits no box → would fight the RL term).
+- **RL = GRPO**: reward `IoU(student_box, GT_box)` gated by answer correctness
+  (DeepEyes conditional), group-normalized over `group_size` rollouts → advantage →
+  `-A·logπ` on the box coordinate tokens. Group rollout is done by the collator
+  (replicate each prompt `group_size`× into a contiguous block; `group_ids` +
+  `locate_gt_boxes` emitted); per-device batch counts PROMPTS.
+- Files: `prompts.py`, `locate_rl.py` (pure IoU/advantage/box-parse, CPU-tested),
+  `opd_locate_collator.py` (`OPDLocateDataCollator(OPDHintDataCollator)`),
+  `opd_locate_trainer.py` (`OPDLocateTrainer(OPDHintTrainer)`),
+  `../train_opd_locate.py`, `scripts/train_opd_locate_qwen3_2b.sh`, `sanity_check.py`,
+  `README.md`. Realizes the GHD-deferred items: the position gate is a knob
+  (`--kl_position_gate`, OFF by default per plan) and the student-box idea (no-crop
+  variant: box is an RL handle, never an OPD target — the verified "verbalizing coords
+  is harmful / region beats zoom" priors).
+
+**Status (2026-06-28): implemented; CPU sanity green (RL math), NOT yet GPU-validated.**
+Next: smoke test (`MAX_STEPS=2 NUM_PROCESSES=1 MAX_TRAIN_SAMPLES=8 GROUP_SIZE=4`) — does
+the student emit `<box>` (watch `box_coverage`), and do `loss_opd`/`loss_rl` stay finite?
+Then the B2 vs B1 A/B on V*Bench (gate G2). Memory: [[opd-locate-once]].
 
 ## Next / open items (for new planning)
 

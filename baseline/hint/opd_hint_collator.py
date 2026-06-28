@@ -139,6 +139,13 @@ class OPDHintDataCollator(OPDDataCollator):
     # How the teacher is privileged with the box: "hint" = full image + text coords
     # (direction); "crop" = image cropped to the box, no text (zoom).
     teacher_privilege_mode: str = "hint"
+    # System prompt for the privileged TEACHER turn. ``None`` (default) reuses the
+    # student's ``system_prompt`` verbatim — the original GHD behaviour, so the spine
+    # is byte-for-byte unchanged. Set it to decouple the two turns: the Locate-Once
+    # fork gives the student a "find a <box>" prompt but keeps the teacher on the
+    # plain think prompt (it must NOT be told to locate — it is silently handed the
+    # box via the hint and forbidden from verbalizing it).
+    teacher_system_prompt: str | None = None
     # Column on the dataset row holding the evidence box. saliency-r1-8k ships it
     # as a string ``"[x1, y1, x2, y2]"`` normalized to [0,1]; parse_bbox_norm also
     # accepts a list/tuple and order-normalizes / clamps / drops degenerate boxes.
@@ -194,7 +201,7 @@ class OPDHintDataCollator(OPDDataCollator):
                 problem,
                 teacher_image,
                 hint,
-                system_prompt=self.system_prompt,
+                system_prompt=self.teacher_system_prompt or self.system_prompt,
                 suffix=self.opd_prompt_suffix,
             )
             teacher_messages.append(message)
