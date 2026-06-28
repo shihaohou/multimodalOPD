@@ -49,6 +49,8 @@ os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from baseline.eval.opd_eval_prompt import build_general_eval_messages
+from baseline.locate.locate_rl import parse_student_box
+from baseline.locate.prompts import LOCATE_SYSTEM_PROMPT
 from baseline.opd_data_collator import (
     _safe_rgb_image,
     resolve_opd_system_prompt,
@@ -56,6 +58,19 @@ from baseline.opd_data_collator import (
 from baseline.opd_dataset import load_opd_dataset
 from baseline.probe.saliency_data import parse_bbox_norm
 from vigos.answer_utils import extract_boxed_content, normalize_reference_answer
+
+# trace_mode="natural": the teacher is SHOWN the GT box and writes the WHOLE locate trace
+# (box woven into the reasoning) itself, used verbatim — vs "inject", which generates plain
+# reasoning and bolts a <box>[GT]</box> onto the head. Natural traces match the teacher's
+# own thinking pattern (Rethinking-OPD: OPD needs compatible student/teacher patterns), so
+# the cold-started student's reasoning is closer to the OPD target.
+NATURAL_GEN_TEMPLATE = (
+    "Hint: the single most relevant region for this question is <box>{bbox}</box> "
+    "(coordinates normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Begin your "
+    "reasoning inside <think> by restating this region once as <box>{bbox}</box>, then "
+    "reason about what is in that region to answer the question, and give the final answer "
+    "in \\boxed{{}}."
+)
 
 try:  # optional, better math/MCQ matching when available
     from mathruler.grader import grade_answer as _grade_answer
@@ -82,7 +97,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--bbox_decimals", type=int, default=2)
     ap.add_argument("--keep_incorrect", action="store_true", help="If no attempt is correct, keep one anyway with the GT answer forced (more data, noisier).")
     ap.add_argument("--gen_system_prompt", default="think", help="System-prompt style for GENERATION (think/freecot/reason/none).")
-    ap.add_argument("--gen_hint", action="store_true", help="Generate with the hidden-hint teacher prompt (generator silently sees the GT box, forbidden to verbalize it) so the reasoning is GROUNDED to the evidence region. Use with --gen_model <teacher>.")
+    ap.add_argument("--gen_hint", action="store_true", help="(inject mode) Generate with the hidden-hint teacher prompt (generator silently sees the GT box, forbidden to verbalize it) so the reasoning is GROUNDED. Use with --gen_model <teacher>.")
+    ap.add_argument("--trace_mode", default="inject", choices=["inject", "natural"], help="'inject': generate reasoning, bolt a <box>[GT]</box> onto the head. 'natural': the teacher (use --gen_model) is shown the GT box and writes the WHOLE locate trace itself (box woven in) — used verbatim; matches the teacher's thinking pattern.")
     # vLLM
     ap.add_argument("--tensor_parallel_size", type=int, default=1)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
@@ -178,12 +194,29 @@ def main() -> None:
         max_tokens=args.max_tokens,
         seed=args.seed,
     )
-    if args.gen_hint:
-        # GROUNDED traces: the generator (teacher) silently sees the GT box via the SAME
-        # hidden-hint prompt the OPD teacher uses (no-verbalize clause), so its reasoning
-        # is about the evidence region. The GT box is still injected at the head below.
-        # Lazy import (pulls the trainer stack via baseline.hint) so the module stays
-        # light for the CPU sanity check; only hit here, at runtime, when --gen_hint.
+    if args.trace_mode == "natural":
+        # NATURAL: show the generator (teacher) the GT box and have it write the WHOLE
+        # locate trace itself (box restated in <box> at the head, reasoning flowing from
+        # it). Used verbatim below — no bolt-on, so it matches the teacher's own pattern.
+        def gen_messages(s: dict[str, Any]) -> list[dict[str, Any]]:
+            coords = "[" + ", ".join(f"{v:.{args.bbox_decimals}f}" for v in s["bbox"]) + "]"
+            text = s["problem"] + "\n\n" + NATURAL_GEN_TEMPLATE.format(bbox=coords)
+            content = [
+                {"type": "image", "image": s["image"]},
+                {"type": "text", "text": text},
+            ]
+            return [
+                {"role": "system", "content": [{"type": "text", "text": LOCATE_SYSTEM_PROMPT}]},
+                {"role": "user", "content": content},
+            ]
+
+        print("[coldstart] NATURAL generation: teacher writes the full locate trace (box shown).", flush=True)
+    elif args.gen_hint:
+        # GROUNDED inject traces: the generator (teacher) silently sees the GT box via the
+        # SAME hidden-hint prompt the OPD teacher uses (no-verbalize clause), so its
+        # reasoning is about the evidence region. The GT box is still injected at the head.
+        # Lazy import (pulls the trainer stack via baseline.hint) so the module stays light
+        # for the CPU sanity check; only hit here, at runtime, when --gen_hint.
         from baseline.hint.opd_hint_collator import (
             HINT_TEMPLATE,
             build_hint_teacher_messages,
@@ -214,30 +247,41 @@ def main() -> None:
     ]
     outputs = engine.generate(requests, sampling, use_tqdm=True)
 
-    # --- rejection-filter + format-inject ---------------------------------------
+    # --- rejection-filter + build targets ---------------------------------------
     records: list[dict[str, Any]] = []
     n_correct_pool = 0
+    natural = args.trace_mode == "natural"
     for sample, output in zip(samples, outputs, strict=True):
         chosen_text = None
         for cand in output.outputs:
-            if _answer_matches(extract_boxed_content(cand.text), sample["answer"]):
-                chosen_text = cand.text
-                n_correct_pool += 1
-                break
+            if not _answer_matches(extract_boxed_content(cand.text), sample["answer"]):
+                continue
+            # natural: the verbatim trace must already be a clean, parseable locate trace.
+            if natural and (parse_student_box(cand.text) is None or "<think>" not in cand.text):
+                continue
+            chosen_text = cand.text
+            n_correct_pool += 1
+            break
         if chosen_text is None:
-            if not args.keep_incorrect:
+            # natural never force-keeps (the trace itself must be valid); inject may.
+            if natural or not args.keep_incorrect:
                 continue
             chosen_text = output.outputs[0].text  # forced GT answer below
-        reasoning = clean_reasoning(chosen_text, args.max_reasoning_chars)
-        target = build_locate_target(
-            sample["bbox"], reasoning, sample["answer"], decimals=args.bbox_decimals
-        )
+        if natural:
+            target = chosen_text.strip()  # teacher wrote the whole trace; use as-is
+        else:
+            reasoning = clean_reasoning(chosen_text, args.max_reasoning_chars)
+            target = build_locate_target(
+                sample["bbox"], reasoning, sample["answer"], decimals=args.bbox_decimals
+            )
         records.append({"image": sample["image"], "problem": sample["problem"], "target": target})
 
     if not records:
         raise ValueError(
-            "0 cold-start traces kept (no attempt matched GT). Lower the bar with "
-            "--keep_incorrect, raise --num_samples, or check answer matching."
+            "0 cold-start traces kept. inject: lower the bar with --keep_incorrect / raise "
+            "--num_samples. natural: the teacher must emit a parseable <box> + <think> + "
+            "correct \\boxed{} — raise --num_samples, use a stronger --gen_model, or check "
+            "answer matching."
         )
     kept = len(records)
     print(

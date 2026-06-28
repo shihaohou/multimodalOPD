@@ -50,8 +50,11 @@ GEN_TEMPERATURE="${GEN_TEMPERATURE:-0.8}"
 GEN_MAX_TOKENS="${GEN_MAX_TOKENS:-1024}"
 MAX_REASONING_CHARS="${MAX_REASONING_CHARS:-1500}"
 KEEP_INCORRECT="${KEEP_INCORRECT:-false}"
-# Grounded traces: generator (use GEN_MODEL=<teacher>) silently sees the GT box via the
-# hidden-hint prompt -> reasoning is about the evidence region (strongest cold-start).
+# inject: generate reasoning, bolt <box>[GT]</box> onto the head (GEN_HINT=true grounds
+#   the reasoning first). natural: the teacher (set GEN_MODEL=<teacher>) is shown the GT box
+#   and writes the WHOLE locate trace itself (box woven in), used verbatim — matches the
+#   teacher's own pattern (recommended; Rethinking-OPD: OPD needs compatible patterns).
+TRACE_MODE="${TRACE_MODE:-inject}"
 GEN_HINT="${GEN_HINT:-false}"
 GEN_GPU_MEM_UTIL="${GEN_GPU_MEM_UTIL:-0.9}"
 GEN_MAX_MODEL_LEN="${GEN_MAX_MODEL_LEN:-}"
@@ -72,6 +75,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     --answer_field "$ANSWER_FIELD" \
     --bbox_field "$BBOX_FIELD" \
     --output_dir "$TRACES_DIR" \
+    --trace_mode "$TRACE_MODE" \
     --max_samples "$MAX_SAMPLES" \
     --num_samples "$NUM_SAMPLES" \
     --temperature "$GEN_TEMPERATURE" \

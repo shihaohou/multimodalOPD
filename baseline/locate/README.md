@@ -124,11 +124,18 @@ bash scripts/coldstart_locate_qwen3_2b.sh           # Phase 1: build traces (1 G
                                                     # Phase 2: SFT (N GPU) -> runs/<model>_locate_coldstart
 ```
 
-- **Phase 1** (`coldstart_build.py`): vLLM-sample the student's own reasoning, keep
-  answer-correct attempts, inject the GT box + `<think>/<box>` scaffold →
-  `<think><box>[GT]</box> {reasoning} </think> \boxed{answer}` ([0,1] coords). Each
-  example has a *different* GT box, so SFT teaches box *prediction* (image+Q → box), not
-  memorization. `--gen_model` to generate with a stronger model/teacher.
+- **Phase 1** (`coldstart_build.py`): two trace modes (`TRACE_MODE`):
+  - `inject` (default) — vLLM-sample reasoning, bolt a `<box>[GT]</box>` onto the head:
+    `<think><box>[GT]</box> {reasoning} </think> \boxed{answer}` ([0,1] coords).
+    `GEN_HINT=true` grounds the reasoning first (teacher silently sees the box).
+  - `natural` (**recommended**, set `GEN_MODEL=<teacher>`) — the teacher is *shown* the
+    GT box and writes the **whole** locate trace itself (box restated in `<box>` and the
+    reasoning flowing from it), used verbatim. No bolt-on, so it matches the teacher's own
+    thinking pattern — which [Rethinking-OPD](https://github.com/thunlp/OPD) shows OPD
+    needs (compatible student/teacher patterns). Kept only if it has a parseable `<box>` +
+    `<think>` + correct `\boxed{}`.
+  Each example has a *different* GT box, so SFT teaches box *prediction* (image+Q → box),
+  not memorization.
 - **Phase 2** (`coldstart_sft.py`): vanilla CE SFT (prompt masked) → a checkpoint that
   emits the format.
 
