@@ -80,6 +80,9 @@ class OPDLocateScriptArguments(OPDHintScriptArguments):
     # RL reward: "gated_iou" = IoU(student_box, GT_box) only when the answer is correct
     # (DeepEyes conditional tool reward, the default); "iou" = ungated (ablation).
     rl_reward: str = "gated_iou"
+    # Warmup (gated_iou only): add `rl_ungated_weight * IoU` so a well-placed box still
+    # earns a small signal while answer accuracy is low. 0.0 = pure gated.
+    rl_ungated_weight: float = 0.0
     # GRPO advantage normalization: True = (r - mean)/(std + eps); False = r - mean (Dr.GRPO).
     rl_normalize_adv: bool = True
     rl_adv_eps: float = 1e-6
@@ -160,7 +163,8 @@ def main() -> None:
         print(
             "Box RL (GRPO): "
             f"group_size={script_args.group_size}, lambda_rl={script_args.lambda_rl}, "
-            f"reward={script_args.rl_reward}, normalize_adv={script_args.rl_normalize_adv}"
+            f"reward={script_args.rl_reward}, ungated_weight={script_args.rl_ungated_weight}, "
+            f"normalize_adv={script_args.rl_normalize_adv}"
         )
         print(f"Output directory: {training_args.output_dir}")
         print("=" * 80 + "\n")
@@ -316,6 +320,7 @@ def main() -> None:
         lambda_opd=script_args.lambda_opd,
         lambda_rl=script_args.lambda_rl,
         rl_reward=script_args.rl_reward,
+        rl_ungated_weight=script_args.rl_ungated_weight,
         rl_normalize_adv=script_args.rl_normalize_adv,
         rl_adv_eps=script_args.rl_adv_eps,
         group_size=script_args.group_size,
@@ -365,6 +370,7 @@ def main() -> None:
                     "locate_group_size": script_args.group_size,
                     "locate_lambda_rl": script_args.lambda_rl,
                     "locate_rl_reward": script_args.rl_reward,
+                    "locate_rl_ungated_weight": script_args.rl_ungated_weight,
                     "locate_rl_normalize_adv": script_args.rl_normalize_adv,
                     "locate_kl_position_gate": script_args.kl_position_gate,
                     "locate_bbox_field": script_args.bbox_field,

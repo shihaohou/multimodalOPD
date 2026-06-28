@@ -5,6 +5,8 @@ Text-only (no model needed) — the RL math and prompt wiring:
 * ``check_box_parsing``  — ``<box>`` extraction + normalization from a completion.
 * ``check_iou``          — IoU of normalized boxes (overlap / disjoint / identical).
 * ``check_advantage``    — GRPO group-normalized advantage (per-group, singleton=0).
+* ``check_pg_gradient``  — the box PG gradient lands ONLY on box-coordinate positions,
+  vanishes on non-box / no-box rows, and moves ``log pi`` in the advantage direction.
 * ``check_prompts``      — the locate-once student prompt asks for a ``<box>``; an
   empty hint reproduces the question (teacher decoupling base case).
 
@@ -32,6 +34,7 @@ from baseline.locate.locate_rl import (
     group_normalize_advantage,
     iou_norm,
     parse_student_box,
+    sampled_token_logprobs,
 )
 from baseline.locate.prompts import LOCATE_SYSTEM_PROMPT
 
@@ -86,6 +89,43 @@ def check_advantage() -> None:
     # Advantage is detached (a weight, not a target).
     assert not adv.requires_grad
     print("[log-sanity] check_advantage OK")
+
+
+def check_pg_gradient() -> None:
+    """Gradient sanity for the box PG term (mirrors OPDLocateTrainer._box_rl_loss).
+
+    Asserts the RL gradient lands ONLY on box-coordinate positions, vanishes on
+    non-box positions and on rollouts with no box, and pushes log pi of the sampled
+    token in the advantage direction (positive advantage -> increase its logit).
+    """
+    torch.manual_seed(0)
+    batch, length, vocab = 2, 6, 40
+    logits = torch.randn(batch, length, vocab, requires_grad=True)
+    token_ids = torch.randint(0, vocab, (batch, length))
+    # Row 0 has a box at cols 1..3; row 1 has none.
+    box_mask = torch.zeros(batch, length, dtype=torch.bool)
+    box_mask[0, 1:4] = True
+    advantage = torch.tensor([2.0, -3.0])  # row0 positive, row1 negative (but no box)
+
+    rows, cols = box_mask.nonzero(as_tuple=True)
+    sel = logits[rows, cols].float()
+    logp = sampled_token_logprobs(sel, token_ids[rows, cols])
+    loss = -(advantage[rows] * logp).mean()
+    loss.backward()
+    grad = logits.grad
+
+    assert torch.count_nonzero(grad[1]) == 0, "row with no box must get no RL gradient"
+    assert torch.count_nonzero(grad[0, 0]) == 0, "non-box position (col 0) must get none"
+    assert torch.count_nonzero(grad[0, 4:]) == 0, "non-box positions (cols 4+) must get none"
+    assert grad[0, 1:4].abs().sum() > 0, "box positions must get gradient"
+    # loss = -adv*logp with adv>0 => dloss/dlogit[sampled] < 0 (gradient step raises it).
+    sampled = token_ids[0, 1]
+    assert grad[0, 1, sampled] < 0, "positive advantage must increase sampled-token logit"
+    # Full-vocab normalizer: gather - logsumexp matches manual log-softmax.
+    manual = torch.log_softmax(logits[0, 1].detach().float(), dim=-1)[sampled]
+    got = sampled_token_logprobs(logits[0, 1:2].detach().float(), token_ids[0, 1:2])[0]
+    assert abs(float(got) - float(manual)) < 1e-5, (got, manual)
+    print("[log-sanity] check_pg_gradient OK")
 
 
 def check_prompts() -> None:
@@ -171,6 +211,7 @@ def main() -> None:
     check_box_parsing()
     check_iou()
     check_advantage()
+    check_pg_gradient()
     check_prompts()
     if args.model:
         check_collator(args.model)

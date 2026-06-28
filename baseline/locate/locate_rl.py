@@ -68,6 +68,20 @@ def iou_norm(box_a: BoxNorm, box_b: BoxNorm) -> float:
     return float(inter / union) if union > 0.0 else 0.0
 
 
+def sampled_token_logprobs(
+    logits: torch.Tensor, token_ids: torch.Tensor
+) -> torch.Tensor:
+    """``log pi(token) = logit[token] - logsumexp(logits)`` over the FULL given vocab.
+
+    ``logits`` ``[..., V]`` (use the STUDENT's full logits — the action is the
+    student's own sample, so the normalizer must be the student's whole vocab, never a
+    teacher-truncated slice); ``token_ids`` ``[...]`` (long). Returns ``[...]``. Pure
+    so the RL gradient direction is unit-testable on CPU (see sanity_check).
+    """
+    gathered = logits.gather(-1, token_ids.unsqueeze(-1)).squeeze(-1)
+    return gathered - logits.logsumexp(dim=-1)
+
+
 def group_normalize_advantage(
     rewards: torch.Tensor,
     group_ids: torch.Tensor,

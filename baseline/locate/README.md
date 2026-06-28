@@ -28,9 +28,18 @@ L = lambda_opd * L_OPD(answer/reasoning span, box span MASKED)   # how to answer
 | OPD | per-token `KL(student‖teacher)` over the completion **with the `<box>…</box>` span removed from the mask** — the hidden-hint teacher emits no box, so scoring the student's box tokens under it would push the student to stop emitting boxes, fighting the RL term. |
 | RL | reward = `IoU(student_box, GT_box)` **gated by answer correctness** (DeepEyes-style: only a correct rollout earns localization credit) → group-normalized advantage → `-A·logπ` on the box coordinate tokens. |
 
-The two masks are disjoint (OPD on non-box tokens, RL on box-coordinate tokens; the
-literal `<box>`/`</box>` tags get neither), so the two gradients never collide on a
-shared token — that decoupling is the core design decision.
+The two **supervised output positions** are disjoint (OPD on non-box tokens, RL on
+box-coordinate tokens; the literal `<box>`/`</box>` tags get neither), so no token gets
+a direct OPD *and* RL gradient — that decoupling is the core design decision. (They are
+not fully independent: the answer tokens still attend back to the box text in context,
+so OPD's later-token loss is implicitly conditioned on the student's box — the box stays
+in context and is only removed from the *loss*.)
+
+A box that appears at/after `\boxed{}` ("answer then locate") is masked from OPD but
+earns **no RL/reward** (`late_box_rate` logs it). RL trains the *coordinates* of an
+emitted box, not whether to emit one — emission relies on the prompt and, if
+`box_coverage`/`box_present_rate` come up low, a short SFT cold-start (Option β); the RL
+group baseline is mean-centered, so it cannot by itself bootstrap box emission.
 
 > **Position gate (deferred, off by default).** `--kl_position_gate true` applies the
 > OPD KL only where the teacher gives the sampled token higher logprob than the student
@@ -44,7 +53,7 @@ shared token — that decoupling is the core design decision.
 | `locate_rl.py` | Pure RL math (no model): `parse_student_box`, `iou_norm`, `group_normalize_advantage`. |
 | `opd_locate_collator.py` | `OPDLocateDataCollator(OPDHintDataCollator)` — group expansion + the locate-once student prompt; teacher stays on the hidden-hint prompt (decoupled via `teacher_system_prompt`). Emits `group_ids` + `locate_gt_boxes`. |
 | `opd_locate_trainer.py` | `OPDLocateTrainer(OPDHintTrainer)` — overrides `compute_loss`: box-span masking on OPD + the GRPO box RL term. `local_hf` teacher only. |
-| `../train_opd_locate.py` | entry point (`OPDLocateScriptArguments` adds `--group_size` / `--lambda_rl` / `--rl_reward` / `--rl_normalize_adv` / `--kl_position_gate` / `--locate_system_prompt`). |
+| `../train_opd_locate.py` | entry point (`OPDLocateScriptArguments` adds `--group_size` / `--lambda_rl` / `--rl_reward` / `--rl_ungated_weight` / `--rl_normalize_adv` / `--kl_position_gate` / `--locate_system_prompt`). |
 | `../../scripts/train_opd_locate_qwen3_2b.sh` | launcher (GHD knobs + `GROUP_SIZE` / `LAMBDA_RL` / `RL_REWARD`). |
 | `sanity_check.py` | CPU-only RL math + (with `--model`) the collator group-expansion / prompt-asymmetry check. |
 
@@ -88,8 +97,12 @@ bash scripts/train_opd_locate_qwen3_2b.sh
 ```
 
 Then inspect `runs/<run>/completion_samples/*.md`: does the student actually emit
-`<box>[…]</box>` at the head of `<think>`? Watch the W&B curves `box_coverage`
-(→ near 1.0), `iou_correct_mean` (should rise), `loss_rl`, `loss_opd`.
+`<box>[…]</box>` at the head of `<think>`? W&B curves to watch: `box_present_rate` (any
+`<box>`) and `box_coverage` (a parsed valid box) → near 1.0; `late_box_rate` → ~0;
+`iou_correct_mean` (the gated signal) should rise; `nonzero_adv_rate` (RL has signal);
+`mean_box_area` (collapse monitor); `loss_rl`, `loss_opd`. If `box_coverage` is low,
+cold-start (Option β) or raise `RL_UNGATED_WEIGHT` (warmup: rewards a well-placed box
+even when the answer is wrong, default 0).
 
 ## Baselines / decision (why this fork exists)
 
@@ -100,7 +113,8 @@ Then inspect `runs/<run>/completion_samples/*.md`: does the student actually emi
 | **B2** | B1 + locate-once + box RL | **this package** |
 
 Same data / teacher / schedule across arms. Ablations via knobs: `LAMBDA_RL=0`
-(box emitted but unrewarded), `RL_REWARD=iou` (ungated), `KL_POSITION_GATE=true`.
+(box emitted but unrewarded), `RL_REWARD=iou` (ungated), `RL_UNGATED_WEIGHT>0`
+(gated + warmup mix), `KL_POSITION_GATE=true`.
 
 **Go/No-Go** (eval on V\*Bench with `scripts/eval_vstar.sh`, + the suite for regressions):
 

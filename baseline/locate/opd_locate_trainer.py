@@ -24,9 +24,13 @@ L = lambda_opd * L_OPD(answer/reasoning span, box span MASKED)
   only. This teaches "where to look". The box does not change the pixels the student
   sees (no crop), so the only thing RL can move is the model's internal attention.
 
-The two masks are disjoint (OPD on non-box tokens, RL on box-coordinate tokens; the
-literal ``<box>``/``</box>`` tags get neither), so the gradients never collide on a
-shared token. ``local_hf`` teacher only (reverse KL needs full teacher logits).
+The two *supervised output positions* are disjoint (OPD on non-box tokens, RL on
+box-coordinate tokens; the literal ``<box>``/``</box>`` tags get neither), so no token
+receives a direct OPD and RL gradient at once. (They are not fully independent: the
+answer/reasoning tokens still attend back to the box text in context, so OPD's
+later-token loss is implicitly conditioned on the student's box — the box is kept in
+context and only removed from the *loss*.) ``local_hf`` teacher only (reverse KL needs
+full teacher logits).
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ from baseline.locate.locate_rl import (
     BOX_OPEN,
     group_normalize_advantage,
     iou_norm,
+    sampled_token_logprobs,
 )
 from baseline.opd_losses import masked_topk_kl_loss
 from baseline.probe.saliency_data import parse_bbox_norm
@@ -53,6 +58,7 @@ class OPDLocateTrainer(OPDHintTrainer):
         *args: Any,
         lambda_rl: float = 0.5,
         rl_reward: str = "gated_iou",
+        rl_ungated_weight: float = 0.0,
         rl_normalize_adv: bool = True,
         rl_adv_eps: float = 1e-6,
         group_size: int = 8,
@@ -69,6 +75,10 @@ class OPDLocateTrainer(OPDHintTrainer):
             raise ValueError(f"group_size must be >= 1, got {group_size}.")
         self.lambda_rl = float(lambda_rl)
         self.rl_reward = rl_reward
+        # Early-training warmup (gated_iou only): add `rl_ungated_weight * IoU` so a box
+        # with good overlap still earns a (small) signal even when the answer is wrong —
+        # mitigates reward sparsity before answer accuracy rises. 0.0 = pure gated.
+        self.rl_ungated_weight = float(rl_ungated_weight)
         self.rl_normalize_adv = bool(rl_normalize_adv)
         self.rl_adv_eps = float(rl_adv_eps)
         self.group_size = int(group_size)
@@ -80,39 +90,54 @@ class OPDLocateTrainer(OPDHintTrainer):
     # ------------------------------------------------------------------ box spans
     def _locate_row_box(
         self, row: torch.Tensor, valid_length: int
-    ) -> tuple[tuple[int, int] | None, tuple[int, int] | None, Any]:
-        """Find ``<box>...</box>`` in one completion row.
+    ) -> tuple[tuple[int, int] | None, tuple[int, int] | None, Any, bool]:
+        """Find the first ``<box>...</box>`` in one completion row.
 
-        Returns ``(full_span, coord_span, box_norm)``:
+        Returns ``(full_span, coord_span, box_norm, late)``:
         * ``full_span``  — token range to MASK from the OPD loss (``<box>`` tag, plus
-          coords + ``</box>`` when the box closes);
-        * ``coord_span`` — token range the RL term reinforces (the coordinates only);
-        * ``box_norm``   — the parsed normalized ``(x1,y1,x2,y2)`` (None if unparseable).
-        A box with an open tag but no close still masks the tag from OPD (the teacher
-        never emits it) but yields no RL handle / box value.
+          coords + ``</box>`` when the box closes), or None if no ``<box>`` at all;
+        * ``coord_span`` — token range the RL term reinforces (the coordinates only),
+          or None when the box is malformed (no close) or *late* (no RL handle);
+        * ``box_norm``   — the parsed normalized ``(x1,y1,x2,y2)`` (None if unparseable
+          or late);
+        * ``late``       — True when the box appears at/after ``\\boxed{}`` ("answer then
+          locate", not "locate then answer"). A late box is still masked from OPD but
+          earns no RL/reward, so RL can't reinforce locating *after* the fact.
+
+        A box with an open tag but no close still masks the tag from OPD (the
+        hidden-hint teacher never emits it) but yields no RL handle / box value.
         """
         open_span = self._find_tag_span(row, valid_length, BOX_OPEN)
         if open_span is None:
-            return None, None, None
+            return None, None, None, False
         close_span = self._find_tag_span(
             row, valid_length, BOX_CLOSE, start=open_span[1]
         )
         if close_span is None or close_span[0] < open_span[1]:
-            return (open_span[0], open_span[1]), None, None
+            return (open_span[0], open_span[1]), None, None, False
         full_span = (open_span[0], close_span[1])
+        answer_span = self._find_tag_span(row, valid_length, "\\boxed{")
+        if answer_span is not None and open_span[0] >= answer_span[0]:
+            return full_span, None, None, True  # late box: mask from OPD, no RL
         coord_span = (open_span[1], close_span[0])
         inner_text = self._decode_token_ids(
             row[coord_span[0] : coord_span[1]], skip_special_tokens=False
         )
-        return full_span, coord_span, parse_bbox_norm(inner_text)
+        return full_span, coord_span, parse_bbox_norm(inner_text), False
 
     def _locate_box_masks(
         self,
         completion_ids: torch.Tensor,
         completion_attention: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, list[Any]]:
-        """Per-row box masks + parsed boxes. ``box_full_mask`` is masked OUT of OPD;
-        ``box_coord_mask`` is what RL reinforces; both restricted to attended tokens."""
+    ) -> tuple[torch.Tensor, torch.Tensor, list[Any], torch.Tensor, torch.Tensor]:
+        """Per-row box masks + parsed boxes + diagnostics.
+
+        Returns ``(box_full_mask, box_coord_mask, student_boxes, box_present, box_late)``:
+        ``box_full_mask`` is masked OUT of OPD; ``box_coord_mask`` is what RL reinforces
+        (both restricted to attended tokens); ``box_present`` flags rows that emitted a
+        ``<box>`` tag (vs. no box at all — distinguishes "didn't emit" from "malformed"
+        in the metrics); ``box_late`` flags boxes after ``\\boxed{}``.
+        """
         batch_size, completion_length = completion_ids.shape
         device = completion_ids.device
         box_full_mask = torch.zeros(
@@ -121,20 +146,24 @@ class OPDLocateTrainer(OPDHintTrainer):
         box_coord_mask = torch.zeros(
             (batch_size, completion_length), dtype=torch.bool, device=device
         )
+        box_present = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        box_late = torch.zeros(batch_size, dtype=torch.bool, device=device)
         student_boxes: list[Any] = []
         for row_idx in range(batch_size):
             valid_length = int(completion_attention[row_idx].sum().item())
-            full_span, coord_span, box = self._locate_row_box(
+            full_span, coord_span, box, late = self._locate_row_box(
                 completion_ids[row_idx], valid_length
             )
             if full_span is not None:
                 box_full_mask[row_idx, full_span[0] : full_span[1]] = True
+                box_present[row_idx] = True
             if coord_span is not None and coord_span[1] > coord_span[0]:
                 box_coord_mask[row_idx, coord_span[0] : coord_span[1]] = True
+            box_late[row_idx] = late
             student_boxes.append(box)
         box_full_mask &= completion_attention
         box_coord_mask &= completion_attention
-        return box_full_mask, box_coord_mask, student_boxes
+        return box_full_mask, box_coord_mask, student_boxes, box_present, box_late
 
     # --------------------------------------------------------------------- reward
     def _locate_rewards(
@@ -165,7 +194,10 @@ class OPDLocateTrainer(OPDHintTrainer):
             iou = iou_norm(student_box, gt_box) if gt_box is not None else 0.0
             iou_vals[row_idx] = iou
             if self.rl_reward == "gated_iou":
-                rewards[row_idx] = iou if bool(answer_correct[row_idx]) else 0.0
+                gated = iou if bool(answer_correct[row_idx]) else 0.0
+                # Optional warmup: a small ungated IoU term keeps a signal alive while
+                # answer accuracy (the gate) is still low. 0.0 => pure gated.
+                rewards[row_idx] = gated + self.rl_ungated_weight * iou
             else:  # "iou" — ungated ablation control
                 rewards[row_idx] = iou
         return rewards, iou_vals, has_box
@@ -185,20 +217,28 @@ class OPDLocateTrainer(OPDHintTrainer):
         masks stay correctly weighted). vLLM is resynced to the policy every step, so
         the sampling policy ~= the gradient policy and a plain on-policy PG (no
         importance ratio) is valid. ``advantage`` is detached (a weight, not a target).
+
+        Pass the FULL (untruncated) student logits — the action is the student's own
+        sample, so ``log pi`` must normalize over the student's whole vocab, not the
+        teacher-shared slice used for the KL. Only the box-coordinate positions are
+        gathered out (and cast to fp32) before the softmax-normalizer, so this stays
+        cheap (≈ #box tokens × vocab) regardless of completion length.
         """
-        vocab = student_logits.shape[-1]
-        ids = completion_ids.clamp(0, vocab - 1).unsqueeze(-1)
-        token_logp = student_logits.gather(-1, ids).squeeze(-1) - student_logits.logsumexp(
-            dim=-1
-        )  # [B, C], fp32, grad flows to the student
-        mask = box_coord_mask.to(device=token_logp.device, dtype=torch.bool)
-        adv = advantage.to(device=token_logp.device, dtype=torch.float32).unsqueeze(1)
-        per_token = -(adv * token_logp)  # maximize adv*logp -> minimize -(adv*logp)
-        mask_f = mask.to(dtype=token_logp.dtype)
-        denom = mask_f.sum().clamp_min(1.0)
-        # Always graph-connected (even if the mask is empty this step) so DDP backward
-        # does not deadlock on a rank with no boxes.
-        local_loss = (per_token * mask_f).sum() / denom
+        mask = box_coord_mask.to(device=student_logits.device, dtype=torch.bool)
+        rows, cols = mask.nonzero(as_tuple=True)
+        if rows.numel() == 0:
+            # No box tokens this micro-batch. Keep a graph-connected zero so DDP
+            # backward does not deadlock on a rank with no boxes.
+            local_loss = student_logits.flatten()[0] * 0.0
+        else:
+            sel_logits = student_logits[rows, cols].float()  # [N_box, V], full vocab
+            sel_ids = completion_ids[rows, cols].to(device=sel_logits.device)
+            token_logp = sampled_token_logprobs(sel_logits, sel_ids)  # [N_box]
+            adv = advantage.detach().to(device=sel_logits.device, dtype=torch.float32)
+            per_token = -(adv[rows] * token_logp)  # maximize adv*logp
+            local_loss = per_token.sum() / per_token.new_tensor(
+                float(per_token.numel())
+            ).clamp_min(1.0)
         objective, _, numerator, count = self._distributed_masked_loss_with_stats(
             local_loss, mask
         )
@@ -240,8 +280,8 @@ class OPDLocateTrainer(OPDHintTrainer):
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)
 
         # Box spans from the sampled completion (one pass; no model needed).
-        box_full_mask, box_coord_mask, student_boxes = self._locate_box_masks(
-            completion_ids, completion_attention
+        box_full_mask, box_coord_mask, student_boxes, box_present, box_late = (
+            self._locate_box_masks(completion_ids, completion_attention)
         )
 
         # --- Student forward (with gradients) on the locate-once prompt -----------
@@ -321,8 +361,10 @@ class OPDLocateTrainer(OPDHintTrainer):
             normalize_std=self.rl_normalize_adv,
             eps=self.rl_adv_eps,
         )
+        # Full student logits (NOT the teacher-shared-vocab slice): log pi of the
+        # student's own sampled box token must normalize over the student's whole vocab.
         rl_loss, rl_loss_numerator, rl_loss_count = self._box_rl_loss(
-            student_kl_logits, completion_ids, box_coord_mask, advantage
+            student_logits, completion_ids, box_coord_mask, advantage
         )
 
         loss = self.lambda_opd * opd_loss + self.lambda_rl * rl_loss
@@ -346,6 +388,25 @@ class OPDLocateTrainer(OPDHintTrainer):
         _, iou_correct_sum, iou_correct_count = self._distributed_rate_stats(
             iou_vals[boxed_correct]
         )
+        # Box-emission health: present (any <box> tag) vs coverage (a fully parsed valid
+        # box) splits "didn't emit" from "malformed"; late = box after \boxed{} (no RL).
+        _, present_sum, present_count = self._distributed_rate_stats(
+            box_present.to(torch.float32)
+        )
+        _, late_sum, late_count = self._distributed_rate_stats(box_late.to(torch.float32))
+        # RL-signal density: fraction of rollouts whose group gave a non-zero advantage
+        # (0 for singleton or all-equal-reward groups → no gradient that row).
+        _, nonzero_adv_sum, nonzero_adv_count = self._distributed_rate_stats(
+            (advantage.abs() > 1e-6).to(torch.float32)
+        )
+        # Mean area of parsed boxes (collapse monitor: a crash toward a constant
+        # center/whole-image box shows up here and in its variance across steps).
+        box_areas = torch.tensor(
+            [(b[2] - b[0]) * (b[3] - b[1]) for b in student_boxes if b is not None],
+            dtype=torch.float32,
+            device=completion_ids.device,
+        )
+        _, area_sum, area_count = self._distributed_rate_stats(box_areas)
         metrics: dict[str, tuple[float, float]] = {
             "loss_opd": (opd_loss_numerator, opd_loss_count),
             "loss_rl": (rl_loss_numerator, rl_loss_count),
@@ -353,8 +414,13 @@ class OPDLocateTrainer(OPDHintTrainer):
             "completion_length": (completion_token_count, num_sequences),
             "completion_token_ratio": (completion_token_count, completion_token_total),
             "reward_mean": (reward_sum, reward_count),
+            # box_present = emitted a <box> tag; box_coverage = parsed a valid box.
+            "box_present_rate": (present_sum, present_count),
             "box_coverage": (box_sum, box_count),
+            "late_box_rate": (late_sum, late_count),
             "advantage_abs_mean": (adv_abs_sum, adv_abs_count),
+            "nonzero_adv_rate": (nonzero_adv_sum, nonzero_adv_count),
+            "mean_box_area": (area_sum, area_count),
             # IoU over rollouts that emitted a box; iou_correct over correct+boxed ones
             # (the actual gated reward signal — watch this rise if grounding improves).
             "iou_mean": (iou_sum, iou_count),

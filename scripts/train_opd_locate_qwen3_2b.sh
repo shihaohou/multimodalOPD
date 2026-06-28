@@ -89,6 +89,8 @@ LOCATE_SYSTEM_PROMPT="${LOCATE_SYSTEM_PROMPT:-}"
 LAMBDA_OPD="${LAMBDA_OPD:-1.0}"
 LAMBDA_RL="${LAMBDA_RL:-0.5}"
 RL_REWARD="${RL_REWARD:-gated_iou}"          # gated_iou | iou
+# Warmup (gated_iou only): reward += RL_UNGATED_WEIGHT * IoU even when answer wrong. 0=off.
+RL_UNGATED_WEIGHT="${RL_UNGATED_WEIGHT:-0.0}"
 RL_NORMALIZE_ADV="${RL_NORMALIZE_ADV:-true}" # true=(r-mean)/std | false=r-mean (Dr.GRPO)
 KL_POSITION_GATE="${KL_POSITION_GATE:-false}"
 # --- OPD distillation --------------------------------------------------------
@@ -182,6 +184,7 @@ uv run accelerate launch \
   --lambda_opd "$LAMBDA_OPD" \
   --lambda_rl "$LAMBDA_RL" \
   --rl_reward "$RL_REWARD" \
+  --rl_ungated_weight "$RL_UNGATED_WEIGHT" \
   --rl_normalize_adv "$RL_NORMALIZE_ADV" \
   --kl_position_gate "$KL_POSITION_GATE" \
   --output_dir "$OUTPUT_DIR" \
