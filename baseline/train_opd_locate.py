@@ -47,6 +47,7 @@ from transformers import (
 import vigos.dataset_utils as dataset_utils
 from baseline.locate.opd_locate_collator import LOCATE_SYSTEM_PROMPT, OPDLocateDataCollator
 from baseline.locate.opd_locate_trainer import OPDLocateTrainer
+from baseline.locate.prompts import LOCATE_TEACHER_HINT_TEMPLATE
 from baseline.opd_data_collator import resolve_opd_system_prompt
 from baseline.opd_dataset import load_opd_dataset
 from baseline.train_opd import (
@@ -91,6 +92,10 @@ class OPDLocateScriptArguments(OPDHintScriptArguments):
     kl_position_gate: bool = False
     # Student locate-once system prompt (must contain "<box>"). Override for ablations.
     locate_system_prompt: str = LOCATE_SYSTEM_PROMPT
+    # OPD teacher hint: STATES the GT box (no no-verbalize) so the box-emitting (cold-started)
+    # student and the teacher share the locate->describe->reason pattern. Option 3: the box
+    # coord span is still masked from the OPD loss in the trainer (RL owns the box).
+    hint_template: str = LOCATE_TEACHER_HINT_TEMPLATE
 
 
 def main() -> None:
@@ -139,7 +144,9 @@ def main() -> None:
             os.path.basename(os.path.normpath(training_args.output_dir)) or "opd_locate"
         )
 
-    teacher_system_prompt = resolve_opd_system_prompt(script_args.opd_system_prompt)
+    # Teacher uses the SAME structured locate prompt as the student (locate->describe->reason)
+    # and is given the GT box via the hint (which it states) -> matched thinking pattern.
+    teacher_system_prompt = script_args.locate_system_prompt
     if os.environ.get("LOCAL_RANK", "0") == "0":
         print("\n" + "=" * 80)
         print("LOCATE-ONCE GROUNDING (LOG) RUN CONFIGURATION")
@@ -151,7 +158,7 @@ def main() -> None:
         print(f"Answer/reference field: {script_args.answer_field}")
         print(f"Bbox field: {script_args.bbox_field}  filter_no_bbox={script_args.filter_no_bbox}")
         print(f"Student (locate-once) prompt: {script_args.locate_system_prompt!r}")
-        print(f"Teacher (hidden-hint) base prompt: {teacher_system_prompt!r}")
+        print(f"Teacher (locate, states box) prompt: {teacher_system_prompt!r}")
         print(f"Hint template: {script_args.hint_template!r}")
         print(
             "Distillation (OPD): "

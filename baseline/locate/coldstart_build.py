@@ -50,7 +50,7 @@ os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from baseline.eval.opd_eval_prompt import build_general_eval_messages
-from baseline.locate.locate_rl import parse_student_box
+from baseline.locate.locate_rl import collapse_extra_boxes, parse_student_box
 from baseline.locate.prompts import LOCATE_SYSTEM_PROMPT
 from baseline.opd_data_collator import (
     _safe_rgb_image,
@@ -66,13 +66,69 @@ from vigos.answer_utils import extract_boxed_content, normalize_reference_answer
 # own thinking pattern (Rethinking-OPD: OPD needs compatible student/teacher patterns), so
 # the cold-started student's reasoning is closer to the OPD target.
 NATURAL_GEN_TEMPLATE = (
-    "Hint: the single most relevant region for this question is <box>{bbox}</box> "
-    "(coordinates normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Inside <think>, "
-    "first decide where to look in one short, natural sentence that weaves in this region "
-    "as <box>{bbox}</box> (for example: \"To answer this, I should focus on the region "
-    "<box>{bbox}</box>, where ...\"). Do NOT just paste the box on its own line. Then reason "
-    "about what is in that region, and give the final answer in \\boxed{{}}."
+    "Hint: the region that contains the answer is <box>{bbox}</box> (coordinates normalized "
+    "to [0,1], top-left origin, [x1, y1, x2, y2]). Inside <think>, follow three steps: "
+    "(1) state this region once as <box>{bbox}</box>; (2) describe what is in that region "
+    "(the visual details relevant to the question); (3) reason from that description to the "
+    "answer. Refer to it as \"that region\" afterwards and do not repeat the coordinates. "
+    "Then give the final answer in \\boxed{{}}."
 )
+
+
+JUDGE_PROMPT = (
+    "You are grading whether a model's answer to a visual question is correct.\n"
+    "Question: {question}\n"
+    "Reference answer: {reference}\n"
+    "Model answer: {candidate}\n"
+    "Does the model answer have the same meaning as the reference answer? "
+    "Open-ended phrasing differences are fine; judge the meaning. "
+    "Reply with only \"yes\" or \"no\"."
+)
+
+
+def judge_correct_batch(
+    items: list[tuple[str, str, str]],
+    *,
+    base_url: str,
+    model: str,
+    api_key: str,
+    max_workers: int = 16,
+) -> list[bool]:
+    """LLM-judge a batch of ``(question, reference, candidate)`` -> list[bool].
+
+    Used only for the exact-match FAILURES (open-ended Visual-CoT answers that string
+    matching wrongly drops). OpenAI-compatible endpoint (e.g. a local vLLM Kimi). Any
+    error on an item -> False (conservative: drop rather than keep a wrong trace).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from openai import OpenAI
+
+    client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY")
+
+    def _judge_one(item: tuple[str, str, str]) -> bool:
+        question, reference, candidate = item
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": JUDGE_PROMPT.format(
+                            question=question, reference=reference, candidate=candidate
+                        ),
+                    }
+                ],
+                temperature=0.0,
+                max_tokens=8,
+            )
+            out = (resp.choices[0].message.content or "").strip().lower()
+            return out.startswith("yes")
+        except Exception:  # noqa: BLE001 - a judge failure just drops the trace
+            return False
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        return list(pool.map(_judge_one, items))
 
 try:  # optional, better math/MCQ matching when available
     from mathruler.grader import grade_answer as _grade_answer
@@ -102,6 +158,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--gen_system_prompt", default="think", help="System-prompt style for GENERATION (think/freecot/reason/none).")
     ap.add_argument("--gen_hint", action="store_true", help="(inject mode) Generate with the hidden-hint teacher prompt (generator silently sees the GT box, forbidden to verbalize it) so the reasoning is GROUNDED. Use with --gen_model <teacher>.")
     ap.add_argument("--trace_mode", default="inject", choices=["inject", "natural"], help="'inject': generate reasoning, bolt a <box>[GT]</box> onto the head. 'natural': the teacher (use --gen_model) is shown the GT box and writes the WHOLE locate trace itself (box woven in) — used verbatim; matches the teacher's thinking pattern.")
+    # LLM judge (optional): judge ONLY exact-match failures (open-ended answers) via an
+    # OpenAI-compatible endpoint (e.g. a local vLLM Kimi). Exact matches are kept for free.
+    ap.add_argument("--judge", default="none", choices=["none", "api"], help="'api': LLM-judge the exact-match failures (recommended for open-ended answers like Visual-CoT).")
+    ap.add_argument("--judge_base_url", default="http://10.48.91.210:8000/v1")
+    ap.add_argument("--judge_model", default="kimi")
+    ap.add_argument("--judge_api_key", default="EMPTY")
+    ap.add_argument("--judge_max_workers", type=int, default=16)
+    # Data-parallel sharding: run N copies (one per GPU) over disjoint shards of the
+    # shuffled dataset, each with its own --output_dir; merge afterwards. max_samples is
+    # the GLOBAL target (each shard does max_samples/num_shards).
+    ap.add_argument("--shard_index", type=int, default=0)
+    ap.add_argument("--num_shards", type=int, default=1)
     # vLLM
     ap.add_argument("--tensor_parallel_size", type=int, default=1)
     ap.add_argument("--gpu_memory_utilization", type=float, default=0.9)
@@ -157,6 +225,7 @@ def build_natural_target(text: str, answer: str, *, max_chars: int) -> str:
     if idx >= 0:
         text = text[:idx]
     text = text.replace("<think>", "").replace("</think>", "").strip()
+    text = collapse_extra_boxes(text)  # locate-once: keep only the first <box>
     if max_chars and len(text) > max_chars:
         text = text[:max_chars].rsplit(" ", 1)[0].rstrip() + " ..."
     return f"<think>\n{text}\n</think>\n\\boxed{{{answer}}}"
@@ -178,8 +247,13 @@ def main() -> None:
     indices = list(range(len(dataset)))
     if not args.no_shuffle:
         # Representative draw: Visual-CoT is folded from per-domain JSONLs in order, so a
-        # first-N slice would be skewed to the first domain(s). Seeded for reproducibility.
+        # first-N slice would be skewed to the first domain(s). Seeded (SAME seed across
+        # shards) so the stride-shard below is disjoint and reproducible.
         random.Random(args.seed).shuffle(indices)
+    target = args.max_samples
+    if args.num_shards > 1:
+        indices = indices[args.shard_index :: args.num_shards]  # disjoint stride shard
+        target = -(-args.max_samples // args.num_shards)  # ceil; per-shard share of the global target
     samples: list[dict[str, Any]] = []
     for idx in indices:
         row = dataset[int(idx)]
@@ -193,9 +267,10 @@ def main() -> None:
             continue
         image = _safe_rgb_image(row.get("images", row.get("image")))
         samples.append({"image": image, "problem": problem, "answer": answer, "bbox": bbox})
-        if len(samples) >= args.max_samples:
+        if len(samples) >= target:
             break
-    print(f"[coldstart] {len(samples)} boxed samples to generate from (gen_model={gen_model}).", flush=True)
+    shard_tag = f"shard {args.shard_index}/{args.num_shards}: " if args.num_shards > 1 else ""
+    print(f"[coldstart] {shard_tag}{len(samples)} boxed samples to generate (gen_model={gen_model}).", flush=True)
     if not samples:
         raise ValueError("No boxed samples; check --dataset_name / --bbox_field / --answer_field.")
 
@@ -274,67 +349,87 @@ def main() -> None:
     outputs = engine.generate(requests, sampling, use_tqdm=True)
 
     # --- rejection-filter + build targets ---------------------------------------
-    records: list[dict[str, Any]] = []
-    n_correct = 0  # samples with >=1 answer-correct candidate
-    n_box = 0      # (natural) correct samples whose candidate also has a parseable <box>
     natural = args.trace_mode == "natural"
-    for sample, output in zip(samples, outputs, strict=True):
-        correct = [
-            cand.text
-            for cand in output.outputs
-            if _answer_matches(extract_boxed_content(cand.text), sample["answer"])
-        ]
-        if correct:
-            n_correct += 1
-        if natural:
-            # natural needs the GENERATOR to emit a parseable <box> (no <think> required —
-            # build_natural_target re-wraps); inject injects the box, so a correct answer
-            # is enough (and --keep_incorrect can force one).
-            chosen_text = next((t for t in correct if parse_student_box(t) is not None), None)
-            if chosen_text is not None:
-                n_box += 1
-        elif correct:
-            chosen_text = correct[0]
-        elif args.keep_incorrect and output.outputs:
-            chosen_text = output.outputs[0].text
-        else:
-            chosen_text = None
-        if chosen_text is None:
-            continue
+    judge_enabled = args.judge == "api"
+
+    def _valid(cand_text: str) -> bool:
+        # usable for a trace: has a boxed answer; natural also needs a parseable <box>.
+        if not extract_boxed_content(cand_text):
+            return False
+        if natural and parse_student_box(cand_text) is None:
+            return False
+        return True
+
+    def _record(sample: dict[str, Any], cand_text: str) -> dict[str, Any]:
         if natural:
             target = build_natural_target(
-                chosen_text, sample["answer"], max_chars=args.max_reasoning_chars
+                cand_text, sample["answer"], max_chars=args.max_reasoning_chars
             )
         else:
-            reasoning = clean_reasoning(chosen_text, args.max_reasoning_chars)
+            reasoning = clean_reasoning(cand_text, args.max_reasoning_chars)
             target = build_locate_target(
                 sample["bbox"], reasoning, sample["answer"], decimals=args.bbox_decimals
             )
-        records.append({"image": sample["image"], "problem": sample["problem"], "target": target})
+        return {"image": sample["image"], "problem": sample["problem"], "target": target}
+
+    records: list[dict[str, Any]] = []
+    n_valid = 0   # samples with >=1 usable candidate (boxed answer [+ <box> for natural])
+    n_exact = 0   # kept via exact answer match (free)
+    judge_queue: list[tuple[int, str]] = []  # (sample_idx, candidate) — exact-fails to judge
+    for si, (sample, output) in enumerate(zip(samples, outputs, strict=True)):
+        valid = [c.text for c in output.outputs if _valid(c.text)]
+        if valid:
+            n_valid += 1
+        exact = next(
+            (t for t in valid if _answer_matches(extract_boxed_content(t), sample["answer"])),
+            None,
+        )
+        if exact is not None:
+            n_exact += 1
+            records.append(_record(sample, exact))
+        elif judge_enabled and valid:
+            judge_queue.append((si, valid[0]))  # judge ONLY exact-fails, one per sample
+        elif args.keep_incorrect and not natural and output.outputs:
+            records.append(_record(sample, output.outputs[0].text))  # inject force-keep (GT written in)
+
+    # LLM-judge the exact-match failures (open-ended answers string match wrongly drops).
+    n_judged = 0
+    if judge_queue:
+        items = [
+            (samples[si]["problem"], samples[si]["answer"], extract_boxed_content(t) or t)
+            for si, t in judge_queue
+        ]
+        verdicts = judge_correct_batch(
+            items,
+            base_url=args.judge_base_url,
+            model=args.judge_model,
+            api_key=args.judge_api_key,
+            max_workers=args.judge_max_workers,
+        )
+        for (si, cand_text), ok in zip(judge_queue, verdicts):
+            if ok:
+                n_judged += 1
+                records.append(_record(samples[si], cand_text))
 
     total = len(samples)
-    print(f"[coldstart] {n_correct}/{total} samples had a correct answer.", flush=True)
-    if natural:
-        print(
-            f"[coldstart] of those, {n_box}/{total} also had a parseable <box>. If this is "
-            "~0 the generator is not emitting <box> tags (CapCurriculum writes coords in "
-            "prose) -> use TRACE_MODE=inject GEN_HINT=true (injects the box; needs only a "
-            "correct answer).",
-            flush=True,
-        )
+    shard_tag = f"shard {args.shard_index}/{args.num_shards}: " if args.num_shards > 1 else ""
+    print(
+        f"[coldstart] {shard_tag}{n_valid}/{total} samples had a usable candidate; "
+        f"kept {len(records)} = {n_exact} exact-match"
+        + (f" + {n_judged} llm-judge (of {len(judge_queue)} exact-fails)" if judge_enabled else "")
+        + f"; mode={args.trace_mode}.",
+        flush=True,
+    )
     if not records:
         raise ValueError(
-            "0 cold-start traces kept (see counts above). Most robust fix: TRACE_MODE=inject "
-            "GEN_HINT=true (grounded reasoning + an injected <box>, only needs a correct "
-            "answer). Or raise --num_samples / --keep_incorrect / use a stronger --gen_model."
+            "0 cold-start traces kept (see counts above). If n_valid is ~0 the generator "
+            "isn't emitting <box> (natural) -> use TRACE_MODE=inject GEN_HINT=true. Else "
+            "raise --num_samples, enable --judge api (open-ended answers), or --keep_incorrect."
         )
-    kept = len(records)
-    print(f"[coldstart] kept {kept}/{total} traces (mode={args.trace_mode}).", flush=True)
     out = Dataset.from_list(records).cast_column("image", Image())
     out.save_to_disk(args.output_dir)
-    print(f"[coldstart] saved {kept} traces -> {args.output_dir}", flush=True)
-    # Show one for eyeballing.
-    print("[coldstart] example target:\n" + records[0]["target"][:600], flush=True)
+    print(f"[coldstart] {shard_tag}saved {len(records)} traces -> {args.output_dir}", flush=True)
+    print("[coldstart] example target:\n" + records[0]["target"][:700], flush=True)
 
 
 if __name__ == "__main__":

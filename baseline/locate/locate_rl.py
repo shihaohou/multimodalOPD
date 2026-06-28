@@ -67,6 +67,26 @@ def first_box_span(text: str):
     return match.group(1), match.start(), match.end(), match.start(1), match.end(1)
 
 
+def collapse_extra_boxes(text: str) -> str:
+    """Locate-once invariant: keep only the FIRST ``<box>...</box>``; strip any later ones
+    (leaving the surrounding prose) and tidy whitespace/punctuation.
+
+    The first box is the one the RL reward + OPD mask act on; extra restatements (a teacher
+    naturally repeats "the region <box>...</box>") would otherwise teach the student to
+    emit redundant boxes that OPD then has to trim.
+    """
+    count = {"n": 0}
+
+    def _sub(match: "re.Match[str]") -> str:
+        count["n"] += 1
+        return match.group(0) if count["n"] == 1 else ""
+
+    out = _BOX_RE.sub(_sub, text)
+    for bad, good in (("  ", " "), (" ,", ","), (" .", "."), (" )", ")"), ("( ", "(")):
+        out = out.replace(bad, good)
+    return out.strip()
+
+
 def char_span_to_token_span(
     pieces: list[str], char_start: int, char_end: int
 ) -> tuple[int, int]:

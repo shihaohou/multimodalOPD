@@ -64,7 +64,11 @@ def check_box_parsing() -> None:
 def check_box_span() -> None:
     """Text-based box detection + char->token mapping (the fix for box_coverage=0:
     <box>/</box> are multi-token, so token-subsequence matching misaligns)."""
-    from baseline.locate.locate_rl import char_span_to_token_span, first_box_span
+    from baseline.locate.locate_rl import (
+        char_span_to_token_span,
+        collapse_extra_boxes,
+        first_box_span,
+    )
 
     text = "<think>\n<box>[0.10, 0.20, 0.50, 0.60]</box>\nreason\n</think>\n\\boxed{X}"
     span = first_box_span(text)
@@ -84,6 +88,11 @@ def check_box_span() -> None:
     assert "".join(pieces2[cs:ce]) == "[0.10, 0.20, 0.50, 0.60]", pieces2[cs:ce]
     # no box -> None
     assert first_box_span("just text \\boxed{Y}") is None
+    # multi-box -> collapse to the first (locate-once)
+    multi = "focus on <box>[0.1, 0.2, 0.5, 0.6]</box>. The <box>[0.1, 0.2, 0.5, 0.6]</box> shows a bird."
+    collapsed = collapse_extra_boxes(multi)
+    assert collapsed.count("<box>") == 1, collapsed
+    assert "<box>[0.1, 0.2, 0.5, 0.6]</box>" in collapsed, collapsed
     print("[log-sanity] check_box_span OK")
 
 
@@ -174,11 +183,15 @@ def check_coldstart() -> None:
     target = build_locate_target((0.1, 0.2, 0.5, 0.6), reasoning, "No", decimals=2)
     assert target.startswith("<think>") and "<box>[0.10, 0.20, 0.50, 0.60]</box>" in target, target
     assert parse_student_box(target) == (0.1, 0.2, 0.5, 0.6), parse_student_box(target)
-    # natural: keep the teacher's woven box, re-wrap with <think> + GT answer.
-    woven = "I should look at <box>[0.30, 0.40, 0.70, 0.80]</box>, where ... \\boxed{x}"
+    # natural: keep the teacher's woven box, collapse extras, re-wrap with <think> + GT.
+    woven = (
+        "I should look at <box>[0.30, 0.40, 0.70, 0.80]</box>; the "
+        "<box>[0.30, 0.40, 0.70, 0.80]</box> shows X. \\boxed{x}"
+    )
     nat = build_natural_target(woven, "Yes", max_chars=0)
+    assert nat.count("<box>") == 1, nat  # locate-once: extra boxes collapsed
     assert parse_student_box(nat) == (0.3, 0.4, 0.7, 0.8), parse_student_box(nat)
-    assert nat.rstrip().endswith("\\boxed{Yes}") and "<box>" in nat, nat
+    assert nat.rstrip().endswith("\\boxed{Yes}"), nat
     print("[log-sanity] check_coldstart OK")
 
 

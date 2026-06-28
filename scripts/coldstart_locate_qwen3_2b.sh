@@ -41,10 +41,11 @@ TRACES_DIR="${TRACES_DIR:-runs/coldstart_locate_traces}"
 MODEL_TAG="$(basename "${MODEL_NAME_OR_PATH%/}")"
 SFT_OUTPUT_DIR="${SFT_OUTPUT_DIR:-runs/${MODEL_TAG}_locate_coldstart}"
 
-# --- Phase 1: build traces (1 GPU vLLM) -------------------------------------
+# --- Phase 1: build traces (vLLM) -------------------------------------------
 SKIP_BUILD="${SKIP_BUILD:-false}"
-COLDSTART_GEN_GPU="${COLDSTART_GEN_GPU:-0}"
-MAX_SAMPLES="${MAX_SAMPLES:-4000}"
+GEN_NUM_GPUS="${GEN_NUM_GPUS:-1}"           # >1 => data-parallel build across GPUs 0..N-1
+COLDSTART_GEN_GPU="${COLDSTART_GEN_GPU:-0}" # single-GPU index when GEN_NUM_GPUS=1
+MAX_SAMPLES="${MAX_SAMPLES:-4000}"          # GLOBAL prompt target (split across shards)
 NUM_SAMPLES="${NUM_SAMPLES:-4}"
 GEN_TEMPERATURE="${GEN_TEMPERATURE:-0.8}"
 GEN_MAX_TOKENS="${GEN_MAX_TOKENS:-1024}"
@@ -52,39 +53,76 @@ MAX_REASONING_CHARS="${MAX_REASONING_CHARS:-1500}"
 KEEP_INCORRECT="${KEEP_INCORRECT:-false}"
 # inject: generate reasoning, bolt <box>[GT]</box> onto the head (GEN_HINT=true grounds
 #   the reasoning first). natural: the teacher (set GEN_MODEL=<teacher>) is shown the GT box
-#   and writes the WHOLE locate trace itself (box woven in), used verbatim — matches the
-#   teacher's own pattern (recommended; Rethinking-OPD: OPD needs compatible patterns).
+#   and writes the WHOLE structured (locate->describe->reason) trace itself, used verbatim —
+#   matches the teacher's own pattern (recommended; Rethinking-OPD: OPD needs compatible patterns).
 TRACE_MODE="${TRACE_MODE:-inject}"
 GEN_HINT="${GEN_HINT:-false}"
 GEN_GPU_MEM_UTIL="${GEN_GPU_MEM_UTIL:-0.9}"
 GEN_MAX_MODEL_LEN="${GEN_MAX_MODEL_LEN:-}"
+# LLM judge for the exact-match FAILURES only (open-ended answers string match wrongly drops).
+# none | api (OpenAI-compatible, e.g. a local vLLM Kimi). Exact matches are kept for free.
+JUDGE="${JUDGE:-none}"
+JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://10.48.91.210:8000/v1}"
+JUDGE_MODEL="${JUDGE_MODEL:-kimi}"
+JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
+JUDGE_MAX_WORKERS="${JUDGE_MAX_WORKERS:-16}"
 
 if [[ "$SKIP_BUILD" != "true" ]]; then
-  KEEP_INCORRECT_ARG=()
-  [[ "$KEEP_INCORRECT" == "true" ]] && KEEP_INCORRECT_ARG=(--keep_incorrect)
-  GEN_HINT_ARG=()
-  [[ "$GEN_HINT" == "true" ]] && GEN_HINT_ARG=(--gen_hint)
-  GEN_MAX_MODEL_LEN_ARG=()
-  [[ -n "$GEN_MAX_MODEL_LEN" ]] && GEN_MAX_MODEL_LEN_ARG=(--max_model_len "$GEN_MAX_MODEL_LEN")
-  echo "[coldstart] Phase 1: building traces -> $TRACES_DIR (GPU $COLDSTART_GEN_GPU)"
-  CUDA_VISIBLE_DEVICES="$COLDSTART_GEN_GPU" uv run python -m baseline.locate.coldstart_build \
-    --model_path "$MODEL_NAME_OR_PATH" \
-    --gen_model "$GEN_MODEL" \
-    --dataset_name "$DATASET_NAME" \
-    --dataset_split "$DATASET_SPLIT" \
-    --answer_field "$ANSWER_FIELD" \
-    --bbox_field "$BBOX_FIELD" \
-    --output_dir "$TRACES_DIR" \
-    --trace_mode "$TRACE_MODE" \
-    --max_samples "$MAX_SAMPLES" \
-    --num_samples "$NUM_SAMPLES" \
-    --temperature "$GEN_TEMPERATURE" \
-    --max_tokens "$GEN_MAX_TOKENS" \
-    --max_reasoning_chars "$MAX_REASONING_CHARS" \
-    --gpu_memory_utilization "$GEN_GPU_MEM_UTIL" \
-    "${GEN_MAX_MODEL_LEN_ARG[@]}" \
-    "${GEN_HINT_ARG[@]}" \
+  KEEP_INCORRECT_ARG=(); [[ "$KEEP_INCORRECT" == "true" ]] && KEEP_INCORRECT_ARG=(--keep_incorrect)
+  GEN_HINT_ARG=(); [[ "$GEN_HINT" == "true" ]] && GEN_HINT_ARG=(--gen_hint)
+  GEN_MAX_MODEL_LEN_ARG=(); [[ -n "$GEN_MAX_MODEL_LEN" ]] && GEN_MAX_MODEL_LEN_ARG=(--max_model_len "$GEN_MAX_MODEL_LEN")
+  BUILD_ARGS=(
+    --model_path "$MODEL_NAME_OR_PATH"
+    --gen_model "$GEN_MODEL"
+    --dataset_name "$DATASET_NAME"
+    --dataset_split "$DATASET_SPLIT"
+    --answer_field "$ANSWER_FIELD"
+    --bbox_field "$BBOX_FIELD"
+    --trace_mode "$TRACE_MODE"
+    --max_samples "$MAX_SAMPLES"
+    --num_samples "$NUM_SAMPLES"
+    --temperature "$GEN_TEMPERATURE"
+    --max_tokens "$GEN_MAX_TOKENS"
+    --max_reasoning_chars "$MAX_REASONING_CHARS"
+    --gpu_memory_utilization "$GEN_GPU_MEM_UTIL"
+    --judge "$JUDGE"
+    --judge_base_url "$JUDGE_BASE_URL"
+    --judge_model "$JUDGE_MODEL"
+    --judge_api_key "$JUDGE_API_KEY"
+    --judge_max_workers "$JUDGE_MAX_WORKERS"
+    "${GEN_MAX_MODEL_LEN_ARG[@]}"
+    "${GEN_HINT_ARG[@]}"
     "${KEEP_INCORRECT_ARG[@]}"
+  )
+  if [[ "$GEN_NUM_GPUS" -gt 1 ]]; then
+    echo "[coldstart] Phase 1: data-parallel build on $GEN_NUM_GPUS GPUs -> $TRACES_DIR"
+    pids=()
+    for ((i=0; i<GEN_NUM_GPUS; i++)); do
+      CUDA_VISIBLE_DEVICES="$i" uv run python -m baseline.locate.coldstart_build \
+        "${BUILD_ARGS[@]}" \
+        --shard_index "$i" --num_shards "$GEN_NUM_GPUS" \
+        --output_dir "${TRACES_DIR}.shard${i}" &
+      pids+=($!)
+    done
+    fail=0
+    for pid in "${pids[@]}"; do wait "$pid" || fail=1; done
+    [[ $fail -eq 0 ]] || { echo "[coldstart] a build shard failed; aborting."; exit 1; }
+    echo "[coldstart] merging $GEN_NUM_GPUS shards -> $TRACES_DIR"
+    uv run python - "$TRACES_DIR" "$GEN_NUM_GPUS" <<'PY'
+import sys
+from datasets import concatenate_datasets, load_from_disk
+traces_dir, n = sys.argv[1], int(sys.argv[2])
+parts = [load_from_disk(f"{traces_dir}.shard{i}") for i in range(n)]
+merged = concatenate_datasets(parts)
+merged.save_to_disk(traces_dir)
+print(f"[coldstart] merged {n} shards -> {len(merged)} traces -> {traces_dir}", flush=True)
+PY
+    rm -rf "${TRACES_DIR}".shard*
+  else
+    echo "[coldstart] Phase 1: building traces -> $TRACES_DIR (GPU $COLDSTART_GEN_GPU)"
+    CUDA_VISIBLE_DEVICES="$COLDSTART_GEN_GPU" uv run python -m baseline.locate.coldstart_build \
+      "${BUILD_ARGS[@]}" --output_dir "$TRACES_DIR"
+  fi
 else
   echo "[coldstart] Phase 1 skipped (SKIP_BUILD=true); reusing $TRACES_DIR"
 fi
