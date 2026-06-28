@@ -43,14 +43,25 @@ from baseline.probe.saliency_data import BoxNorm, parse_bbox_norm
 
 # The exact privileged hint appended to the teacher's question. ``{bbox}`` is
 # filled with the per-sample normalized box, e.g. ``[0.12, 0.34, 0.55, 0.78]``.
-# Deliberately spells out the coordinate convention (normalized, top-left origin,
-# x1y1x2y2) so a format-following VLM teacher can localize without guessing, and
-# states *why* the region matters (the evidence is there) to bias its attention,
-# not its answer. Override via ``--hint_template`` for ablations.
+# Spells out the coordinate convention (normalized, top-left origin, x1y1x2y2) so a
+# format-following VLM teacher can localize, states *why* the region matters (the
+# evidence is there), and — critically — forbids the teacher from VERBALIZING the
+# box/coordinates/hint in its output.
+#
+# Why the no-verbalize clause: without it, a region-aware teacher (e.g.
+# CapCurriculum) writes its CoT as "the hint directs me to bbox [X]… in the crop…".
+# Reverse-KL then forces the hint-FREE student to reproduce that text on its own
+# rollouts — it must emit coordinate tokens it cannot know → unmatchable per-token KL
+# → on-policy mode collapse into token salad (observed: loss_opd crashes, clip_ratio
+# spikes, agreement craters ~step 60-100). Keeping the box out of the teacher's
+# *output* leaves only the benign "more grounded answer" signal we actually want.
+# Override via ``--hint_template`` for ablations.
 HINT_TEMPLATE = (
-    "Hint: pay special attention to the region of the image inside the bounding "
-    "box {bbox} (normalized to [0,1], top-left origin, [x1, y1, x2, y2]). "
-    "The evidence needed to answer the question is located there."
+    "Hint: the evidence needed to answer the question is inside the bounding box "
+    "{bbox} (normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Use this only "
+    "to decide where to look in the image, then answer the question directly. Do NOT "
+    "mention the bounding box, the coordinates, this hint, or a crop in your "
+    "reasoning or your answer."
 )
 
 
