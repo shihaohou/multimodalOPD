@@ -128,6 +128,24 @@ def check_pg_gradient() -> None:
     print("[log-sanity] check_pg_gradient OK")
 
 
+def check_coldstart() -> None:
+    """Cold-start SFT plumbing: label assembly + the trace target round-trips through
+    the RL box parser (so a cold-started student's boxes are parseable -> RL fires)."""
+    from baseline.locate.coldstart_build import build_locate_target, clean_reasoning
+    from baseline.locate.coldstart_collator import IGNORE_INDEX, assemble_sft_row
+
+    inp, lab = assemble_sft_row([1, 2, 3], [4, 5], eos_id=9)
+    assert inp == [1, 2, 3, 4, 5, 9], inp
+    assert lab == [IGNORE_INDEX] * 3 + [4, 5, 9], lab  # prompt masked, target+EOS supervised
+
+    reasoning = clean_reasoning("The crown is brown. <think>x</think> \\boxed{No}", 0)
+    assert "boxed" not in reasoning and "<think>" not in reasoning, reasoning
+    target = build_locate_target((0.1, 0.2, 0.5, 0.6), reasoning, "No", decimals=2)
+    assert target.startswith("<think>\n<box>[0.10, 0.20, 0.50, 0.60]</box>"), target
+    assert parse_student_box(target) == (0.1, 0.2, 0.5, 0.6), parse_student_box(target)
+    print("[log-sanity] check_coldstart OK")
+
+
 def check_prompts() -> None:
     assert "<box>" in LOCATE_SYSTEM_PROMPT, "student prompt must request a <box>"
     assert "\\boxed{}" in LOCATE_SYSTEM_PROMPT, "student must still answer in \\boxed{}"
@@ -212,6 +230,7 @@ def main() -> None:
     check_iou()
     check_advantage()
     check_pg_gradient()
+    check_coldstart()
     check_prompts()
     if args.model:
         check_collator(args.model)

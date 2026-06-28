@@ -55,7 +55,11 @@ group baseline is mean-centered, so it cannot by itself bootstrap box emission.
 | `opd_locate_trainer.py` | `OPDLocateTrainer(OPDHintTrainer)` — overrides `compute_loss`: box-span masking on OPD + the GRPO box RL term. `local_hf` teacher only. |
 | `../train_opd_locate.py` | entry point (`OPDLocateScriptArguments` adds `--group_size` / `--lambda_rl` / `--rl_reward` / `--rl_ungated_weight` / `--rl_normalize_adv` / `--kl_position_gate` / `--locate_system_prompt`). |
 | `../../scripts/train_opd_locate_qwen3_2b.sh` | launcher (GHD knobs + `GROUP_SIZE` / `LAMBDA_RL` / `RL_REWARD`). |
-| `sanity_check.py` | CPU-only RL math + (with `--model`) the collator group-expansion / prompt-asymmetry check. |
+| `coldstart_build.py` | Phase-1 trace builder (vLLM self-distill → rejection-filter → inject GT box → `save_to_disk`). |
+| `coldstart_collator.py` | SFT collator (locate prompt + target, prompt masked, right-padded) + `assemble_sft_row`. |
+| `coldstart_sft.py` | Phase-2 SFT entry (vanilla HF `Trainer`, CE from `labels`). |
+| `../../scripts/coldstart_locate_qwen3_2b.sh` | two-phase cold-start launcher (build → SFT). |
+| `sanity_check.py` | CPU-only RL math + cold-start plumbing + (with `--model`) the collator group-expansion / prompt-asymmetry check. |
 
 The only change outside this package is a backward-compatible `teacher_system_prompt`
 field on `OPDHintDataCollator` (default `None` → unchanged GHD behaviour) so the
@@ -103,6 +107,42 @@ Then inspect `runs/<run>/completion_samples/*.md`: does the student actually emi
 `mean_box_area` (collapse monitor); `loss_rl`, `loss_opd`. If `box_coverage` is low,
 cold-start (Option β) or raise `RL_UNGATED_WEIGHT` (warmup: rewards a well-placed box
 even when the answer is wrong, default 0).
+
+## Cold-start (Option β) — required for generic-instruct students
+
+A smoke on **Qwen3-VL-2B-Instruct** showed it ignores the locate format zero-shot
+(no `<think>`, no `<box>`) → `box_coverage=0` → the RL term never fires. RL **cannot**
+bootstrap box *emission* (it only shapes the coordinates of a box that was emitted), so
+a generic-instruct student needs a short SFT to learn the format first. `coldstart_*`
+does this (self-distillation):
+
+```bash
+export M=/path/to/models D=/path/to/datasets
+MODEL_NAME_OR_PATH=$M/Qwen3-VL-2B-Instruct \
+DATASET_NAME=$D/Visual-CoT ANSWER_FIELD=answer \
+bash scripts/coldstart_locate_qwen3_2b.sh           # Phase 1: build traces (1 GPU vLLM)
+                                                    # Phase 2: SFT (N GPU) -> runs/<model>_locate_coldstart
+```
+
+- **Phase 1** (`coldstart_build.py`): vLLM-sample the student's own reasoning, keep
+  answer-correct attempts, inject the GT box + `<think>/<box>` scaffold →
+  `<think><box>[GT]</box> {reasoning} </think> \boxed{answer}` ([0,1] coords). Each
+  example has a *different* GT box, so SFT teaches box *prediction* (image+Q → box), not
+  memorization. `--gen_model` to generate with a stronger model/teacher.
+- **Phase 2** (`coldstart_sft.py`): vanilla CE SFT (prompt masked) → a checkpoint that
+  emits the format.
+
+Then run B2 from the cold-started checkpoint:
+
+```bash
+MODEL_NAME_OR_PATH=runs/Qwen3-VL-2B-Instruct_locate_coldstart TEACHER_MODEL=$M/... \
+DATASET_NAME=$D/Visual-CoT ANSWER_FIELD=answer \
+bash scripts/train_opd_locate_qwen3_2b.sh
+```
+
+Re-check the smoke metrics: `box_present_rate`/`box_coverage` should now be ≈1 and
+`loss_rl`/`nonzero_adv_rate` non-zero. (A reasoning-format-SFT'd student, e.g.
+MMR1-3B-SFT, may need no cold-start.)
 
 ## Baselines / decision (why this fork exists)
 
