@@ -466,6 +466,16 @@ for path in sorted(glob.glob(os.path.join(root, "**", "summary.json"), recursive
             matrix.setdefault(name, {})[tag] = entry.get("pass_at_k")
 
 tags = sorted(tags)
+# Derived row: MMMU-Pro average over its two sub-scores (per tag). Name ends with ")"
+# so the per-checkpoint "avg(judged pass@k)" rollup excludes it (same convention as the
+# det rows). Added only when at least one sub-score is present.
+_pro_subs = ("mmmu_pro_10options", "mmmu-pro-vision")
+if any(s in matrix for s in _pro_subs):
+    avg_row = {}
+    for t in tags:
+        vals = [matrix[s][t] for s in _pro_subs if isinstance(matrix.get(s, {}).get(t), (int, float))]
+        avg_row[t] = sum(vals) / len(vals) if vals else None
+    matrix["mmmu-pro(avg)"] = avg_row
 per_model = {}
 if matrix:
     width = max([len(n) for n in matrix] + [16])

@@ -41,11 +41,17 @@ DET_METRIC = {
     "vstar": ("accuracy", "vstar (acc)"),
 }
 
+# Derived column: the average of MMMU-Pro's two sub-scores. It re-aggregates columns
+# already in the table, so it is kept OUT of the judged average (registered in
+# det_labels, which judged_avg() skips). Emitted only when ≥1 sub-score actually ran.
+PRO_SUBSCORES = ("mmmu_pro_10options", "mmmu-pro-vision")
+PRO_AVG_LABEL = "mmmu-pro (avg)"
+
 # Preferred column order (the standard suite); unknown benchmarks sort alphabetically
 # after these.
 BENCH_ORDER = [
     "mathvista", "mathverse", "mathvision",
-    "MMMU", "mmmu_pro_10options", "mmmu-pro-vision",
+    "MMMU", "mmmu_pro_10options", "mmmu-pro-vision", PRO_AVG_LABEL,
     "mmstar", "hallusionbench",
     "pope (F1)", "chartqa (relax)", "vqav2 (soft)", "vstar (acc)",
 ]
@@ -57,7 +63,8 @@ def collect(root: str):
     """Parse every ``summary.json`` under ``root`` into ``matrix[benchmark][tag] = ratio``.
 
     Returns ``(matrix, tags, det_labels)`` where ``det_labels`` is the set of
-    benchmark columns scored by an official metric (kept out of the judged average).
+    benchmark columns kept out of the judged average — either scored by an official
+    metric or a derived re-aggregation (the MMMU-Pro sub-score average).
     """
     matrix: dict[str, dict[str, float | None]] = {}
     tags: list[str] = []
@@ -87,6 +94,21 @@ def collect(root: str):
                     str(entry.get("dataset") or entry.get("benchmark") or "?").rstrip("/")
                 )
                 matrix.setdefault(name, {})[tag] = entry.get("pass_at_k")
+
+    # Derived MMMU-Pro average column = per-method mean of the two sub-scores. Added to
+    # det_labels so it stays out of the judged average (it only re-aggregates columns
+    # already counted there). Skipped entirely if neither sub-score was evaluated.
+    if any(sub in matrix for sub in PRO_SUBSCORES):
+        avg_col: dict[str, float | None] = {}
+        for tag in tags:
+            sub_vals = [
+                matrix[sub][tag]
+                for sub in PRO_SUBSCORES
+                if isinstance(matrix.get(sub, {}).get(tag), (int, float))
+            ]
+            avg_col[tag] = sum(sub_vals) / len(sub_vals) if sub_vals else None
+        matrix[PRO_AVG_LABEL] = avg_col
+        det_labels.add(PRO_AVG_LABEL)
     return matrix, tags, det_labels
 
 
