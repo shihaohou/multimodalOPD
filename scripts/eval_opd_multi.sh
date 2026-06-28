@@ -132,7 +132,7 @@ DSROOT="${DSROOT:-$D/zli12321}"
 export POPE_REPO="${POPE_REPO:-$D/POPE}"        # passed through to eval_vqa.sh (det group)
 export CHARTQA_REPO="${CHARTQA_REPO:-$D/ChartQA}"
 export VQAV2_REPO="${VQAV2_REPO:-$D/VQAv2}"
-export VSTAR_REPO="${VSTAR_REPO:-$D/vstar_bench}"  # passed to eval_vstar.sh (det-style MCQ, no judge)
+export VSTAR_REPO="${VSTAR_REPO:-$D/VStarBench}"  # passed to eval_vstar.sh (det-style MCQ, no judge)
 # Names (case-insensitive) that are deterministic -> eval_vqa.sh, never the judge.
 is_det() { case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in pope|chartqa|vqav2) return 0 ;; *) return 1 ;; esac; }
 # V*Bench: deterministic MCQ too, but its OWN evaluator (eval_vstar.sh), never the judge.

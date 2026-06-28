@@ -32,7 +32,11 @@ MODEL_NAME="${MODEL_NAME:-$(basename "$MODEL_PATH")}"
 
 # HF dataset id, OR a local snapshot dir for offline boxes (HF_HUB_OFFLINE=1):
 #   hf download craigwu/vstar_bench --repo-type dataset --local-dir <dir>; VSTAR_REPO=<dir>
-VSTAR_REPO="${VSTAR_REPO:-craigwu/vstar_bench}"
+# Default: the shared-disk snapshot ($D/VStarBench, same layout/root as eval_opd_multi.sh)
+# when present, else fall back to the HF id (auto-download) so this still works on any box.
+D="${D:-/home/web_server/antispam/project/houshihao/datasets}"
+_VSTAR_DEFAULT="$D/VStarBench"; [[ -d "$_VSTAR_DEFAULT" ]] || _VSTAR_DEFAULT="craigwu/vstar_bench"
+VSTAR_REPO="${VSTAR_REPO:-$_VSTAR_DEFAULT}"
 QUESTIONS_FILE="${QUESTIONS_FILE:-test_questions.jsonl}"
 # Comma-separated category filter (default: all). e.g. CATEGORIES=direct_attributes
 CATEGORIES="${CATEGORIES:-}"
