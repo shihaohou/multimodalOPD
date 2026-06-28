@@ -44,6 +44,7 @@ from __future__ import annotations
 import argparse
 import os
 import random
+import re
 from typing import Any
 
 os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
@@ -80,10 +81,12 @@ JUDGE_PROMPT = (
     "Question: {question}\n"
     "Reference answer: {reference}\n"
     "Model answer: {candidate}\n"
-    "Does the model answer have the same meaning as the reference answer? "
-    "Open-ended phrasing differences are fine; judge the meaning. "
-    "Reply with only \"yes\" or \"no\"."
+    "Does the model answer mean the same as the reference (open-ended phrasing "
+    "differences are fine; judge the meaning)? End your reply with a single word: "
+    "yes or no."
 )
+
+_VERDICT_RE = re.compile(r"\b(yes|no)\b")
 
 
 def judge_correct_batch(
@@ -93,18 +96,24 @@ def judge_correct_batch(
     model: str,
     api_key: str,
     max_workers: int = 16,
+    max_tokens: int = 256,
 ) -> list[bool]:
     """LLM-judge a batch of ``(question, reference, candidate)`` -> list[bool].
 
-    Used only for the exact-match FAILURES (open-ended Visual-CoT answers that string
-    matching wrongly drops). OpenAI-compatible endpoint (e.g. a local vLLM Kimi). Any
-    error on an item -> False (conservative: drop rather than keep a wrong trace).
+    Used only for the exact-match FAILURES (open-ended answers string matching drops).
+    OpenAI-compatible endpoint (e.g. a local vLLM Kimi). Robust to *thinking* models:
+    ``max_tokens`` is large enough to let it finish, the verdict is the LAST ``yes``/``no``
+    in the reply (after any reasoning), and ``reasoning_content`` is a fallback when
+    ``content`` is empty. Prints one raw reply + the error count so a misconfigured
+    endpoint / unexpected format is visible (the 0-recovered failure mode) instead of
+    silently dropping everything. Any per-item error -> False (drop, don't keep a wrong trace).
     """
     from concurrent.futures import ThreadPoolExecutor
 
     from openai import OpenAI
 
     client = OpenAI(base_url=base_url, api_key=api_key or "EMPTY")
+    debug: dict[str, Any] = {"raw": None, "errors": 0, "first_error": None}
 
     def _judge_one(item: tuple[str, str, str]) -> bool:
         question, reference, candidate = item
@@ -120,15 +129,33 @@ def judge_correct_batch(
                     }
                 ],
                 temperature=0.0,
-                max_tokens=8,
+                max_tokens=max_tokens,
             )
-            out = (resp.choices[0].message.content or "").strip().lower()
-            return out.startswith("yes")
-        except Exception:  # noqa: BLE001 - a judge failure just drops the trace
+            message = resp.choices[0].message
+            out = message.content or ""
+            if not out.strip():  # thinking models may leave content empty / in reasoning_content
+                out = getattr(message, "reasoning_content", "") or ""
+            if debug["raw"] is None:
+                debug["raw"] = out[:300]
+            verdicts = _VERDICT_RE.findall(out.lower())
+            return verdicts[-1] == "yes" if verdicts else False  # the FINAL yes/no = verdict
+        except Exception as exc:  # noqa: BLE001
+            debug["errors"] += 1
+            if debug["first_error"] is None:
+                debug["first_error"] = f"{type(exc).__name__}: {exc}"
             return False
 
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(_judge_one, items))
+        results = list(pool.map(_judge_one, items))
+    if debug["errors"]:
+        print(
+            f"[coldstart] judge: {debug['errors']}/{len(items)} API errors "
+            f"(first: {debug['first_error']})",
+            flush=True,
+        )
+    if debug["raw"] is not None:
+        print(f"[coldstart] judge raw reply sample (model={model}): {debug['raw']!r}", flush=True)
+    return results
 
 try:  # optional, better math/MCQ matching when available
     from mathruler.grader import grade_answer as _grade_answer
@@ -165,6 +192,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--judge_model", default="kimi")
     ap.add_argument("--judge_api_key", default="EMPTY")
     ap.add_argument("--judge_max_workers", type=int, default=16)
+    ap.add_argument("--judge_max_tokens", type=int, default=256, help="Judge reply budget; big enough for a thinking model to reach its yes/no verdict.")
     # Data-parallel sharding: run N copies (one per GPU) over disjoint shards of the
     # shuffled dataset, each with its own --output_dir; merge afterwards. max_samples is
     # the GLOBAL target (each shard does max_samples/num_shards).
@@ -405,6 +433,7 @@ def main() -> None:
             model=args.judge_model,
             api_key=args.judge_api_key,
             max_workers=args.judge_max_workers,
+            max_tokens=args.judge_max_tokens,
         )
         for (si, cand_text), ok in zip(judge_queue, verdicts):
             if ok:

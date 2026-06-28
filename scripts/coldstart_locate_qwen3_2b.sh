@@ -66,6 +66,7 @@ JUDGE_BASE_URL="${JUDGE_BASE_URL:-http://10.48.91.210:8000/v1}"
 JUDGE_MODEL="${JUDGE_MODEL:-kimi}"
 JUDGE_API_KEY="${JUDGE_API_KEY:-EMPTY}"
 JUDGE_MAX_WORKERS="${JUDGE_MAX_WORKERS:-16}"
+JUDGE_MAX_TOKENS="${JUDGE_MAX_TOKENS:-256}"  # big enough for a thinking judge to reach yes/no
 
 if [[ "$SKIP_BUILD" != "true" ]]; then
   KEEP_INCORRECT_ARG=(); [[ "$KEEP_INCORRECT" == "true" ]] && KEEP_INCORRECT_ARG=(--keep_incorrect)
@@ -90,6 +91,7 @@ if [[ "$SKIP_BUILD" != "true" ]]; then
     --judge_model "$JUDGE_MODEL"
     --judge_api_key "$JUDGE_API_KEY"
     --judge_max_workers "$JUDGE_MAX_WORKERS"
+    --judge_max_tokens "$JUDGE_MAX_TOKENS"
     "${GEN_MAX_MODEL_LEN_ARG[@]}"
     "${GEN_HINT_ARG[@]}"
     "${KEEP_INCORRECT_ARG[@]}"
