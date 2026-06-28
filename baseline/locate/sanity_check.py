@@ -61,6 +61,32 @@ def check_box_parsing() -> None:
     print("[log-sanity] check_box_parsing OK")
 
 
+def check_box_span() -> None:
+    """Text-based box detection + char->token mapping (the fix for box_coverage=0:
+    <box>/</box> are multi-token, so token-subsequence matching misaligns)."""
+    from baseline.locate.locate_rl import char_span_to_token_span, first_box_span
+
+    text = "<think>\n<box>[0.10, 0.20, 0.50, 0.60]</box>\nreason\n</think>\n\\boxed{X}"
+    span = first_box_span(text)
+    assert span is not None, "first_box_span missed a valid box"
+    inner, open_start, close_end, inner_start, inner_end = span
+    assert inner == "[0.10, 0.20, 0.50, 0.60]", inner
+    assert text[open_start:close_end] == "<box>[0.10, 0.20, 0.50, 0.60]</box>"
+    assert text[inner_start:inner_end] == "[0.10, 0.20, 0.50, 0.60]"
+    # char->token map: char-granular pieces -> token idx == char idx.
+    pieces = list(text)
+    assert char_span_to_token_span(pieces, inner_start, inner_end) == (inner_start, inner_end)
+    # multi-char pieces: recover exactly the coord "token".
+    pieces2 = ["<think>", "\n", "<box>", "[0.10, 0.20, 0.50, 0.60]", "</box>", "..."]
+    full = "".join(pieces2)
+    s2 = first_box_span(full)
+    cs, ce = char_span_to_token_span(pieces2, s2[3], s2[4])
+    assert "".join(pieces2[cs:ce]) == "[0.10, 0.20, 0.50, 0.60]", pieces2[cs:ce]
+    # no box -> None
+    assert first_box_span("just text \\boxed{Y}") is None
+    print("[log-sanity] check_box_span OK")
+
+
 def check_iou() -> None:
     a = (0.0, 0.0, 0.5, 0.5)
     assert abs(iou_norm(a, a) - 1.0) < 1e-9, "identical boxes -> IoU 1"
@@ -227,6 +253,7 @@ def main() -> None:
     )
     args = ap.parse_args()
     check_box_parsing()
+    check_box_span()
     check_iou()
     check_advantage()
     check_pg_gradient()

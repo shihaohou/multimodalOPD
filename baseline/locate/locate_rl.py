@@ -51,6 +51,43 @@ def parse_student_box(completion_text: str) -> Optional[BoxNorm]:
     return parse_bbox_norm(inner)
 
 
+def first_box_span(text: str):
+    """Char offsets of the FIRST ``<box>...</box>`` in ``text``.
+
+    Returns ``(inner_text, open_start, close_end, inner_start, inner_end)`` (char
+    indices into ``text``) or None. ``open_start..close_end`` spans the whole
+    ``<box>...</box>``; ``inner_start..inner_end`` spans the coordinate text between the
+    tags. Text-based on purpose: ``<box>``/``</box>`` are NOT single tokens (unlike
+    Qwen's ``<think>``), so token-subsequence matching is unreliable — find them in the
+    decoded string, then map back to tokens with :func:`char_span_to_token_span`.
+    """
+    match = _BOX_RE.search(text)
+    if match is None:
+        return None
+    return match.group(1), match.start(), match.end(), match.start(1), match.end(1)
+
+
+def char_span_to_token_span(
+    pieces: list[str], char_start: int, char_end: int
+) -> tuple[int, int]:
+    """Map ``[char_start, char_end)`` in ``''.join(pieces)`` to a ``[tok_start, tok_end)``
+    token range. ``pieces[i]`` = the decoded text of token ``i``. Exact for byte-level
+    BPE over the (ASCII) box region. Pure mirror of the trainer's per-token decode loop,
+    so the mapping logic is CPU-testable without a tokenizer.
+    """
+    tok_start: int | None = None
+    cumulative = 0
+    for index, piece in enumerate(pieces):
+        nxt = cumulative + len(piece)
+        if tok_start is None and nxt > char_start:
+            tok_start = index
+        if nxt >= char_end:
+            return (tok_start if tok_start is not None else index, index + 1)
+        cumulative = nxt
+    total = len(pieces)
+    return (tok_start if tok_start is not None else total, total)
+
+
 def iou_norm(box_a: BoxNorm, box_b: BoxNorm) -> float:
     """IoU of two normalized ``(x1, y1, x2, y2)`` boxes (top-left origin).
 

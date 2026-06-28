@@ -42,8 +42,8 @@ import torch.nn as nn
 
 from baseline.hint.opd_hint_trainer import OPDHintTrainer
 from baseline.locate.locate_rl import (
-    BOX_CLOSE,
     BOX_OPEN,
+    first_box_span,
     group_normalize_advantage,
     iou_norm,
     sampled_token_logprobs,
@@ -88,6 +88,26 @@ class OPDLocateTrainer(OPDHintTrainer):
         self.kl_position_gate = bool(kl_position_gate)
 
     # ------------------------------------------------------------------ box spans
+    def _char_span_to_tokens(
+        self, valid: torch.Tensor, char_start: int, char_end: int
+    ) -> tuple[int, int]:
+        """Map a ``[char_start, char_end)`` span in ``decode(valid)`` to a token range,
+        via per-token cumulative decode (exact for the ASCII box region; byte-level BPE).
+        Stops at ``char_end`` so it never decodes into later (possibly multi-byte) text.
+        Mirrors :func:`baseline.locate.locate_rl.char_span_to_token_span`."""
+        tok_start: int | None = None
+        cumulative = 0
+        n = int(valid.shape[0])
+        for index in range(n):
+            piece = self._decode_token_ids(valid[index : index + 1], skip_special_tokens=False)
+            nxt = cumulative + len(piece)
+            if tok_start is None and nxt > char_start:
+                tok_start = index
+            if nxt >= char_end:
+                return (tok_start if tok_start is not None else index, index + 1)
+            cumulative = nxt
+        return (tok_start if tok_start is not None else n, n)
+
     def _locate_row_box(
         self, row: torch.Tensor, valid_length: int
     ) -> tuple[tuple[int, int] | None, tuple[int, int] | None, Any, bool]:
@@ -102,28 +122,35 @@ class OPDLocateTrainer(OPDHintTrainer):
           or late);
         * ``late``       — True when the box appears at/after ``\\boxed{}`` ("answer then
           locate", not "locate then answer"). A late box is still masked from OPD but
-          earns no RL/reward, so RL can't reinforce locating *after* the fact.
+          earns no RL/reward.
 
-        A box with an open tag but no close still masks the tag from OPD (the
-        hidden-hint teacher never emits it) but yields no RL handle / box value.
+        The box VALUE comes from the decoded TEXT (``first_box_span`` + ``parse_bbox_norm``)
+        — robust, because ``<box>``/``</box>`` are multi-token (not single special tokens
+        like Qwen's ``<think>``) so token-subsequence/re-encode matching misaligns and
+        silently corrupts the coords. Token spans (for the masks) are recovered with an
+        exact cumulative-decode char->token map.
         """
-        open_span = self._find_tag_span(row, valid_length, BOX_OPEN)
-        if open_span is None:
+        if valid_length <= 0:
             return None, None, None, False
-        close_span = self._find_tag_span(
-            row, valid_length, BOX_CLOSE, start=open_span[1]
-        )
-        if close_span is None or close_span[0] < open_span[1]:
-            return (open_span[0], open_span[1]), None, None, False
-        full_span = (open_span[0], close_span[1])
-        answer_span = self._find_tag_span(row, valid_length, "\\boxed{")
-        if answer_span is not None and open_span[0] >= answer_span[0]:
+        valid = row[:valid_length]
+        text = self._decode_token_ids(valid, skip_special_tokens=False)
+        span = first_box_span(text)
+        if span is None:
+            # An open ``<box>`` with no proper close: mask the tag from OPD (the
+            # hidden-hint teacher never emits it), no RL handle / value.
+            open_char = text.find(BOX_OPEN)
+            if open_char < 0:
+                return None, None, None, False
+            full = self._char_span_to_tokens(valid, open_char, open_char + len(BOX_OPEN))
+            return full, None, None, False
+        inner, open_start, close_end, inner_start, inner_end = span
+        box = parse_bbox_norm(inner)
+        full_span = self._char_span_to_tokens(valid, open_start, close_end)
+        boxed_char = text.find("\\boxed{")
+        if boxed_char >= 0 and open_start >= boxed_char:
             return full_span, None, None, True  # late box: mask from OPD, no RL
-        coord_span = (open_span[1], close_span[0])
-        inner_text = self._decode_token_ids(
-            row[coord_span[0] : coord_span[1]], skip_special_tokens=False
-        )
-        return full_span, coord_span, parse_bbox_norm(inner_text), False
+        coord_span = self._char_span_to_tokens(valid, inner_start, inner_end)
+        return full_span, coord_span, box, False
 
     def _locate_box_masks(
         self,
