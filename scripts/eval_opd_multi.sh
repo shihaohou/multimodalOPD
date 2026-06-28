@@ -9,6 +9,8 @@ set -euo pipefail
 #                    mmmu-pro-vision mmstar hallusionbench
 #   deterministic -> scripts/eval_vqa.sh   (official metric, NO judge, lmms-lab/* src)
 #                    pope (F1), chartqa (relaxed acc), vqav2 (soft acc)
+#   V*Bench       -> scripts/eval_vstar.sh (official MCQ acc, NO judge, $D/VStarBench)
+#                    vstar (overall + per-category accuracy)
 # The judged datasets live under DSROOT/<name>; the deterministic three are matched
 # by name (case-insensitive) and routed to eval_vqa.sh with their own repos
 # (POPE_REPO/CHARTQA_REPO/VQAV2_REPO — set these to local snapshot dirs on an offline
@@ -116,12 +118,13 @@ case "$(printf '%s' "${DET_SPLIT:-1}" | tr '[:upper:]' '[:lower:]')" in
 esac
 
 # Default benchmark set (override DATASETS to run a subset). Judged group + the three
-# deterministic benchmarks (matched by name and routed to eval_vqa.sh). V*Bench is
-# deterministic too but OFF by default (it needs the vstar_bench snapshot / VSTAR_REPO);
-# opt in with  DATASETS="$JUDGED_DEFAULT $DET_DEFAULT vstar"  -> routed to eval_vstar.sh.
+# deterministic benchmarks (routed to eval_vqa.sh) + V*Bench (routed to eval_vstar.sh).
+# V*Bench needs the VStarBench snapshot ($D/VStarBench, or VSTAR_REPO); if that dir is
+# absent the vstar job is skipped with a message, so it's safe to keep in the default.
 JUDGED_DEFAULT="mathvista mathverse mathvision MMMU mmmu_pro_10options mmmu-pro-vision mmstar hallusionbench"
 DET_DEFAULT="pope chartqa vqav2"
-DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT}"
+VSTAR_DEFAULT="vstar"
+DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT $VSTAR_DEFAULT}"
 
 # Shared-disk layout (identical on every machine -> sane defaults so the common
 # command needs only MODELS/OUTPUT_ROOT/PHASE). Override any of these via env on a box
