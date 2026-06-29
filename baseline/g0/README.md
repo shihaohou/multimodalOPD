@@ -96,6 +96,22 @@ graded cleanly).
 4. **Teacher-vs-student gap** (C1 vs C3) — is the gap mainly localization
    (`IoU_LH`) or attribution (`vt_ratio`)? Tells us what OPD must transfer.
 
+## Comparing teachers / runs
+
+G0 is one-teacher-per-run, so to compare teachers (e.g. Qwen3-VL-8B vs
+CapCurriculum-8B) put their run dirs side by side:
+
+```bash
+uv run python -m baseline.g0.compare_g0 \
+    --run-dirs eval_outputs/g0/Qwen3-VL-8B-Instruct eval_outputs/g0/CapCurriculum-8B \
+    --output eval_outputs/g0/compare.md
+```
+
+It tabulates the teacher block (head usability + C1 acc/IoU/pointing + the
+C1-vs-C2 hint Δacc/ΔIoU_LH/verdict) per run, plus the student (C3) block — the
+same 2B model in every run, so it's also a consistency check (works on partial
+runs; just shows fewer n).
+
 ## Visualizing cases (stratified, criterion-based)
 
 The inline viz (`VIZ_PER_SUBSET`, default 2) saves the first N samples **per
