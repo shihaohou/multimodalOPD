@@ -109,6 +109,11 @@ def analysis_1_head_usability(run_dir, conds) -> dict:
             continue
         iou_lh = _vals(recs, "iou_lh") if recs else np.array([])
         best_single = _vals(recs, "best_single_iou") if recs else np.array([])
+        # pointing (argmax-in-box) / energy (mass-in-box) are more forgiving than
+        # IoU for small GT boxes on a coarse grid: high pointing + low IoU = "points
+        # roughly right but diffuse"; ~chance pointing = genuinely mislocalized.
+        pointing = _vals(recs, "lh_pointing") if recs else np.array([])
+        energy = _vals(recs, "lh_energy") if recs else np.array([])
         entry = {
             "condition": cond,
             "best_head_mean_iou": stats["best_mean_iou"] if stats else None,
@@ -116,6 +121,8 @@ def analysis_1_head_usability(run_dir, conds) -> dict:
             "selected_head_layers": sorted({h[0] for h in stats["selected_heads"]}) if stats else None,
             "assembled_iou_lh_mean": float(iou_lh.mean()) if iou_lh.size else None,
             "best_single_iou_mean": float(best_single.mean()) if best_single.size else None,
+            "assembled_pointing_mean": float(pointing.mean()) if pointing.size else None,
+            "assembled_energy_mean": float(energy.mean()) if energy.size else None,
             "n": len(recs),
         }
         # Heuristic verdict (numbers are what matter; this is a quick label).
@@ -218,15 +225,25 @@ def analysis_3_hint_mechanism(records_c1, records_c2) -> dict:
         "mean_iou_lh_c1": float(iou1.mean()) if iou1.size else float("nan"),
         "mean_iou_lh_c2": float(iou2.mean()) if iou2.size else float("nan"),
     }
-    # attentional if the hint moves attention toward GT AND helps the answer.
+    # attentional if the hint moves attention toward GT AND meaningfully helps the
+    # answer. d_acc must clear a noise floor (a +0.0004 delta is NOT "helps").
     moves_attn = (not np.isnan(d_iou)) and d_iou >= 0.05
-    helps = d_acc > 0.0
+    helps = d_acc >= 0.01
     if moves_attn and helps:
         res["verdict"] = "attentional: hint pulls attention toward GT and helps → 'attend like C2' is a real target"
     elif helps and not moves_attn:
         res["verdict"] = "non-attentional: answer improves with ~unchanged attention → hint acts at the output level"
+    elif moves_attn and not helps:
+        res["verdict"] = ("attention moved toward GT but accuracy flat → looking wasn't the bottleneck "
+                          "(consistent with using-failure)")
     else:
-        res["verdict"] = "weak/none: hint did not clearly help here (check coverage / sample count)"
+        res["verdict"] = ("no effect: hint moved neither attention nor accuracy (Δacc≈0) → where-to-look "
+                          "is not the lever on this dataset")
+    # Δvt_ratio is confounded: the hint adds TEXT tokens to the prompt, which
+    # mechanically lowers visual/(visual+textual). vt is only clean WITHIN a model
+    # (correct vs wrong, analysis 2), not across C1 vs C2.
+    res["note"] = ("Δvt_ratio is confounded by the hint adding prompt text tokens; do not read it as a "
+                   "real attribution shift. Δaccuracy and ΔIoU_LH are the clean signals here.")
     return res
 
 
@@ -248,6 +265,11 @@ def analysis_4_gap(records_c1, records_c3) -> dict:
     loc = abs(res["gap_iou_lh"]) / max(1e-6, abs(res["teacher_mean_iou_lh"]))
     attr = abs(res["gap_vt"]) / max(1e-6, abs(res["teacher_mean_vt"]))
     res["dominant_gap"] = "localization (IoU_LH)" if loc > attr else "attribution (vt_ratio)"
+    # Cross-model vt is confounded by CoT length (a more verbose teacher puts more
+    # mass on its own generated tokens → lower visual/(visual+textual)). Don't read
+    # student>teacher vt as the student being "more grounded".
+    res["note"] = ("Cross-model vt_ratio is confounded by CoT length / verbosity; the clean vt signal is "
+                   "WITHIN-model (correct vs wrong) in analysis 2, not this teacher-vs-student gap.")
     return res
 
 
@@ -320,8 +342,11 @@ def write_report(run_dir, analysis) -> None:
             continue
         L.append(f"- **{tag}** ({e['condition']}): assembled IoU_LH={_fmt(e['assembled_iou_lh_mean'])}, "
                  f"best single-head IoU={_fmt(e['best_single_iou_mean'])}, best per-head mean IoU="
-                 f"{_fmt(e['best_head_mean_iou'])}, heads={e['selected_heads']} (layers {e['selected_head_layers']}) "
-                 f"→ **{e['verdict']}**")
+                 f"{_fmt(e['best_head_mean_iou'])}, pointing={_fmt(e.get('assembled_pointing_mean'))}, "
+                 f"energy={_fmt(e.get('assembled_energy_mean'))}, heads={e['selected_heads']} "
+                 f"(layers {e['selected_head_layers']}) → **{e['verdict']}**")
+    L.append("_pointing = argmax-patch-in-GT (chance ≈ GT-area fraction, small here); high pointing + low "
+             "IoU = points right but diffuse; ~chance pointing = mislocalized._")
     L.append("")
 
     if a2:
@@ -351,6 +376,8 @@ def write_report(run_dir, analysis) -> None:
         L.append(f"- ΔIoU_LH={_fmt(a3.get('delta_iou_lh'))}, ΔIoU_GL={_fmt(a3.get('delta_iou_gl'))}, "
                  f"Δvt_ratio={_fmt(a3.get('delta_vt_ratio'))}")
         L.append(f"- **verdict: {a3.get('verdict')}**")
+        if a3.get("note"):
+            L.append(f"- _note: {a3['note']}_")
         L.append("")
 
     if a4:
@@ -361,6 +388,8 @@ def write_report(run_dir, analysis) -> None:
                  f"(gap={_fmt(a4['gap_vt'])})")
         L.append(f"- accuracy: teacher={_fmt(a4['teacher_acc'])} vs student={_fmt(a4['student_acc'])}")
         L.append(f"- **dominant gap: {a4['dominant_gap']}**")
+        if a4.get("note"):
+            L.append(f"- _note: {a4['note']}_")
         L.append("")
 
     L.append("## Decision (G0 manual §7)")
