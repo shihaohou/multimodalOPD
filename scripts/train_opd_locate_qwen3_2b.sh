@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Locate-Once Grounding (LOG): the verified hidden-hint OPD spine + an explicit,
-# student-generated evidence box trained by RL. The student rolls out from a
-# *locate-once* prompt (opens <think> with one <box>[x1,y1,x2,y2]</box>, no crop),
-# the frozen teacher is scored on the *hidden-hint* prompt (silently handed the GT
-# box), the OPD reverse-KL covers the answer/reasoning span with the box span masked,
-# and GRPO reinforces the box coords with an IoU reward gated by answer correctness.
-# Question (G2): does the explicit box beat the box-free hidden-hint spine on V*Bench?
+# Locate-Once Grounding (LOG): OPD distillation + an explicit, student-generated
+# evidence box trained by RL. The student rolls out from a *locate-once* prompt (opens
+# <think> with one <box>[x1,y1,x2,y2]</box>, no crop). The frozen teacher shares that
+# SAME structured prompt (LOCATE_TEACHER_MODE=shared, default) so student and teacher
+# stay in one distribution — a plain/box-forbidding teacher makes reverse-KL erase the
+# <box> (box_present -> 0 ~step 35). OPD reverse-KL covers answer/reasoning with the box
+# span (and its decision token) masked; GRPO reinforces the box coords with an IoU reward
+# gated by answer correctness. Question (G2): does the explicit box beat the spine on V*Bench?
 #
 # Required:
 #   TEACHER_MODEL  Path/id of the frozen, stronger, SAME-FAMILY VLM teacher.
@@ -78,8 +79,15 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-16384}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
 ANSWER_FIELD="${ANSWER_FIELD:-solution}"
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
-# Teacher (hidden-hint) base system-prompt style; the student always uses the
-# locate-once prompt. think | freecot | reason | none.
+# OPD teacher channel (FIX for the box-death collapse). The student emits a <box>, so the
+# teacher must share that distribution or reverse-KL kills the format:
+#   shared (default) = teacher uses the SAME structured locate prompt, no coordinate hint;
+#   crop             = structured teacher + image cropped to the GT box (privilege, no digits);
+#   plain_hint       = OLD plain-think + no-verbalize hint (reproduces the collapse — ablation only).
+LOCATE_TEACHER_MODE="${LOCATE_TEACHER_MODE:-shared}"
+# Also drop the box-emission decision token (before "<box>") from OPD so RL/SFT own localization.
+MASK_BOX_TRANSITION="${MASK_BOX_TRANSITION:-true}"
+# Teacher base system-prompt style — only used by LOCATE_TEACHER_MODE=plain_hint. think | freecot | reason | none.
 OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
 # --- Grounding / box knobs ---------------------------------------------------
 BBOX_FIELD="${BBOX_FIELD:-bbox}"
@@ -175,7 +183,8 @@ uv run accelerate launch \
   --filter_tiny_images "$FILTER_TINY_IMAGES" \
   --min_image_size "$MIN_IMAGE_SIZE" \
   --answer_field "$ANSWER_FIELD" \
-  --teacher_privilege_mode hint \
+  --locate_teacher_mode "$LOCATE_TEACHER_MODE" \
+  --mask_box_transition "$MASK_BOX_TRANSITION" \
   --bbox_field "$BBOX_FIELD" \
   --filter_no_bbox "$FILTER_NO_BBOX" \
   --hint_coord_decimals "$HINT_COORD_DECIMALS" \

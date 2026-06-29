@@ -91,11 +91,25 @@ class OPDLocateScriptArguments(OPDHintScriptArguments):
     kl_position_gate: bool = False
     # Student locate-once system prompt (must contain "<box>"). Override for ablations.
     locate_system_prompt: str = LOCATE_SYSTEM_PROMPT
-    # OPD teacher hint = inherited no-verbalize HINT_TEMPLATE. We do NOT let the teacher state
-    # the box: CapCurriculum verbalizes coordinates in its reasoning, and reverse-KL then
-    # forces the student to reproduce unknowable coords in the (unmasked) reasoning span ->
-    # token-salad collapse (de5e4c5). Cold-start already taught the student to emit boxes, and
-    # its <box> span is masked from OPD, so the teacher needn't (and must not) verbalize it.
+    # OPD teacher channel. The student is SFT'd to ALWAYS open its <think> with a <box>, so the
+    # teacher MUST live in the same DISTRIBUTION (Rethinking-OPD) or reverse-KL fights the format:
+    #   "shared" (default) — teacher uses the SAME structured locate prompt as the student and
+    #               gets NO coordinate hint. It then also wants a <box> at the head (reverse-KL
+    #               no longer suppresses it) and carries no coordinate digits (nothing primes a
+    #               token-salad). The stronger model is the only privilege; spatial privilege off.
+    #   "crop"    — privilege-preserving: structured locate prompt + the image CROPPED to the GT
+    #               box (zoom), no coordinate text. Keeps the GHD "teacher sees the evidence" spine
+    #               without digits. (Needs GPU validation of the crop+box-frame path.)
+    #   "plain_hint" — OLD behaviour (plain think prompt + no-verbalize coordinate hint). Kept ONLY
+    #               to reproduce the collapse: the hint orders "do NOT mention the box", so the
+    #               teacher puts ~0 prob on the student's <box> and reverse-KL drives box_present
+    #               -> 0 (observed ~step 35). Do not use for real runs.
+    locate_teacher_mode: str = "shared"
+    # Also drop the box-emission DECISION token (the position right before "<box>", whose
+    # next-token target is "<box>") from the OPD loss, not just the <box>...</box> span. Completes
+    # the span decoupling — whether/when to localize and the coordinates belong to RL+SFT; OPD only
+    # shapes describe/reason/answer — so a teacher lukewarm about boxes can't erode box_present.
+    mask_box_transition: bool = True
 
 
 def main() -> None:
@@ -114,10 +128,11 @@ def main() -> None:
         )
     if not script_args.teacher_model_name_or_path:
         raise ValueError("--teacher_model_name_or_path is required for local_hf.")
-    if script_args.teacher_privilege_mode != "hint":
+    if script_args.locate_teacher_mode not in {"shared", "crop", "plain_hint"}:
         raise ValueError(
-            "Locate-Once Grounding uses the HIDDEN-HINT teacher "
-            "(--teacher_privilege_mode hint); 'crop' is not part of this fork."
+            f"Unknown --locate_teacher_mode {script_args.locate_teacher_mode!r}; "
+            "use 'shared' (default, structured teacher + no hint), 'crop' "
+            "(structured teacher + cropped evidence), or 'plain_hint' (collapse ablation)."
         )
     if "<box>" not in script_args.locate_system_prompt:
         raise ValueError(
@@ -144,10 +159,22 @@ def main() -> None:
             os.path.basename(os.path.normpath(training_args.output_dir)) or "opd_locate"
         )
 
-    # OPD teacher = the hidden-hint GHD teacher (plain think + no-verbalize hint): grounded
-    # (it silently sees the GT box) but MUST NOT verbalize the box, or it collapses (see the
-    # hint_template note above). The student's <box> span is masked from OPD regardless.
-    teacher_system_prompt = resolve_opd_system_prompt(script_args.opd_system_prompt)
+    # Resolve the OPD teacher channel (see --locate_teacher_mode). The student emits a <box>;
+    # the teacher must not fight that, so by default it shares the student's structured prompt
+    # with NO coordinate hint (same distribution, no digits). The student's <box> span (and, by
+    # default, the box-emission decision token) is masked from OPD regardless.
+    if script_args.locate_teacher_mode == "shared":
+        teacher_system_prompt = script_args.locate_system_prompt
+        teacher_hint_template = ""  # empty hint => non-privileged plain prompt, no coord digits
+        teacher_privilege_mode = "hint"
+    elif script_args.locate_teacher_mode == "crop":
+        teacher_system_prompt = script_args.locate_system_prompt
+        teacher_hint_template = ""  # the crop carries the privilege; no coordinate text
+        teacher_privilege_mode = "crop"
+    else:  # "plain_hint" — ablation that reproduces the box-death collapse
+        teacher_system_prompt = resolve_opd_system_prompt(script_args.opd_system_prompt)
+        teacher_hint_template = script_args.hint_template
+        teacher_privilege_mode = "hint"
     if os.environ.get("LOCAL_RANK", "0") == "0":
         print("\n" + "=" * 80)
         print("LOCATE-ONCE GROUNDING (LOG) RUN CONFIGURATION")
@@ -159,8 +186,10 @@ def main() -> None:
         print(f"Answer/reference field: {script_args.answer_field}")
         print(f"Bbox field: {script_args.bbox_field}  filter_no_bbox={script_args.filter_no_bbox}")
         print(f"Student (locate-once) prompt: {script_args.locate_system_prompt!r}")
-        print(f"Teacher (hidden-hint, no-verbalize) prompt: {teacher_system_prompt!r}")
-        print(f"Hint template: {script_args.hint_template!r}")
+        print(f"Teacher mode: {script_args.locate_teacher_mode}  (privilege={teacher_privilege_mode})")
+        print(f"Teacher prompt: {teacher_system_prompt!r}")
+        print(f"Teacher hint template: {teacher_hint_template!r}")
+        print(f"Mask box-emission decision token from OPD: {script_args.mask_box_transition}")
         print(
             "Distillation (OPD): "
             f"loss_mode={script_args.opd_loss_mode}, kl_direction={script_args.opd_kl_direction}, "
@@ -303,13 +332,13 @@ def main() -> None:
         max_prompt_length=script_args.max_prompt_length,
         answer_field=script_args.answer_field,
         opd_prompt_suffix=script_args.opd_prompt_suffix,
-        # Student gets the locate-once prompt; the teacher keeps the plain think prompt
-        # (+ the silent hint), decoupled via teacher_system_prompt.
+        # Student gets the structured locate prompt; the teacher channel is set by
+        # --locate_teacher_mode (shared structured prompt + no hint by default).
         system_prompt=script_args.locate_system_prompt,
         teacher_system_prompt=teacher_system_prompt,
-        teacher_privilege_mode="hint",
+        teacher_privilege_mode=teacher_privilege_mode,
         bbox_field=script_args.bbox_field,
-        hint_template=script_args.hint_template,
+        hint_template=teacher_hint_template,
         hint_coord_decimals=script_args.hint_coord_decimals,
         group_size=script_args.group_size,
     )
@@ -332,6 +361,7 @@ def main() -> None:
         rl_normalize_adv=script_args.rl_normalize_adv,
         rl_adv_eps=script_args.rl_adv_eps,
         group_size=script_args.group_size,
+        mask_box_transition=script_args.mask_box_transition,
         kl_position_gate=script_args.kl_position_gate,
         opd_loss_mode=script_args.opd_loss_mode,
         opd_kl_direction=script_args.opd_kl_direction,

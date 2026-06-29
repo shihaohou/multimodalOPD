@@ -62,6 +62,7 @@ class OPDLocateTrainer(OPDHintTrainer):
         rl_normalize_adv: bool = True,
         rl_adv_eps: float = 1e-6,
         group_size: int = 8,
+        mask_box_transition: bool = True,
         kl_position_gate: bool = False,
         **kwargs: Any,
     ) -> None:
@@ -82,6 +83,9 @@ class OPDLocateTrainer(OPDHintTrainer):
         self.rl_normalize_adv = bool(rl_normalize_adv)
         self.rl_adv_eps = float(rl_adv_eps)
         self.group_size = int(group_size)
+        # Mask the box-emission DECISION token (position before "<box>") from OPD too, so the
+        # whole "localize" act (decision + coords) is owned by RL/SFT and OPD never penalizes it.
+        self.mask_box_transition = bool(mask_box_transition)
         # Deferred (off by default, per plan): apply the OPD KL only where the teacher
         # assigns the sampled token higher logprob than the student — the
         # evidence-dependent tokens. Available for ablation once the spine shows signal.
@@ -182,7 +186,12 @@ class OPDLocateTrainer(OPDHintTrainer):
                 completion_ids[row_idx], valid_length
             )
             if full_span is not None:
-                box_full_mask[row_idx, full_span[0] : full_span[1]] = True
+                start = full_span[0]
+                # Also drop the token whose next-token target is "<box>" (the decision to
+                # localize): a teacher cold to boxes would otherwise erode box_present -> 0.
+                if self.mask_box_transition and start > 0:
+                    start -= 1
+                box_full_mask[row_idx, start : full_span[1]] = True
                 box_present[row_idx] = True
             if coord_span is not None and coord_span[1] > coord_span[0]:
                 box_coord_mask[row_idx, coord_span[0] : coord_span[1]] = True
