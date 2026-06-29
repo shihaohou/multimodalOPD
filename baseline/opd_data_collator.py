@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from PIL import Image
+from PIL import Image, ImageFile, PngImagePlugin
 
 from vigos.answer_utils import normalize_reference_answer
 from vigos.data_collator import (
@@ -22,6 +22,14 @@ from vigos.data_collator import (
     _format_reasoning_reference,
     _message_with_optional_image,
 )
+
+# Robustness for arbitrary source images: some PNGs carry an oversized iCCP/text chunk that
+# trips PIL's anti-DoS guard ("Decompressed data too large for PngImagePlugin.MAX_TEXT_CHUNK")
+# and crashes the DataLoader mid-training. Raise the cap and tolerate truncated images so one
+# pathological image can't kill a multi-GPU run. Set at import so DataLoader workers (fork or
+# spawn) inherit it; this module is imported by every OPD collator/entry and the cold-start build.
+PngImagePlugin.MAX_TEXT_CHUNK = max(getattr(PngImagePlugin, "MAX_TEXT_CHUNK", 0) or 0, 256 * 1024 * 1024)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 # Qwen2.5-VL / Qwen3-VL share the SAME HF image processor, which *infers* the
 # channel axis from the raw array shape (before any resize) and which aborts on
