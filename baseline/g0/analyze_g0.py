@@ -161,7 +161,10 @@ def analysis_2_looking_vs_using(records_c3, *, iou_threshold=None, abs_iou_thres
     iou = _vals(records_c3, iou_key, drop_nan=False)
     correct = np.array([float(r["correct"]) for r in records_c3])
     vt = np.array([r["vt_ratio"] for r in records_c3], dtype=np.float64)
-    pointing = np.array([float(r.get("lh_pointing", 0.0)) for r in records_c3])
+    # Match the pointing key to the IoU variant (answer-span analysis must use the
+    # answer-span pointing, not the first-gen-step one).
+    pointing_key = "lh_answer_pointing" if iou_key == "iou_lh_answer" else "lh_pointing"
+    pointing = np.array([float(r.get(pointing_key, 0.0)) for r in records_c3])
     right = correct >= 0.5
     n_wrong = int(np.sum(~right))
 
