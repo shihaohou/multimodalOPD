@@ -62,7 +62,7 @@ _DEFAULT_HINT = (
 # EXCEPT the per-worker model / gpu / output, so both workers run identically).
 _CONFIG_KEYS = (
     "dataset", "split", "subsets", "limit", "max_bbox_area", "schemes", "coord_mode",
-    "bbox_hint", "draw_color", "draw_width", "system_prompt", "prompt_suffix",
+    "bbox_hint", "noverbalize_hint", "draw_color", "draw_width", "system_prompt", "prompt_suffix",
     "max_new_tokens", "do_sample", "temperature", "top_p", "top_k", "seed",
     "dtype", "gpu_mem_util", "limit_images", "grader", "batch_size", "max_image_side",
 )
@@ -98,7 +98,10 @@ def parse_args() -> argparse.Namespace:
                         "noverbalize = OPD silent hint.)")
     p.add_argument("--coord-mode", default="normalized", choices=["normalized", "pixel"],
                    help="How the bbox coords are written into the hint.")
-    p.add_argument("--bbox-hint", default=_DEFAULT_HINT, help="Hint template; needs {coords} (+ optional {note}).")
+    p.add_argument("--bbox-hint", default=_DEFAULT_HINT, help="'bbox' scheme template; needs {coords} (+ optional {note}).")
+    p.add_argument("--noverbalize-hint", default=None,
+                   help="'noverbalize' scheme template; needs {bbox}. Default = baseline.hint HINT_TEMPLATE "
+                        "(the strict 'do NOT mention the box/coords/hint/crop'). Pass a softer one to A/B it.")
     p.add_argument("--draw-color", default="red")
     p.add_argument("--draw-width", type=int, default=4)
     # prompt / generation
@@ -200,10 +203,12 @@ def build_scheme_item(problem: str, bbox_norm, image, scheme: str, args):
         coords, note = format_coords(bbox_norm, image.size, args.coord_mode)
         return f"{problem}\n{args.bbox_hint.format(coords=coords, note=note)}", image
     if scheme == "noverbalize":
-        # Exact OPD C2 hint (always normalized [0,1], 2 decimals) — the no-verbalize template.
+        # OPD no-verbalize hint (always normalized [0,1], 2 decimals). --noverbalize-hint
+        # overrides the default strict template (e.g. a softer "do NOT mention the box").
         from baseline.hint.opd_hint_collator import HINT_TEMPLATE, format_bbox_hint
 
-        return f"{problem}\n{format_bbox_hint(bbox_norm, HINT_TEMPLATE, decimals=2)}", image
+        tpl = getattr(args, "noverbalize_hint", None) or HINT_TEMPLATE
+        return f"{problem}\n{format_bbox_hint(bbox_norm, tpl, decimals=2)}", image
     if scheme == "draw":
         img = image.convert("RGB").copy()
         w, h = img.size
