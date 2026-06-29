@@ -72,6 +72,29 @@ def head_visual_maps(
     return torch.stack(layers, 0).numpy()  # [L, H, H_grid, W_grid]
 
 
+def head_visual_maps_avg(
+    out_attentions,
+    rows: torch.Tensor,
+    visual_positions: torch.Tensor,
+    grid_hw: tuple[int, int],
+) -> np.ndarray:
+    """Per-head image maps AVERAGED over a set of query rows: ``[L, H, H_grid, W_grid]``.
+
+    Used for the answer-span LH (``rows`` = predictor rows of the last-k generated /
+    answer tokens), as opposed to the single first-gen-step row. Averaging over the
+    answer span asks "where does the model attend WHILE producing the answer" rather
+    than "at the first token", which can be a generic ``<think>`` / format token.
+    """
+    h_grid, w_grid = grid_hw
+    layers = []
+    for a in out_attentions:
+        sub = a[0, :, rows.to(a.device), :]  # [H, len(rows), S]
+        row = sub.mean(dim=1)  # [H, S]
+        vis = row.index_select(1, visual_positions.to(row.device))  # [H, P]
+        layers.append(vis.reshape(vis.shape[0], h_grid, w_grid).float().detach().cpu())
+    return torch.stack(layers, 0).numpy()
+
+
 def per_head_scores(
     maps: np.ndarray, bbox: BoxNorm, *, smooth_sigma: float = 0.0
 ) -> tuple[np.ndarray, np.ndarray]:

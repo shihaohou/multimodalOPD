@@ -76,9 +76,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min-layer", type=int, default=2, help="Ignore layers < this when selecting heads.")
     p.add_argument("--lh-sigma", type=float, default=1.0, help="Gaussian sigma for LH assembly.")
     # GLIMPSE
-    p.add_argument("--glimpse-layers", default=None, help="Comma layer list (default all).")
+    p.add_argument("--glimpse-layers", default="last8",
+                   help="'all' | 'lastN' (e.g. last8) | comma list. Default last8 (memory/speed; "
+                        "first-round diagnosis doesn't need full all-layer attribution).")
     p.add_argument("--glimpse-lambda", type=float, default=1.0, help="Head-weight temperature (Eq.6).")
     p.add_argument("--glimpse-lambda-depth", type=float, default=0.1, help="Layer depth prior (Eq.10).")
+    p.add_argument("--answer-tokens", type=int, default=16,
+                   help="Last-K generated tokens treated as the answer span (LH + GLIMPSE answer-span variants).")
     p.add_argument("--threshold", default="mean", choices=["mean", "top_frac"])
     # viz (inline = stratified: first N per subset; criterion-based viz = baseline.g0.viz_g0)
     p.add_argument("--viz-per-subset", type=int, default=2,
@@ -86,6 +90,20 @@ def parse_args() -> argparse.Namespace:
                         "For failure-case selection (worst IoU, using-failure smoking guns, low vt) "
                         "use `python -m baseline.g0.viz_g0` after the run.")
     return p.parse_args()
+
+
+def resolve_glimpse_layers(spec, num_layers: int):
+    """'all'/'' → None (all layers); 'lastN' → last N; 'a,b,c' → explicit. Per-model
+    (teacher/student differ in depth), so resolve against each model's num_layers."""
+    if spec is None:
+        return None
+    s = str(spec).strip().lower()
+    if not s or s == "all":
+        return None
+    if s.startswith("last"):
+        n = int(s[4:])
+        return tuple(range(max(0, num_layers - n), num_layers))
+    return tuple(int(x) for x in s.split(",") if x.strip())
 
 
 def _records_path(out_dir: str, num_shards: int = 1, shard_index: int = 0) -> str:
@@ -159,7 +177,7 @@ def save_viz(out_dir, image, bbox, lh_res, gl_res, tag: str, *, subdir="viz", su
     plt.close(fig)
 
 
-def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers, want_viz):
+def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers_spec, want_viz):
     """One (sample, condition) → record dict (+ optional viz handles)."""
     bbox = sample.bbox_norm
     inputs = build_inputs(gm, sample.image, sample.problem, hint_bbox=bbox if hint else None)
@@ -169,19 +187,28 @@ def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers, wan
         temperature=args.temperature, top_p=args.top_p,
         seed=(args.seed + int(sample.sample_id) if str(sample.sample_id).isdigit() else args.seed),
     )
-    full_ids = torch.cat([inputs["input_ids"][0], completion_ids.to(inputs["input_ids"].device)])
+    device = inputs["input_ids"].device
+    full_ids = torch.cat([inputs["input_ids"][0], completion_ids.to(device)])
+    comp_len = int(completion_ids.numel())
     correct = is_correct(text, sample.solution)
+    layers = resolve_glimpse_layers(glimpse_layers_spec, gm.num_layers)
 
     out = grad_attention_forward(gm, inputs, full_ids)
     gl_res = glimpse_mod.glimpse_probe(
         gm, inputs, full_ids, prompt_len, completion_ids, bbox,
-        layers=glimpse_layers, lam=args.glimpse_lambda, lambda_depth=args.glimpse_lambda_depth,
-        threshold=args.threshold, keep_map=want_viz, out=out,
+        layers=layers, answer_k=args.answer_tokens, lam=args.glimpse_lambda,
+        lambda_depth=args.glimpse_lambda_depth, threshold=args.threshold, keep_map=want_viz, out=out,
     )
     visual_positions, grid_hw = visual_grid(gm, full_ids, inputs["image_grid_thw"])
+    # first-gen-step LH (paper-aligned positive control)
     maps = lh_mod.head_visual_maps(out.attentions, prompt_len - 1, visual_positions, grid_hw)
     lh_res = lh_mod.localize_from_maps(maps, bbox, selected_heads, sigma=args.lh_sigma, keep_map=want_viz)
-    del out, maps
+    # answer-span LH: predictor rows of the last-K generated tokens (where the answer is)
+    k = max(1, min(args.answer_tokens, comp_len))
+    ans_rows = torch.arange(prompt_len + comp_len - 1 - k, prompt_len + comp_len - 1, device=device).clamp_min(prompt_len - 1)
+    ans_maps = lh_mod.head_visual_maps_avg(out.attentions, ans_rows, visual_positions, grid_hw)
+    lh_ans = lh_mod.localize_from_maps(ans_maps, bbox, selected_heads, sigma=args.lh_sigma)
+    del out, maps, ans_maps
 
     record = {
         "sample_id": str(sample.sample_id),
@@ -191,19 +218,25 @@ def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers, wan
         "bbox_area": float(bbox_area(bbox)),
         "grid_hw": list(grid_hw),
         "prompt_len": prompt_len,
-        "completion_len": int(completion_ids.numel()),
-        # looking
+        "completion_len": comp_len,
+        # looking — first gen step (control) + answer span (primary for the verdict)
         "iou_lh": lh_res.iou_lh,
         "lh_bbox_iou": lh_res.bbox_iou,
         "lh_pointing": lh_res.pointing,
         "lh_energy": lh_res.energy,
         "best_single_iou": lh_res.best_single_iou,
-        # using
+        "iou_lh_answer": lh_ans.iou_lh,
+        "lh_answer_pointing": lh_ans.pointing,
+        "lh_answer_energy": lh_ans.energy,
+        "best_single_iou_answer": lh_ans.best_single_iou,
+        # using — full response + answer span
         "iou_gl": gl_res.iou_gl,
         "gl_bbox_iou": gl_res.bbox_iou,
         "gl_pointing": gl_res.pointing,
         "gl_energy": gl_res.energy,
+        "iou_gl_answer": gl_res.iou_gl_answer,
         "vt_ratio": gl_res.vt_ratio,
+        "vt_ratio_answer": gl_res.vt_ratio_answer,
         "visual_mass": gl_res.visual_mass,
         "textual_mass": gl_res.textual_mass,
         "self_mass": gl_res.self_mass,
@@ -217,10 +250,7 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     conditions = [c.strip().lower() for c in args.conditions.split(",") if c.strip()]
     subsets = [s for s in args.subsets.split(",") if s.strip()] or None
-    glimpse_layers = (
-        tuple(int(x) for x in args.glimpse_layers.split(",") if x.strip())
-        if args.glimpse_layers else None
-    )
+    glimpse_layers_spec = args.glimpse_layers  # resolved per-model in run_condition
 
     is_main = args.shard_index == 0
     if is_main:  # one writer for the shared config (avoids concurrent-write races)
@@ -241,8 +271,13 @@ def main() -> None:
         max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area,
         num_shards=args.num_shards, shard_index=args.shard_index,
     )
-    print(f"[g0] shard {args.shard_index}/{args.num_shards}: {len(samples)} eval samples, "
-          f"{len(calib_samples)} calibration samples")
+    # DISJOINT split: drop eval samples that are in the calibration set, so the
+    # selected heads are evaluated on HELD-OUT samples (analysis 1 not optimistic).
+    calib_keys = {(s.subset, s.sample_id) for s in calib_samples}
+    before = len(samples)
+    samples = [s for s in samples if (s.subset, s.sample_id) not in calib_keys]
+    print(f"[g0] shard {args.shard_index}/{args.num_shards}: {len(samples)} eval samples "
+          f"(dropped {before - len(samples)} overlapping calibration), {len(calib_samples)} calib samples")
 
     # ----- load models -----
     pix = dict(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
@@ -285,7 +320,7 @@ def main() -> None:
                 try:
                     record, (lh_res, gl_res) = run_condition(
                         gm, sample, hint=hint, selected_heads=heads, args=args,
-                        glimpse_layers=glimpse_layers, want_viz=want_viz,
+                        glimpse_layers_spec=glimpse_layers_spec, want_viz=want_viz,
                     )
                 except Exception as exc:
                     n_skip += 1

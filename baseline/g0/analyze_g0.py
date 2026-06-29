@@ -133,57 +133,81 @@ def analysis_1_head_usability(run_dir, conds) -> dict:
 
 
 # ------------------------------------------ analysis 2: student looking-vs-using
-def analysis_2_looking_vs_using(records_c3: list[dict], *, iou_threshold: Optional[float]) -> dict:
+def _two_by_two(looked_right: np.ndarray, right: np.ndarray) -> dict:
+    cell = lambda lr, c: int(np.sum((looked_right == lr) & (right == c)))
+    return {
+        "high_iou_correct": cell(True, True),
+        "high_iou_wrong": cell(True, False),   # ⚠ looked right but wrong (using-failure flavor)
+        "low_iou_correct": cell(False, True),  # guessed right
+        "low_iou_wrong": cell(False, False),
+    }
+
+
+def analysis_2_looking_vs_using(records_c3, *, iou_threshold=None, abs_iou_threshold=0.30,
+                                iou_key="iou_lh") -> dict:
+    """Looking-vs-using on the student.
+
+    The verdict is **correlation-driven** (threshold-independent): does IoU_LH
+    predict correctness (looking-failure) or does vt_ratio predict it while IoU_LH
+    does not (using-failure)? We report THREE 2x2s for transparency — a relative
+    (median) split, an ABSOLUTE split (IoU >= abs_iou_threshold = genuinely
+    "looked right"), and a pointing split (argmax patch in GT box) — because a
+    median split mechanically calls half the samples "high IoU" even when all IoU
+    are low, which would inflate the using-failure cell. ``iou_key`` lets the
+    caller run this on the answer-span LH (``iou_lh_answer``) too.
+    """
     if not records_c3:
         return {}
-    iou = _vals(records_c3, "iou_lh", drop_nan=False)
+    iou = _vals(records_c3, iou_key, drop_nan=False)
     correct = np.array([float(r["correct"]) for r in records_c3])
     vt = np.array([r["vt_ratio"] for r in records_c3], dtype=np.float64)
-    thr = float(np.median(iou)) if iou_threshold is None else iou_threshold
-
-    high = iou >= thr
+    pointing = np.array([float(r.get("lh_pointing", 0.0)) for r in records_c3])
     right = correct >= 0.5
-    cell = lambda h, c: int(np.sum((high == h) & (right == c)))
-    table = {
-        "high_iou_correct": cell(True, True),
-        "high_iou_wrong": cell(True, False),   # ⚠ using-failure smoking gun
-        "low_iou_correct": cell(False, True),  # guessed right
-        "low_iou_wrong": cell(False, False),   # looking failure
-    }
     n_wrong = int(np.sum(~right))
-    n = len(records_c3)
+
+    med = float(np.median(iou))
+    rel_thr = med if iou_threshold is None else iou_threshold
+    tables = {
+        "relative_median": {"threshold": rel_thr, **_two_by_two(iou >= rel_thr, right)},
+        "absolute": {"threshold": abs_iou_threshold, **_two_by_two(iou >= abs_iou_threshold, right)},
+        "pointing": {"threshold": 1.0, **_two_by_two(pointing >= 0.5, right)},
+    }
     vt_right = vt[right & ~np.isnan(vt)]
     vt_wrong = vt[(~right) & ~np.isnan(vt)]
+    look_corr = safe_corr(iou, correct)
+    use_corr = safe_corr(vt[~np.isnan(vt)], correct[~np.isnan(vt)])
 
     res = {
-        "n": n,
-        "iou_threshold": thr,
+        "n": len(records_c3),
+        "iou_key": iou_key,
         "accuracy": float(right.mean()),
-        "table": table,
-        "high_iou_among_wrong_frac": (table["high_iou_wrong"] / n_wrong) if n_wrong else float("nan"),
+        "median_iou": med,
+        "looked_right_rate_abs": float(np.mean(iou >= abs_iou_threshold)),
+        "pointing_rate": float(np.mean(pointing >= 0.5)),
+        "tables": tables,
+        "high_iou_among_wrong_frac_abs": (tables["absolute"]["high_iou_wrong"] / n_wrong) if n_wrong else float("nan"),
         "mean_iou_lh_right": float(iou[right].mean()) if right.any() else float("nan"),
         "mean_iou_lh_wrong": float(iou[~right].mean()) if (~right).any() else float("nan"),
         "mean_vt_right": float(vt_right.mean()) if vt_right.size else float("nan"),
         "mean_vt_wrong": float(vt_wrong.mean()) if vt_wrong.size else float("nan"),
-        "corr_correct_iou_lh": safe_corr(iou, correct),
-        "corr_correct_vt": safe_corr(vt[~np.isnan(vt)], correct[~np.isnan(vt)]),
+        "corr_correct_iou_lh": look_corr,
+        "corr_correct_vt": use_corr,
         "mean_iou_gl": _mean(records_c3, "iou_gl"),
         "mean_vt_ratio": _mean(records_c3, "vt_ratio"),
     }
 
-    # Verdict. using-failure: wrong samples still localize (high IoU among wrong is
-    # large) AND are not image-driven (vt_wrong < vt_right). looking-failure: IoU
-    # predicts correctness (positive corr) and wrong samples have low IoU.
-    using_score = res["high_iou_among_wrong_frac"]
-    looking_signal = (res["corr_correct_iou_lh"] if not np.isnan(res["corr_correct_iou_lh"]) else 0.0)
-    vt_gap = (res["mean_vt_right"] - res["mean_vt_wrong"])
-    if not np.isnan(using_score) and using_score >= 0.5 and (np.isnan(vt_gap) or vt_gap >= 0):
-        verdict = "using-failure (dominant): looks right but answer ignores it → output-level leverage"
-    elif looking_signal >= 0.2:
-        verdict = "looking-failure (dominant): correctness tracks IoU_LH → fixing where-to-look has headroom"
+    # Correlation-driven verdict (does not depend on any IoU threshold).
+    lc = look_corr if not np.isnan(look_corr) else 0.0
+    uc = use_corr if not np.isnan(use_corr) else 0.0
+    if lc >= 0.15:
+        res["verdict"] = ("looking-failure (dominant): correctness rises with IoU_LH "
+                          f"(corr={lc:+.2f}) → fixing where-to-look has headroom")
+    elif uc >= 0.10 and lc <= 0.05:
+        res["verdict"] = ("using-failure (dominant): IoU_LH does NOT predict correctness "
+                          f"(corr={lc:+.2f}) but vt_ratio does (corr={uc:+.2f}) → output-level leverage")
     else:
-        verdict = "mixed / inconclusive — inspect the 2x2 and vt gap; consider more samples"
-    res["verdict"] = verdict
+        res["verdict"] = (f"mixed / inconclusive (corr(correct,IoU_LH)={lc:+.2f}, "
+                          f"corr(correct,vt)={uc:+.2f}) — inspect tables + answer-span variant")
     return res
 
 
@@ -191,8 +215,10 @@ def analysis_2_looking_vs_using(records_c3: list[dict], *, iou_threshold: Option
 def analysis_3_hint_mechanism(records_c1, records_c2) -> dict:
     if not records_c1 or not records_c2:
         return {}
-    by_id1 = {r["sample_id"]: r for r in records_c1}
-    by_id2 = {r["sample_id"]: r for r in records_c2}
+    # Pair on (subset, sample_id): question_id repeats across subsets in saliency-r1-8k,
+    # so keying on sample_id alone would mis-pair C1/C2 across subsets.
+    by_id1 = {(r["subset"], r["sample_id"]): r for r in records_c1}
+    by_id2 = {(r["subset"], r["sample_id"]): r for r in records_c2}
     common = sorted(set(by_id1) & set(by_id2))
     if not common:
         return {"n_paired": 0}
@@ -308,8 +334,8 @@ def make_figures(run_dir, conds, a1, a2) -> None:
         fig, ax = plt.subplots(figsize=(6, 5))
         ax.scatter(iou[m & correct], vt[m & correct], c="green", label="correct", alpha=0.6)
         ax.scatter(iou[m & ~correct], vt[m & ~correct], c="red", label="wrong", alpha=0.6)
-        if a2:
-            ax.axvline(a2["iou_threshold"], color="gray", ls="--", lw=1)
+        if a2 and a2.get("tables"):
+            ax.axvline(a2["tables"]["absolute"]["threshold"], color="gray", ls="--", lw=1)
         ax.set_xlabel("IoU_LH (looking)"); ax.set_ylabel("vt_ratio (using)")
         ax.set_title("C3 student: looking vs using"); ax.legend()
         fig.tight_layout(); fig.savefig(os.path.join(figs, "c3_looking_vs_using.png"), dpi=110); plt.close(fig)
@@ -350,22 +376,28 @@ def write_report(run_dir, analysis) -> None:
     L.append("")
 
     if a2:
-        L.append("## Analysis 2 — student looking-vs-using (KEY)")
-        t = a2["table"]
-        L.append(f"IoU_LH split @ {a2['iou_threshold']:.3f}; accuracy={a2['accuracy']:.3f}, n={a2['n']}")
+        L.append(f"## Analysis 2 — student looking-vs-using (KEY) [{a2.get('iou_key', 'iou_lh')}]")
+        L.append(f"n={a2['n']}, accuracy={_fmt(a2['accuracy'])}, median IoU_LH={_fmt(a2.get('median_iou'))}, "
+                 f"looked-right rate (IoU≥{a2['tables']['absolute']['threshold']})={_fmt(a2.get('looked_right_rate_abs'))}, "
+                 f"pointing rate={_fmt(a2.get('pointing_rate'))}")
         L.append("")
-        L.append("|            | correct | wrong |")
-        L.append("|------------|---------|-------|")
-        L.append(f"| IoU_LH high | {t['high_iou_correct']} | {t['high_iou_wrong']} ⚠ |")
-        L.append(f"| IoU_LH low  | {t['low_iou_correct']} | {t['low_iou_wrong']} |")
-        L.append("")
-        L.append(f"- high-IoU among WRONG = {_fmt(a2['high_iou_among_wrong_frac'])} "
-                 f"(large ⇒ using failure)")
+        L.append("**Headline (threshold-free): corr(correct, IoU_LH)="
+                 f"{_fmt(a2['corr_correct_iou_lh'])}, corr(correct, vt_ratio)={_fmt(a2['corr_correct_vt'])}**")
         L.append(f"- mean IoU_LH: right={_fmt(a2['mean_iou_lh_right'])}, wrong={_fmt(a2['mean_iou_lh_wrong'])}")
         L.append(f"- mean vt_ratio: right={_fmt(a2['mean_vt_right'])}, wrong={_fmt(a2['mean_vt_wrong'])} "
                  f"(wrong<right ⇒ answer driven by text/prior)")
-        L.append(f"- corr(correct, IoU_LH)={_fmt(a2['corr_correct_iou_lh'])}, "
-                 f"corr(correct, vt_ratio)={_fmt(a2['corr_correct_vt'])}")
+        L.append("")
+        for name in ("absolute", "pointing", "relative_median"):
+            t = a2["tables"][name]
+            L.append(f"2x2 ({name}, looked-right @ {_fmt(t['threshold'])}):")
+            L.append("")
+            L.append("|             | correct | wrong |")
+            L.append("|-------------|---------|-------|")
+            L.append(f"| looked-right | {t['high_iou_correct']} | {t['high_iou_wrong']} ⚠ |")
+            L.append(f"| looked-wrong | {t['low_iou_correct']} | {t['low_iou_wrong']} |")
+            L.append("")
+        L.append("_(median split is RELATIVE — it labels ~half 'high IoU' even when all IoU are low; "
+                 "use the absolute / pointing tables for 'genuinely looked right'.)_")
         L.append(f"- **verdict: {a2['verdict']}**")
         L.append("")
 
@@ -424,7 +456,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Analyze a G0 run.")
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--iou-threshold", type=float, default=None,
-                    help="High/low IoU_LH split for the 2x2 (default: median of C3).")
+                    help="Relative (median) IoU_LH split for the 2x2 (default: median of C3).")
+    ap.add_argument("--abs-iou-threshold", type=float, default=0.30,
+                    help="ABSOLUTE 'looked right' IoU bar (the verdict uses correlations, not this).")
     ap.add_argument("--no-figs", action="store_true", help="Skip figures (faster mid-run preview).")
     args = ap.parse_args()
 
@@ -437,10 +471,16 @@ def main() -> None:
         "n_records": len(records),
         "conditions": {c: len(v) for c, v in conds.items()},
         "head_usability": analysis_1_head_usability(args.run_dir, conds),
-        "looking_vs_using": analysis_2_looking_vs_using(conds.get("c3", []), iou_threshold=args.iou_threshold),
+        "looking_vs_using": analysis_2_looking_vs_using(
+            conds.get("c3", []), iou_threshold=args.iou_threshold, abs_iou_threshold=args.abs_iou_threshold),
         "hint_mechanism": analysis_3_hint_mechanism(conds.get("c1", []), conds.get("c2", [])),
         "gap": analysis_4_gap(conds.get("c1", []), conds.get("c3", [])),
     }
+    # If answer-span LH was recorded (newer runs), also run the KEY analysis on it.
+    if any("iou_lh_answer" in r for r in conds.get("c3", [])):
+        analysis["looking_vs_using_answer"] = analysis_2_looking_vs_using(
+            conds.get("c3", []), iou_threshold=args.iou_threshold,
+            abs_iou_threshold=args.abs_iou_threshold, iou_key="iou_lh_answer")
     with open(os.path.join(args.run_dir, "analysis.json"), "w") as f:
         json.dump(analysis, f, indent=2)
     if not args.no_figs:

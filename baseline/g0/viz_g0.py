@@ -42,12 +42,21 @@ def _is_nan(x) -> bool:
 
 
 # (filter, sort-key) per criterion. Lower key = picked first; for "random" key is None.
+def _vt(r):  # nan vt sorts last (treat as "not low")
+    v = r.get("vt_ratio")
+    return float("inf") if _is_nan(v) else v
+
+
+# (filter, sort-key) per criterion. Lower key = picked first; for "random" key is None.
 SELECTORS = {
     "low_iou_lh": (lambda r: True, lambda r: r["iou_lh"]),
     "high_iou_lh": (lambda r: True, lambda r: -r["iou_lh"]),
     "low_iou_gl": (lambda r: True, lambda r: r["iou_gl"]),
     "low_vt": (lambda r: not _is_nan(r["vt_ratio"]), lambda r: r["vt_ratio"]),
-    "using_failure": (lambda r: not r["correct"], lambda r: -r["iou_lh"]),
+    # using-failure smoking guns: wrong, ranked by highest IoU then lowest vt (looked
+    # right + answer not image-driven). Rank — not hard-filter — on IoU/vt so it is
+    # non-empty even when absolute IoU is low on this dataset.
+    "using_failure": (lambda r: not r["correct"], lambda r: (-r["iou_lh"], _vt(r))),
     "looking_failure": (lambda r: not r["correct"], lambda r: r["iou_lh"]),
     "wrong": (lambda r: not r["correct"], lambda r: r["iou_lh"]),
     "random": (lambda r: True, None),
@@ -109,6 +118,8 @@ def main() -> None:
     with open(os.path.join(args.run_dir, "config.json")) as f:
         cfg = json.load(f)
     ns = Namespace(**cfg)
+    if not hasattr(ns, "answer_tokens"):  # tolerate configs from before the answer-span fields
+        ns.answer_tokens = 16
 
     records = load_all_records(args.run_dir)
     available = {r["condition"] for r in records}
@@ -128,10 +139,7 @@ def main() -> None:
     from baseline.g0.run_g0 import run_condition, save_viz
     from baseline.probe.saliency_data import load_saliency_samples
 
-    glimpse_layers = (
-        tuple(int(x) for x in cfg.get("glimpse_layers").split(",") if x.strip())
-        if cfg.get("glimpse_layers") else None
-    )
+    glimpse_layers_spec = cfg.get("glimpse_layers")  # resolved per-model in run_condition
     pix = dict(min_pixels=cfg.get("min_pixels"), max_pixels=cfg.get("max_pixels"))
     need_teacher = bool({"c1", "c2"} & set(conditions)) and cfg.get("teacher_model")
     need_student = "c3" in conditions
@@ -173,7 +181,7 @@ def main() -> None:
             try:
                 record, (lh_res, gl_res) = run_condition(
                     gm, sample, hint=hint, selected_heads=heads, args=ns,
-                    glimpse_layers=glimpse_layers, want_viz=True,
+                    glimpse_layers_spec=glimpse_layers_spec, want_viz=True,
                 )
             except Exception as exc:
                 print(f"[g0.viz] skip {key} {cond}: {exc}")

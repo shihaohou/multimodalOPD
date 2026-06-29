@@ -71,8 +71,10 @@ bash scripts/g0_diag_multi.sh
 ```
 
 Sharding is row-strided (`samples[i::N]`); head calibration uses a fixed unsharded
-slice so every shard finds identical localization heads (IoU_LH comparable). Each
-shard writes `records.shardXofN.jsonl`; `analyze_g0` globs them all. `LIMIT=0` =
+slice so every shard finds identical localization heads (IoU_LH comparable), and
+the **eval set is held disjoint from the calibration set** (so analysis 1 is not
+optimistic). Each shard writes `records.shardXofN.jsonl`; `analyze_g0` globs them
+all (and tolerates a half-written trailing line for mid-run previews). `LIMIT=0` =
 no per-subset cap; `SUBSETS=""` = all subsets (note: the free-form subsets
 `flickr30k`/`v7w` need an LLM judge — our rule grader under-scores them, so their
 `correct` is noisy; the headline subsets textvqa/docvqa/gqa/openimages/cub/vsr are
@@ -82,10 +84,13 @@ graded cleanly).
 
 1. **Head usability** (8B & 2B) — best per-head mean IoU, the selected heads +
    their layers, assembled `IoU_LH`. Gates the LH-box / label-free plans.
-2. **Student looking-vs-using** (KEY) — the 2×2 of `IoU_LH` (high/low) ×
-   correctness on C3, plus `vt_ratio` for right vs wrong. Heavy
-   *looked-right-but-wrong + low vt_ratio* ⇒ **using failure** (stay output-level);
-   `IoU_LH` that tracks correctness ⇒ **looking failure** (where-to-look has headroom).
+2. **Student looking-vs-using** (KEY) — the verdict is **correlation-driven**
+   (threshold-free): `corr(correct, IoU_LH)` vs `corr(correct, vt_ratio)` on C3.
+   IoU_LH not predicting correctness while vt_ratio does ⇒ **using failure** (stay
+   output-level); IoU_LH tracking correctness ⇒ **looking failure**. Reported with
+   THREE 2×2s (absolute IoU≥0.30 / pointing / relative-median) since a median split
+   mechanically calls half the samples "high IoU". Computed for both the
+   first-gen-step LH and the **answer-span** LH (`iou_lh_answer`).
 3. **Hint mechanism** (C1 vs C2, paired) — ΔIoU_LH ≫ 0 with Δacc > 0 ⇒
    *attentional*; Δacc > 0 with ΔIoU_LH ≈ 0 ⇒ *non-attentional / output-level*.
 4. **Teacher-vs-student gap** (C1 vs C3) — is the gap mainly localization
@@ -119,8 +124,15 @@ can compare C1/C2/C3 on the same image.
 * Offline box: pass `DATASET=$D/saliency-r1-8k` (local dir), never the HF id —
   `HF_HUB_OFFLINE=1` makes an id fail with `OfflineModeIsEnabled`.
 * `--top-k-heads` (3), `--min-layer` (2, ignore early layers when selecting),
-  `--lh-sigma` (1.0) for LH; `--glimpse-lambda` / `--glimpse-lambda-depth` /
-  `--glimpse-layers` for GLIMPSE; `--threshold {mean,top_frac}` for the maps.
+  `--lh-sigma` (1.0) for LH; `--glimpse-lambda` / `--glimpse-lambda-depth` for
+  GLIMPSE; `--threshold {mean,top_frac}` for the maps.
+* `--glimpse-layers` default `last8` (`all` | `lastN` | comma list) — the memory
+  lever; first-round diagnosis doesn't need full all-layer attribution.
+* `--answer-tokens` (16) = last-K generated tokens treated as the answer span
+  (records `iou_lh_answer` / `vt_ratio_answer` — the verdict prefers these over the
+  full-response / first-token variants, which dilute / mis-target the signal).
+* `analyze_g0 --abs-iou-threshold` (0.30) sets the "genuinely looked right" bar for
+  the 2×2 tables (the verdict itself uses correlations, not this).
 * Greedy decoding by default (reproducible); `SAMPLE=1` to sample.
 * CPU self-tests for the geometry/aggregation logic:
   `python -m baseline.g0.metrics`.

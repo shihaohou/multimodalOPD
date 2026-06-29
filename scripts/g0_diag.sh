@@ -56,9 +56,10 @@ TOP_K_HEADS="${TOP_K_HEADS:-3}"
 MIN_LAYER="${MIN_LAYER:-2}"
 LH_SIGMA="${LH_SIGMA:-1.0}"
 
-GLIMPSE_LAYERS="${GLIMPSE_LAYERS:-}"             # default all
+GLIMPSE_LAYERS="${GLIMPSE_LAYERS:-last8}"        # 'all' | 'lastN' | comma list (memory/speed lever)
 GLIMPSE_LAMBDA="${GLIMPSE_LAMBDA:-1.0}"
 GLIMPSE_LAMBDA_DEPTH="${GLIMPSE_LAMBDA_DEPTH:-0.1}"
+ANSWER_TOKENS="${ANSWER_TOKENS:-16}"             # last-K generated tokens = answer span (LH+GLIMPSE answer variants)
 THRESHOLD="${THRESHOLD:-mean}"
 VIZ_PER_SUBSET="${VIZ_PER_SUBSET:-2}"
 
@@ -88,13 +89,14 @@ CMD=(
   --lh-sigma "$LH_SIGMA"
   --glimpse-lambda "$GLIMPSE_LAMBDA"
   --glimpse-lambda-depth "$GLIMPSE_LAMBDA_DEPTH"
+  --glimpse-layers "$GLIMPSE_LAYERS"
+  --answer-tokens "$ANSWER_TOKENS"
   --threshold "$THRESHOLD"
   --viz-per-subset "$VIZ_PER_SUBSET"
 )
 if [[ -n "$TEACHER_MODEL" ]]; then CMD+=(--teacher-model "$TEACHER_MODEL"); fi
 if [[ -n "$MIN_BBOX_AREA" ]]; then CMD+=(--min-bbox-area "$MIN_BBOX_AREA"); fi
 if [[ -n "$MIN_PIXELS" ]]; then CMD+=(--min-pixels "$MIN_PIXELS"); fi
-if [[ -n "$GLIMPSE_LAYERS" ]]; then CMD+=(--glimpse-layers "$GLIMPSE_LAYERS"); fi
 if [[ "$SAMPLE" == "1" || "$SAMPLE" == "true" ]]; then CMD+=(--sample); fi
 
 echo "[g0_diag] student=$STUDENT_MODEL teacher=${TEACHER_MODEL:-<none>} gpu=$CUDA_VISIBLE_DEVICES shard=$SHARD_INDEX/$NUM_SHARDS out=$OUTPUT_DIR"

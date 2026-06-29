@@ -20,6 +20,7 @@ Run ``python -m baseline.g0.metrics`` for a self-test.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import numpy as np
@@ -124,15 +125,16 @@ def grid_box_to_norm(box: GridBox, h_grid: int, w_grid: int) -> BoxNorm:
 def gt_box_to_grid_mask(bbox: BoxNorm, h_grid: int, w_grid: int) -> np.ndarray:
     """Rasterize a normalized GT box onto the patch grid (bool ``[H_grid,W_grid]``).
 
-    A cell is GT if it overlaps the box. Mirrors ``eval_transfer._bbox_patches``:
-    the left/top edge floors, the right/bottom edge rounds, and the box always
-    covers ≥1 cell. This is the reference GT mask for grid-level IoU.
+    A cell is GT if it OVERLAPS the box: the left/top edge floors, the right/bottom
+    edge **ceils** (so a box touching any part of a cell marks it), and the box
+    always covers ≥1 cell. ``round`` on the far edge would under-cover small boxes
+    on a coarse grid and depress IoU/energy, so we use ceil.
     """
     x1, y1, x2, y2 = bbox
-    c1 = max(0, int(x1 * w_grid))
-    c2 = min(w_grid, max(c1 + 1, int(round(x2 * w_grid))))
-    r1 = max(0, int(y1 * h_grid))
-    r2 = min(h_grid, max(r1 + 1, int(round(y2 * h_grid))))
+    c1 = max(0, min(w_grid - 1, math.floor(x1 * w_grid)))
+    c2 = min(w_grid, max(c1 + 1, math.ceil(x2 * w_grid)))
+    r1 = max(0, min(h_grid - 1, math.floor(y1 * h_grid)))
+    r2 = min(h_grid, max(r1 + 1, math.ceil(y2 * h_grid)))
     mask = np.zeros((h_grid, w_grid), dtype=bool)
     mask[r1:r2, c1:c2] = True
     return mask
