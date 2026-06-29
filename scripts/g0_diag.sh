@@ -28,7 +28,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/g0/$RUN_NAME}"
 
 DATASET="${DATASET:-peterant330/saliency-r1-8k}"
 SPLIT="${SPLIT:-train}"
-SUBSETS="${SUBSETS:-textvqa,docvqa,gqa,openimages}"   # single-region, small-box subsets ("" = all)
+# single-dash so an explicitly-empty SUBSETS="" means "all subsets" (orchestrator uses this);
+# only an UNSET SUBSETS falls back to the headline subsets.
+SUBSETS="${SUBSETS-textvqa,docvqa,gqa,openimages}"
 LIMIT="${LIMIT:-80}"                 # per-subset eval cap (0 = no cap = full 8k)
 CALIB_LIMIT="${CALIB_LIMIT:-40}"     # per-subset head-calibration cap
 MAX_BBOX_AREA="${MAX_BBOX_AREA:-0.5}"
