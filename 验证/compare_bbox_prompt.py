@@ -58,11 +58,20 @@ _DEFAULT_HINT = (
     "box {coords} ({note}). The evidence needed to answer the question is located there."
 )
 
+# Softer no-verbalize template for the `noverbalize_short` scheme: only forbids
+# mentioning the box (drops the strict template's "the coordinates, this hint, or a
+# crop ... or your answer"), which may derail the small student less. Needs {bbox}.
+_SHORT_NOVERB_HINT = (
+    "Hint: the evidence needed to answer the question is inside the bounding box {bbox} "
+    "(normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Use this only to decide where to "
+    "look in the image, then answer the question directly. Do NOT mention the bounding box in your reasoning."
+)
+
 # Shared eval settings the parent passes to each worker via config.json (everything
 # EXCEPT the per-worker model / gpu / output, so both workers run identically).
 _CONFIG_KEYS = (
     "dataset", "split", "subsets", "limit", "max_bbox_area", "schemes", "coord_mode",
-    "bbox_hint", "noverbalize_hint", "draw_color", "draw_width", "system_prompt", "prompt_suffix",
+    "bbox_hint", "noverbalize_hint", "noverbalize_short_hint", "draw_color", "draw_width", "system_prompt", "prompt_suffix",
     "max_new_tokens", "do_sample", "temperature", "top_p", "top_k", "seed",
     "dtype", "gpu_mem_util", "limit_images", "grader", "batch_size", "max_image_side",
 )
@@ -102,6 +111,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--noverbalize-hint", default=None,
                    help="'noverbalize' scheme template; needs {bbox}. Default = baseline.hint HINT_TEMPLATE "
                         "(the strict 'do NOT mention the box/coords/hint/crop'). Pass a softer one to A/B it.")
+    p.add_argument("--noverbalize-short-hint", default=None,
+                   help="'noverbalize_short' scheme template; needs {bbox}. Default = the softer "
+                        "'do NOT mention the bounding box in your reasoning' variant.")
     p.add_argument("--draw-color", default="red")
     p.add_argument("--draw-width", type=int, default=4)
     # prompt / generation
@@ -204,10 +216,16 @@ def build_scheme_item(problem: str, bbox_norm, image, scheme: str, args):
         return f"{problem}\n{args.bbox_hint.format(coords=coords, note=note)}", image
     if scheme == "noverbalize":
         # OPD no-verbalize hint (always normalized [0,1], 2 decimals). --noverbalize-hint
-        # overrides the default strict template (e.g. a softer "do NOT mention the box").
+        # overrides the default STRICT template (do NOT mention box/coords/hint/crop).
         from baseline.hint.opd_hint_collator import HINT_TEMPLATE, format_bbox_hint
 
         tpl = getattr(args, "noverbalize_hint", None) or HINT_TEMPLATE
+        return f"{problem}\n{format_bbox_hint(bbox_norm, tpl, decimals=2)}", image
+    if scheme == "noverbalize_short":
+        # the SOFTER no-verbalize template (only "do NOT mention the bounding box").
+        from baseline.hint.opd_hint_collator import format_bbox_hint
+
+        tpl = getattr(args, "noverbalize_short_hint", None) or _SHORT_NOVERB_HINT
         return f"{problem}\n{format_bbox_hint(bbox_norm, tpl, decimals=2)}", image
     if scheme == "draw":
         img = image.convert("RGB").copy()
@@ -521,9 +539,9 @@ def run_orchestrator(args) -> None:
         raise SystemExit(f"{len(models)} models but {len(groups)} GPU groups — they must match "
                          f"(e.g. --models a=..,b=.. --gpu-groups '0,1,2,3;4,5,6,7').")
     schemes = [s.strip() for s in args.schemes.split(",") if s.strip()]
-    bad = [s for s in schemes if s not in {"plain", "bbox", "noverbalize", "draw"}]
+    bad = [s for s in schemes if s not in {"plain", "bbox", "noverbalize", "noverbalize_short", "draw"}]
     if bad:
-        raise SystemExit(f"unknown scheme(s) {bad}; pick from plain,bbox,noverbalize,draw")
+        raise SystemExit(f"unknown scheme(s) {bad}; pick from plain,bbox,noverbalize,noverbalize_short,draw")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
