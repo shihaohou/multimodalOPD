@@ -51,8 +51,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset", default="peterant330/saliency-r1-8k")
     p.add_argument("--split", default="train")
     p.add_argument("--subsets", default="textvqa,docvqa,gqa,openimages")
-    p.add_argument("--limit", type=int, default=80, help="Per-subset eval cap.")
-    p.add_argument("--calib-limit", type=int, default=40, help="Per-subset head-calibration cap (subset of eval).")
+    p.add_argument("--limit", type=int, default=80, help="Per-subset eval cap (<=0 = no cap = full 8k).")
+    p.add_argument("--calib-limit", type=int, default=40, help="Per-subset head-calibration cap.")
+    p.add_argument("--num-shards", type=int, default=1, help="Data-parallel shards (one process/GPU).")
+    p.add_argument("--shard-index", type=int, default=0, help="This shard's index in [0, num_shards).")
     p.add_argument("--max-bbox-area", type=float, default=0.5, help="Drop near-whole-image boxes.")
     p.add_argument("--min-bbox-area", type=float, default=None)
     p.add_argument("--conditions", default="c1,c2,c3", help="Subset of c1,c2,c3 to run.")
@@ -78,12 +80,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--glimpse-lambda", type=float, default=1.0, help="Head-weight temperature (Eq.6).")
     p.add_argument("--glimpse-lambda-depth", type=float, default=0.1, help="Layer depth prior (Eq.10).")
     p.add_argument("--threshold", default="mean", choices=["mean", "top_frac"])
-    # viz
-    p.add_argument("--viz-n", type=int, default=8, help="Save heatmap overlays for the first N eval samples.")
+    # viz (inline = stratified: first N per subset; criterion-based viz = baseline.g0.viz_g0)
+    p.add_argument("--viz-per-subset", type=int, default=2,
+                   help="Save heatmap overlays for the first N samples PER SUBSET (stratified). "
+                        "For failure-case selection (worst IoU, using-failure smoking guns, low vt) "
+                        "use `python -m baseline.g0.viz_g0` after the run.")
     return p.parse_args()
 
 
-def _records_path(out_dir: str) -> str:
+def _records_path(out_dir: str, num_shards: int = 1, shard_index: int = 0) -> str:
+    if num_shards and num_shards > 1:
+        return os.path.join(out_dir, f"records.shard{shard_index}of{num_shards}.jsonl")
     return os.path.join(out_dir, "records.jsonl")
 
 
@@ -109,8 +116,12 @@ def save_head_stats(out_dir: str, stats: lh_mod.HeadStats, tag: str) -> None:
     )
 
 
-def save_viz(out_dir, image, bbox, lh_res, gl_res, tag: str) -> None:
-    """Overlay LH + GLIMPSE maps on the image with GT (green) and pred (red) boxes."""
+def save_viz(out_dir, image, bbox, lh_res, gl_res, tag: str, *, subdir="viz", suptitle=None) -> None:
+    """Overlay LH + GLIMPSE maps on the image with GT (green) and pred (red) boxes.
+
+    Saved to ``<out_dir>/<subdir>/<tag>.png``; ``suptitle`` (e.g. the case's
+    metrics) is drawn above the panels.
+    """
     try:
         import matplotlib
 
@@ -139,8 +150,10 @@ def save_viz(out_dir, image, bbox, lh_res, gl_res, tag: str) -> None:
             ax.imshow(np.asarray(m), extent=(0, W, H, 0), cmap="jet", alpha=0.5, interpolation="bilinear")
         _box(ax, bbox, "lime"); _box(ax, pred, "red")
         ax.set_title(title); ax.axis("off")
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=11)
     fig.tight_layout()
-    viz_dir = os.path.join(out_dir, "viz")
+    viz_dir = os.path.join(out_dir, subdir)
     os.makedirs(viz_dir, exist_ok=True)
     fig.savefig(os.path.join(viz_dir, f"{tag}.png"), dpi=90)
     plt.close(fig)
@@ -209,21 +222,27 @@ def main() -> None:
         if args.glimpse_layers else None
     )
 
-    with open(os.path.join(args.output_dir, "config.json"), "w") as f:
-        json.dump(vars(args), f, indent=2, default=_json_safe)
+    is_main = args.shard_index == 0
+    if is_main:  # one writer for the shared config (avoids concurrent-write races)
+        with open(os.path.join(args.output_dir, "config.json"), "w") as f:
+            json.dump(vars(args), f, indent=2, default=_json_safe)
 
-    samples = load_saliency_samples(
-        args.dataset, args.split, limit=args.limit, subsets=subsets,
+    # Calibration set: first calib_limit per subset over the FULL dataset (NOT
+    # sharded) so every shard discovers identical localization heads → IoU_LH is
+    # comparable across shards. Small (≈ calib_limit × #subsets images).
+    calib_samples = load_saliency_samples(
+        args.dataset, args.split, limit=args.calib_limit, subsets=subsets,
         max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area,
     )
-    # Calibration subset = first calib_limit per subset (deterministic order).
-    seen: dict[str, int] = {}
-    calib_samples = []
-    for s in samples:
-        if seen.get(s.subset, 0) < args.calib_limit:
-            calib_samples.append(s)
-            seen[s.subset] = seen.get(s.subset, 0) + 1
-    print(f"[g0] {len(samples)} eval samples, {len(calib_samples)} calibration samples")
+    # Eval set: sharded at the raw-row level (each GPU decodes only its 1/N).
+    eval_limit = None if args.limit <= 0 else args.limit
+    samples = load_saliency_samples(
+        args.dataset, args.split, limit=eval_limit, subsets=subsets,
+        max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area,
+        num_shards=args.num_shards, shard_index=args.shard_index,
+    )
+    print(f"[g0] shard {args.shard_index}/{args.num_shards}: {len(samples)} eval samples, "
+          f"{len(calib_samples)} calibration samples")
 
     # ----- load models -----
     pix = dict(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
@@ -237,11 +256,13 @@ def main() -> None:
     # ----- calibrate localization heads (analysis 1) -----
     calib_kwargs = dict(top_k=args.top_k_heads, min_layer=args.min_layer)
     student_stats = lh_mod.calibrate_heads(student, calib_samples, hint=False, **calib_kwargs)
-    save_head_stats(args.output_dir, student_stats, "student")
+    if is_main:  # heads are identical across shards (same calib set); one writer
+        save_head_stats(args.output_dir, student_stats, "student")
     teacher_stats = None
     if teacher is not None:
         teacher_stats = lh_mod.calibrate_heads(teacher, calib_samples, hint=False, **calib_kwargs)
-        save_head_stats(args.output_dir, teacher_stats, "teacher")
+        if is_main:
+            save_head_stats(args.output_dir, teacher_stats, "teacher")
 
     # condition → (model, hint, selected_heads, tag)
     cond_specs = {}
@@ -252,11 +273,13 @@ def main() -> None:
     conditions = [c for c in conditions if c in cond_specs]
 
     # ----- eval loop -----
-    rec_path = _records_path(args.output_dir)
+    rec_path = _records_path(args.output_dir, args.num_shards, args.shard_index)
     n_done, n_skip = 0, 0
+    viz_count: dict[str, int] = {}  # stratified inline viz: first N samples per subset (shard 0 only)
     with open(rec_path, "w") as rf:
         for idx, sample in enumerate(samples):
-            want_viz = idx < args.viz_n
+            want_viz = is_main and viz_count.get(sample.subset, 0) < args.viz_per_subset
+            viz_used = False
             for cond in conditions:
                 gm, hint, heads = cond_specs[cond]
                 try:
@@ -276,18 +299,26 @@ def main() -> None:
                 n_done += 1
                 if want_viz:
                     save_viz(args.output_dir, sample.image, sample.bbox_norm, lh_res, gl_res,
-                             tag=f"{sample.subset}_{sample.sample_id}_{cond}")
+                             tag=f"{sample.subset}_{sample.sample_id}_{cond}",
+                             suptitle=f"{sample.subset} {sample.sample_id} {cond} | correct={record['correct']} "
+                                      f"IoU_LH={record['iou_lh']:.2f} IoU_GL={record['iou_gl']:.2f} "
+                                      f"vt={record['vt_ratio']:.2f}")
+                    viz_used = True
+            if viz_used:
+                viz_count[sample.subset] = viz_count.get(sample.subset, 0) + 1
             if args.device == "cuda" and idx % 4 == 0:
                 torch.cuda.empty_cache()
             if idx % 10 == 0:
                 print(f"[g0] {idx}/{len(samples)} samples ({n_done} records, {n_skip} skips)")
 
     summary = quick_summary(rec_path)
-    with open(os.path.join(args.output_dir, "summary_quick.json"), "w") as f:
+    summary_name = "summary_quick.json" if args.num_shards <= 1 else f"summary_quick.shard{args.shard_index}.json"
+    with open(os.path.join(args.output_dir, summary_name), "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"\n[g0] wrote {n_done} records ({n_skip} skips) → {rec_path}")
+    print(f"\n[g0] shard {args.shard_index}: wrote {n_done} records ({n_skip} skips) → {rec_path}")
     print(json.dumps(summary, indent=2))
-    print(f"[g0] next: uv run python -m baseline.g0.analyze_g0 --run-dir {args.output_dir}")
+    if is_main:
+        print(f"[g0] when all shards finish: uv run python -m baseline.g0.analyze_g0 --run-dir {args.output_dir}")
 
 
 def quick_summary(rec_path: str) -> dict:

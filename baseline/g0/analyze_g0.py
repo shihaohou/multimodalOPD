@@ -25,6 +25,7 @@ Run: ``uv run python -m baseline.g0.analyze_g0 --run-dir eval_outputs/g0/run1``
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -39,13 +40,15 @@ import numpy as np
 
 # --------------------------------------------------------------------- loading
 def load_records(run_dir: str) -> list[dict]:
-    path = os.path.join(run_dir, "records.jsonl")
+    """Read all record files (single ``records.jsonl`` or sharded ``records.shard*.jsonl``)."""
+    paths = sorted(glob.glob(os.path.join(run_dir, "records*.jsonl")))
     records = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
+    for path in paths:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
     return records
 
 

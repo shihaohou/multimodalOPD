@@ -136,6 +136,8 @@ def load_saliency_samples(
     subsets: list[str] | None = None,
     max_bbox_area: float | None = None,
     min_bbox_area: float | None = None,
+    num_shards: int | None = None,
+    shard_index: int = 0,
 ) -> list[SaliencySample]:
     """Load probe samples (those with a valid evidence bbox).
 
@@ -147,15 +149,24 @@ def load_saliency_samples(
     equal-area random-mask control can't be placed disjointly (which would dilute
     Reliance toward 0). Selection is deterministic in dataset order, so two model
     runs with the same args see identical samples (required for the paired analysis).
+
+    ``num_shards`` / ``shard_index`` stride the **raw dataset rows** (``index %
+    num_shards == shard_index``) BEFORE the image is decoded, so N data-parallel
+    workers each touch only 1/N of the images (no N× decode / RAM blow-up). With
+    ``limit`` set, the per-subset cap then applies *within each shard*; for a full
+    pass leave ``limit=None`` so the shards partition the data evenly.
     """
     data = _load_hf_split(dataset, split)
     subset_filter = {s.strip().lower() for s in subsets} if subsets else None
+    sharded = bool(num_shards and num_shards > 1)
     counts: Counter[str] = Counter()
     samples: list[SaliencySample] = []
     skipped_bbox = 0
     skipped_field = 0
     skipped_area = 0
     for index in range(len(data)):
+        if sharded and (index % num_shards) != shard_index:
+            continue
         record = data[index]
         subset = str(record.get("dataset", "")).strip() or "unknown"
         if subset_filter is not None and subset.lower() not in subset_filter:
@@ -182,8 +193,9 @@ def load_saliency_samples(
         samples.append(SaliencySample(sample_id, subset, problem, solution, image, bbox))
         counts[subset] += 1
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(none)"
+    shard_tag = f" [shard {shard_index}/{num_shards}]" if sharded else ""
     print(
-        f"[saliency] loaded {len(samples)} samples ({summary}); skipped "
+        f"[saliency]{shard_tag} loaded {len(samples)} samples ({summary}); skipped "
         f"{skipped_bbox} bad-bbox, {skipped_area} out-of-area, {skipped_field} missing-field"
     )
     return samples

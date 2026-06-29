@@ -28,12 +28,15 @@ OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/g0/$RUN_NAME}"
 
 DATASET="${DATASET:-peterant330/saliency-r1-8k}"
 SPLIT="${SPLIT:-train}"
-SUBSETS="${SUBSETS:-textvqa,docvqa,gqa,openimages}"   # single-region, small-box subsets
-LIMIT="${LIMIT:-80}"                 # per-subset eval cap
-CALIB_LIMIT="${CALIB_LIMIT:-40}"     # per-subset head-calibration cap (subset of eval)
+SUBSETS="${SUBSETS:-textvqa,docvqa,gqa,openimages}"   # single-region, small-box subsets ("" = all)
+LIMIT="${LIMIT:-80}"                 # per-subset eval cap (0 = no cap = full 8k)
+CALIB_LIMIT="${CALIB_LIMIT:-40}"     # per-subset head-calibration cap
 MAX_BBOX_AREA="${MAX_BBOX_AREA:-0.5}"
 MIN_BBOX_AREA="${MIN_BBOX_AREA:-}"
 CONDITIONS="${CONDITIONS:-c1,c2,c3}"
+NUM_SHARDS="${NUM_SHARDS:-1}"        # data-parallel shards (one process/GPU); see g0_diag_multi.sh
+SHARD_INDEX="${SHARD_INDEX:-0}"
+SKIP_ANALYZE="${SKIP_ANALYZE:-}"     # set 1 for sharded runs (orchestrator analyzes once at the end)
 
 ATTN="${ATTN:-eager}"                # MUST be eager for output_attentions
 DTYPE="${DTYPE:-bfloat16}"
@@ -55,7 +58,7 @@ GLIMPSE_LAYERS="${GLIMPSE_LAYERS:-}"             # default all
 GLIMPSE_LAMBDA="${GLIMPSE_LAMBDA:-1.0}"
 GLIMPSE_LAMBDA_DEPTH="${GLIMPSE_LAMBDA_DEPTH:-0.1}"
 THRESHOLD="${THRESHOLD:-mean}"
-VIZ_N="${VIZ_N:-8}"
+VIZ_PER_SUBSET="${VIZ_PER_SUBSET:-2}"
 
 CMD=(
   uv run python -m baseline.g0.run_g0
@@ -66,6 +69,8 @@ CMD=(
   --subsets "$SUBSETS"
   --limit "$LIMIT"
   --calib-limit "$CALIB_LIMIT"
+  --num-shards "$NUM_SHARDS"
+  --shard-index "$SHARD_INDEX"
   --max-bbox-area "$MAX_BBOX_AREA"
   --conditions "$CONDITIONS"
   --attn "$ATTN"
@@ -82,7 +87,7 @@ CMD=(
   --glimpse-lambda "$GLIMPSE_LAMBDA"
   --glimpse-lambda-depth "$GLIMPSE_LAMBDA_DEPTH"
   --threshold "$THRESHOLD"
-  --viz-n "$VIZ_N"
+  --viz-per-subset "$VIZ_PER_SUBSET"
 )
 if [[ -n "$TEACHER_MODEL" ]]; then CMD+=(--teacher-model "$TEACHER_MODEL"); fi
 if [[ -n "$MIN_BBOX_AREA" ]]; then CMD+=(--min-bbox-area "$MIN_BBOX_AREA"); fi
@@ -90,9 +95,11 @@ if [[ -n "$MIN_PIXELS" ]]; then CMD+=(--min-pixels "$MIN_PIXELS"); fi
 if [[ -n "$GLIMPSE_LAYERS" ]]; then CMD+=(--glimpse-layers "$GLIMPSE_LAYERS"); fi
 if [[ "$SAMPLE" == "1" || "$SAMPLE" == "true" ]]; then CMD+=(--sample); fi
 
-echo "[g0_diag] student=$STUDENT_MODEL teacher=${TEACHER_MODEL:-<none>} gpu=$CUDA_VISIBLE_DEVICES out=$OUTPUT_DIR"
+echo "[g0_diag] student=$STUDENT_MODEL teacher=${TEACHER_MODEL:-<none>} gpu=$CUDA_VISIBLE_DEVICES shard=$SHARD_INDEX/$NUM_SHARDS out=$OUTPUT_DIR"
 "${CMD[@]}"
 
-echo "[g0_diag] analyzing ..."
-uv run python -m baseline.g0.analyze_g0 --run-dir "$OUTPUT_DIR"
-echo "[g0_diag] done → $OUTPUT_DIR (report.md, analysis.json, figs/)"
+if [[ -z "$SKIP_ANALYZE" ]]; then
+  echo "[g0_diag] analyzing ..."
+  uv run python -m baseline.g0.analyze_g0 --run-dir "$OUTPUT_DIR"
+  echo "[g0_diag] done → $OUTPUT_DIR (report.md, analysis.json, figs/)"
+fi
