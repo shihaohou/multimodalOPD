@@ -123,10 +123,18 @@ def parse_args() -> argparse.Namespace:
     # grading
     p.add_argument("--grader", default="rule", choices=["rule", "llm"],
                    help="rule = mathruler+exact (no API); llm = DeepSeek judge ($DEEPSEEK_API_KEY).")
-    p.add_argument("--judge-model", default="deepseek-v4-flash")
-    p.add_argument("--judge-api-url", default="https://api.deepseek.com")
-    p.add_argument("--judge-key-env", default="DEEPSEEK_API_KEY")
+    p.add_argument("--judge-model", default="deepseek-v4-flash",
+                   help="Judge model name. For a self-hosted server use its --served-model-name.")
+    p.add_argument("--judge-api-url", default="https://api.deepseek.com",
+                   help="OpenAI-compatible base URL (e.g. http://localhost:8000/v1 for local vLLM).")
+    p.add_argument("--judge-key-env", default="DEEPSEEK_API_KEY",
+                   help="Env var holding the API key (a self-hosted server needs none → dummy used).")
     p.add_argument("--judge-workers", type=int, default=32)
+    p.add_argument("--judge-no-think", action="store_true",
+                   help="Disable thinking for the judge (Qwen3 etc.) via chat_template_kwargs — "
+                        "prevents <think> from truncating the JSON verdict. Recommended for a local hybrid judge.")
+    p.add_argument("--judge-max-tokens", type=int, default=2048,
+                   help="Judge max_new_tokens (raise if you keep thinking ON so the verdict isn't cut off).")
     # re-grade an existing run with the LLM judge (no vLLM / no regeneration)
     p.add_argument("--judge-only", action="store_true",
                    help="Skip generation: re-grade --output-dir/records.jsonl with the LLM judge "
@@ -423,23 +431,31 @@ def grade_llm(records: list[dict[str, Any]], args) -> None:
 
     from vigos.eval_utils import build_judge_messages, parse_judge_output
 
-    key = os.environ.get(args.judge_key_env) or os.environ.get("OPENAI_API_KEY")
-    if not key:
-        raise RuntimeError(f"--grader llm needs ${args.judge_key_env} (or $OPENAI_API_KEY).")
+    # A self-hosted OpenAI-compatible server (vLLM) needs no real key — fall back to a
+    # dummy so only a remote API (DeepSeek) requires the env var.
+    key = os.environ.get(args.judge_key_env) or os.environ.get("OPENAI_API_KEY") or "EMPTY"
     client = OpenAI(base_url=args.judge_api_url, api_key=key)
+    # Disable Qwen3 (and other hybrid) thinking for the judge: a <think> block can eat
+    # the token budget and truncate the JSON verdict → parser falls back to "incorrect"
+    # (a silent, possibly scheme-asymmetric bias). vLLM honors this chat-template kwarg.
+    extra_body = {"chat_template_kwargs": {"enable_thinking": False}} if getattr(args, "judge_no_think", False) else None
+    max_tok = getattr(args, "judge_max_tokens", 2048)
 
     def judge_one(rec):
         msgs = build_judge_messages(rec["extracted_answer"], rec["solution"], rec["problem_text"])
         try:
             resp = client.chat.completions.create(
-                model=args.judge_model, messages=msgs, temperature=0.0, max_tokens=2048, timeout=120
+                model=args.judge_model, messages=msgs, temperature=0.0,
+                max_tokens=max_tok, timeout=180, extra_body=extra_body,
             )
             return parse_judge_output(resp.choices[0].message.content).get("verdict") == "correct"
         except Exception as exc:  # noqa: BLE001
             print(f"[judge] error on {rec.get('sample_id')}: {exc}")
             return False
 
-    print(f"[bbox-ab] grading {len(records)} responses with the LLM judge ...", flush=True)
+    mode = "no-think" if extra_body else "thinking-on"
+    print(f"[bbox-ab] grading {len(records)} responses with the LLM judge "
+          f"(model={args.judge_model}, {mode}, max_tokens={max_tok}) ...", flush=True)
     with ThreadPoolExecutor(max_workers=max(1, args.judge_workers)) as pool:
         for rec, ok in zip(records, pool.map(judge_one, records)):
             rec["correct"] = bool(ok)

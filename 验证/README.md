@@ -39,6 +39,18 @@ uv run python 验证/compare_bbox_prompt.py --judge-only \
 # → summary_llm.json + records_llm.jsonl(rule 版 summary.json/records.jsonl 保留)
 ```
 
+**本地自部署 judge(Qwen3 等)**——judge 走 OpenAI 兼容接口,任何 vLLM serve 都行;先生成(占满 8 卡,rule 存盘),生成结束放掉显存后再部署 judge:
+```bash
+# 1) 部署 judge(35B-A3B 很小,TP 视情况;开 OpenAI 接口)
+vllm serve $M/Qwen3-A3B-... --tensor-parallel-size 8 --port 8000 --served-model-name judge
+# 2) judge 已存的 records(thinking 模型务必 --judge-no-think,否则 <think> 吃光 token → JSON 被截断 → 误判 incorrect)
+uv run python 验证/compare_bbox_prompt.py --judge-only \
+    --output-dir eval_outputs/bbox_viscot_2k --grader llm \
+    --judge-api-url http://localhost:8000/v1 --judge-model judge \
+    --judge-key-env DUMMY --judge-no-think
+```
+自部署 judge 不需要 key(自动用 dummy)。**判分准不准**:对 bbox 的相对 `Δ`,同一个 judge 评所有 scheme,偏差对称会抵消,本地 35B-A3B 足够;temperature 已是 0(确定性)。要核一下质量,在 textvqa 这种精确匹配子集上比 `summary.json`(rule) 与 `summary_llm.json`(judge) 是否 ~95%+ 一致即可。
+
 **数据集选择**
 - **全量 saliency-r1-8k**:`--subsets`(去掉=全 subset)+ `--limit -1`(不限量,全 8K)。vLLM 跑得快。
 - **Visual-CoT**(`$D/Visual-CoT`,逐 domain `metadata/*.jsonl`,像素框→自动归一化):脚本自动识别该目录。
