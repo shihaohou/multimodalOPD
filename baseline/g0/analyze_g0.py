@@ -40,15 +40,26 @@ import numpy as np
 
 # --------------------------------------------------------------------- loading
 def load_records(run_dir: str) -> list[dict]:
-    """Read all record files (single ``records.jsonl`` or sharded ``records.shard*.jsonl``)."""
+    """Read all record files (single ``records.jsonl`` or sharded ``records.shard*.jsonl``).
+
+    Tolerant of a half-written trailing line so it can be run MID-RUN for a live
+    trend preview while shards are still appending.
+    """
     paths = sorted(glob.glob(os.path.join(run_dir, "records*.jsonl")))
     records = []
+    bad = 0
     for path in paths:
         with open(path) as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    bad += 1  # partially-flushed last line during a live run
+    if bad:
+        print(f"[g0.analyze] skipped {bad} unparseable line(s) (mid-run preview?).")
     return records
 
 
@@ -385,10 +396,14 @@ def main() -> None:
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--iou-threshold", type=float, default=None,
                     help="High/low IoU_LH split for the 2x2 (default: median of C3).")
+    ap.add_argument("--no-figs", action="store_true", help="Skip figures (faster mid-run preview).")
     args = ap.parse_args()
 
     records = load_records(args.run_dir)
     conds = by_condition(records)
+    # Live progress line (handy when previewing a still-running sharded job).
+    prog = " ".join(f"{c}={len(v)}" for c, v in sorted(conds.items()))
+    print(f"[g0.analyze] {len(records)} records so far ({prog})")
     analysis = {
         "n_records": len(records),
         "conditions": {c: len(v) for c, v in conds.items()},
@@ -399,7 +414,8 @@ def main() -> None:
     }
     with open(os.path.join(args.run_dir, "analysis.json"), "w") as f:
         json.dump(analysis, f, indent=2)
-    make_figures(args.run_dir, conds, analysis["head_usability"], analysis["looking_vs_using"])
+    if not args.no_figs:
+        make_figures(args.run_dir, conds, analysis["head_usability"], analysis["looking_vs_using"])
     write_report(args.run_dir, analysis)
     print(json.dumps(analysis, indent=2))
     print(f"\n[g0.analyze] wrote analysis.json, report.md, figs/ → {args.run_dir}")
