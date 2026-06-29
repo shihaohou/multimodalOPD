@@ -14,17 +14,29 @@
 一条命令在 8 卡上**并发部署两个模型**（每模型 `tensor_parallel_size=4`），各自跑两种 prompt，最后汇总正确率：
 
 - **方案① plain**：原始图片 + 问题。
-- **方案② bbox**：同样的图片 + 问题，外加一句英文提示，并把该样本的 GT 证据框坐标填进去
-  （“Pay special attention to the region inside the bounding box [...]”）。
+- **方案② bbox**：同样的图片 + 问题，外加一句**鼓励使用**的英文提示，把 GT 框坐标填进去
+  （“Pay special attention to the region inside the bounding box [...], evidence is there”）——**允许模型讲框/推理**。
+- **方案③ noverbalize**：同样把 GT 框给模型，但用 OPD 真正的 **no-verbalize** 模板
+  （baseline/hint 的 HINT_TEMPLATE：“use this only to decide where to look … **do NOT mention the box**”）——
+  这才是 OPD 能蒸馏的"沉默 hint"。bbox vs noverbalize 的差 = "讲出来用" 带来的增益。
 - （可选 **draw**：把框直接画在图上。）
 
+三模型(两 teacher + 一 student)× 三方案,占满 8 卡(TP 4/2/2),先 rule 存盘:
 ```bash
 M=/home/web_server/antispam/project/houshihao/models
+D=/home/web_server/antispam/project/houshihao/datasets
 uv run python 验证/compare_bbox_prompt.py \
-    --models capcurriculum-8b=$M/CapCurriculum-8B,qwen3vl-8b=$M/Qwen3-VL-8B-Instruct \
-    --gpu-groups "0,1,2,3;4,5,6,7" \
-    --subsets docvqa --limit 200 \
-    --output-dir eval_outputs/bbox_ab
+    --models qwen3vl-8b=$M/Qwen3-VL-8B-Instruct,capcurriculum-8b=$M/CapCurriculum-8B,student-2b=$M/Qwen3-VL-2B-Instruct \
+    --gpu-groups "0,1,2,3;4,5;6,7" \
+    --schemes plain,bbox,noverbalize \
+    --dataset $D/saliency-r1-8k --subsets docvqa,textvqa,gqa,openimages --limit 200 \
+    --output-dir eval_outputs/bbox_ab3 --grader rule
+```
+跑完再 LLM judge **同一批已存的 records**(不重跑生成,需 `DEEPSEEK_API_KEY`)：
+```bash
+uv run python 验证/compare_bbox_prompt.py --judge-only \
+    --output-dir eval_outputs/bbox_ab3 --grader llm
+# → summary_llm.json + records_llm.jsonl(rule 版 summary.json/records.jsonl 保留)
 ```
 
 （以上两个模型已是脚本默认值，直接 `uv run python 验证/compare_bbox_prompt.py` 也行。）

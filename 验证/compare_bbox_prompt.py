@@ -93,7 +93,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit", type=int, default=200, help="PER-SUBSET sample cap (None-like: pass -1).")
     p.add_argument("--max-bbox-area", type=float, default=None, help="Drop boxes larger than this (fraction).")
     # schemes / hint
-    p.add_argument("--schemes", default="plain,bbox", help="Subset of: plain,bbox,draw.")
+    p.add_argument("--schemes", default="plain,bbox",
+                   help="Subset of: plain,bbox,noverbalize,draw. (bbox = verbalize-allowed hint; "
+                        "noverbalize = OPD silent hint.)")
     p.add_argument("--coord-mode", default="normalized", choices=["normalized", "pixel"],
                    help="How the bbox coords are written into the hint.")
     p.add_argument("--bbox-hint", default=_DEFAULT_HINT, help="Hint template; needs {coords} (+ optional {note}).")
@@ -125,6 +127,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--judge-api-url", default="https://api.deepseek.com")
     p.add_argument("--judge-key-env", default="DEEPSEEK_API_KEY")
     p.add_argument("--judge-workers", type=int, default=32)
+    # re-grade an existing run with the LLM judge (no vLLM / no regeneration)
+    p.add_argument("--judge-only", action="store_true",
+                   help="Skip generation: re-grade --output-dir/records.jsonl with the LLM judge "
+                        "and write summary_llm.json + records_llm.jsonl.")
     # internal worker mode
     p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--model", default=None, help=argparse.SUPPRESS)        # one name=path
@@ -167,8 +173,17 @@ def format_coords(bbox_norm, image_size, mode: str) -> tuple[str, str]:
 
 
 def build_scheme_item(problem: str, bbox_norm, image, scheme: str, args):
-    """(problem_text, image) for a scheme, given an already-decoded image. plain/bbox
-    keep the image; draw burns the GT box into a copy and keeps the question."""
+    """(problem_text, image) for a scheme, given an already-decoded image. plain/bbox/
+    noverbalize keep the image; draw burns the GT box into a copy and keeps the question.
+
+    Schemes:
+      * plain       — just the question.
+      * bbox        — verbalize-allowed hint ("pay special attention to [box], evidence is there").
+      * noverbalize — the OPD-faithful silent hint (baseline.hint HINT_TEMPLATE: "use this only
+                      to decide where to look ... do NOT mention the box"). Same box, but forbids
+                      the model from reasoning about / mentioning it — what OPD can actually distill.
+      * draw        — the GT box drawn on the image.
+    """
     from PIL import ImageDraw
 
     if scheme == "plain":
@@ -176,6 +191,11 @@ def build_scheme_item(problem: str, bbox_norm, image, scheme: str, args):
     if scheme == "bbox":
         coords, note = format_coords(bbox_norm, image.size, args.coord_mode)
         return f"{problem}\n{args.bbox_hint.format(coords=coords, note=note)}", image
+    if scheme == "noverbalize":
+        # Exact OPD C2 hint (always normalized [0,1], 2 decimals) — the no-verbalize template.
+        from baseline.hint.opd_hint_collator import HINT_TEMPLATE, format_bbox_hint
+
+        return f"{problem}\n{format_bbox_hint(bbox_norm, HINT_TEMPLATE, decimals=2)}", image
     if scheme == "draw":
         img = image.convert("RGB").copy()
         w, h = img.size
@@ -370,34 +390,38 @@ def summarize(records, model_names, schemes) -> dict[str, Any]:
                            "acc": accuracy([r for r in records if r["model"] == name and r["scheme"] == sc])}
                       for sc in schemes}
         entry = {"schemes": per_scheme}
-        if "plain" in per_scheme and "bbox" in per_scheme:
-            a0, a1 = per_scheme["plain"]["acc"], per_scheme["bbox"]["acc"]
-            entry["delta_bbox_minus_plain"] = (a1 - a0) if (a0 is not None and a1 is not None) else None
+        # Δ vs plain for EVERY non-plain scheme (bbox, noverbalize, draw, ...).
+        if "plain" in per_scheme:
+            a0 = per_scheme["plain"]["acc"]
+            for sc in schemes:
+                if sc == "plain":
+                    continue
+                a1 = per_scheme[sc]["acc"]
+                entry[f"delta_{sc}_minus_plain"] = (a1 - a0) if (a0 is not None and a1 is not None) else None
         results[name] = entry
     return results
 
 
 def print_table(results, schemes) -> None:
-    print("\n" + "=" * 74)
+    deltas = [sc for sc in schemes if sc != "plain"] if "plain" in schemes else []
+    print("\n" + "=" * 88)
     print("Final answer accuracy  (model x prompt scheme)")
-    print("=" * 74)
-    head = f"{'model':<16}" + "".join(f"{sc:>12}" for sc in schemes)
-    if "plain" in schemes and "bbox" in schemes:
-        head += f"{'Δ(bbox)':>12}"
+    print("=" * 88)
+    head = f"{'model':<18}" + "".join(f"{sc:>14}" for sc in schemes) + "".join(f"{'Δ(' + sc + ')':>14}" for sc in deltas)
     print(head)
     print("-" * len(head))
     for name, entry in results.items():
-        row = f"{name:<16}"
+        row = f"{name:<18}"
         for sc in schemes:
             a = entry["schemes"][sc]["acc"]
-            row += f"{(f'{a:.3f}' if a is not None else '—'):>12}"
-        if "delta_bbox_minus_plain" in entry:
-            d = entry["delta_bbox_minus_plain"]
-            row += f"{(f'{d:+.3f}' if d is not None else '—'):>12}"
+            row += f"{(f'{a:.3f}' if a is not None else '—'):>14}"
+        for sc in deltas:
+            d = entry.get(f"delta_{sc}_minus_plain")
+            row += f"{(f'{d:+.3f}' if d is not None else '—'):>14}"
         print(row)
     print("-" * len(head))
-    if "plain" in schemes and "bbox" in schemes:
-        print("Δ(bbox) = acc(bbox hint) − acc(plain); > 0 means the GT box hint helped.")
+    if deltas:
+        print("Δ(scheme) = acc(scheme) − acc(plain); > 0 means that hint helped.")
 
 
 # ----------------------------------------------------------------- orchestrator
@@ -408,9 +432,9 @@ def run_orchestrator(args) -> None:
         raise SystemExit(f"{len(models)} models but {len(groups)} GPU groups — they must match "
                          f"(e.g. --models a=..,b=.. --gpu-groups '0,1,2,3;4,5,6,7').")
     schemes = [s.strip() for s in args.schemes.split(",") if s.strip()]
-    bad = [s for s in schemes if s not in {"plain", "bbox", "draw"}]
+    bad = [s for s in schemes if s not in {"plain", "bbox", "noverbalize", "draw"}]
     if bad:
-        raise SystemExit(f"unknown scheme(s) {bad}; pick from plain,bbox,draw")
+        raise SystemExit(f"unknown scheme(s) {bad}; pick from plain,bbox,noverbalize,draw")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -484,10 +508,40 @@ def run_orchestrator(args) -> None:
     print(f"\n[bbox-ab] wrote {out_dir / 'records.jsonl'} and {out_dir / 'summary.json'}")
 
 
+# --------------------------------------------------------------- judge-only mode
+def run_judge_only(args) -> None:
+    """Re-grade an existing run's records.jsonl with the LLM judge (no vLLM)."""
+    out_dir = Path(args.output_dir)
+    recs_path = out_dir / "records.jsonl"
+    if not recs_path.exists():
+        raise SystemExit(f"--judge-only: {recs_path} not found (run the rule pass first).")
+    records = [json.loads(line) for line in recs_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not records:
+        raise SystemExit(f"--judge-only: {recs_path} is empty.")
+    args.grader = "llm"
+    grade_llm(records, args)  # overwrites record['correct'] with the judge verdict
+    model_names = list(dict.fromkeys(r["model"] for r in records))
+    schemes = list(dict.fromkeys(r["scheme"] for r in records))
+    results = summarize(records, model_names, schemes)
+    subsets_seen = sorted({r["subset"] for r in records})
+    per_subset = {sub: summarize([r for r in records if r["subset"] == sub], model_names, schemes)
+                  for sub in subsets_seen}
+    with open(out_dir / "records_llm.jsonl", "w", encoding="utf-8") as fh:
+        for r in records:
+            fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    summary = {"grader": "llm", "judge_model": args.judge_model, "schemes": schemes,
+               "results": results, "per_subset": per_subset}
+    (out_dir / "summary_llm.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print_table(results, schemes)
+    print(f"\n[bbox-ab] judge-only wrote {out_dir / 'summary_llm.json'} and records_llm.jsonl")
+
+
 # ------------------------------------------------------------------------------ main
 def main() -> None:
     args = parse_args()
-    if args.worker:
+    if args.judge_only:
+        run_judge_only(args)
+    elif args.worker:
         if args.config:  # inherit the parent's shared eval settings
             cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
             for k, v in cfg.items():
