@@ -39,6 +39,13 @@ uv run python 验证/compare_bbox_prompt.py --judge-only \
 # → summary_llm.json + records_llm.jsonl(rule 版 summary.json/records.jsonl 保留)
 ```
 
+**数据集选择**
+- **全量 saliency-r1-8k**:`--subsets`(去掉=全 subset)+ `--limit -1`(不限量,全 8K)。vLLM 跑得快。
+- **Visual-CoT**(`$D/Visual-CoT`,逐 domain `metadata/*.jsonl`,像素框→自动归一化):脚本自动识别该目录。
+  **subset = domain(jsonl 文件名)**,所以 `--limit` 是**每个任务的上限**——按任务分层抽样。约 2K 条就设
+  `--limit 200`(domain 数 ~10+,自行按 `2000/任务数` 调)。需 `VISCOT_IMAGE_ROOT` 指向解压后的图片根
+  (默认用数据集目录)。Visual-CoT 答案多为自由文本,**强烈建议 `--grader llm`**。
+
 （以上两个模型已是脚本默认值，直接 `uv run python 验证/compare_bbox_prompt.py` 也行。）
 
 - `--limit` 是**每个子集**的样本上限；去掉 `--subsets`/`--limit` 跑全量。默认贪心解码。

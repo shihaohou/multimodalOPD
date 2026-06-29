@@ -207,12 +207,75 @@ def build_scheme_item(problem: str, bbox_norm, image, scheme: str, args):
     raise ValueError(f"unknown scheme {scheme!r}")
 
 
+def _build_index_viscot(args):
+    """Visual-CoT index: per-domain ``metadata/*.jsonl`` → ``kept`` items carrying a
+    resolved image PATH (not an HF row). subset = the domain (jsonl stem) so ``--limit``
+    stratifies per task; pixel ``bboxs`` are normalized to [0,1]. Reuses the canonical
+    Visual-CoT helpers in ``baseline.opd_dataset`` (image-basename index + resolver)."""
+    import json
+    import os
+
+    from baseline.opd_dataset import (
+        _build_viscot_image_index,
+        _normalize_viscot_bbox,
+        _resolve_viscot_image,
+        _viscot_jsonl_files,
+    )
+    from baseline.probe.saliency_data import bbox_area, parse_bbox_norm
+
+    root = os.environ.get("VISCOT_IMAGE_ROOT") or args.dataset
+    index = _build_viscot_image_index(root, verbose=True)
+    files = _viscot_jsonl_files(args.dataset)
+    subset_filter = {s.strip().lower() for s in args.subsets.split(",")} if args.subsets else None
+    limit = None if (args.limit is not None and args.limit < 0) else args.limit
+
+    kept: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for jsonl in files:
+        domain = os.path.splitext(os.path.basename(jsonl))[0]
+        if subset_filter is not None and domain.lower() not in subset_filter:
+            continue
+        with open(jsonl, encoding="utf-8") as fh:
+            for li, line in enumerate(fh):
+                if limit is not None and counts.get(domain, 0) >= limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                bbox = parse_bbox_norm(_normalize_viscot_bbox(row.get("bboxs"), row.get("width"), row.get("height")))
+                if bbox is None:
+                    continue
+                if args.max_bbox_area is not None and bbox_area(bbox) > args.max_bbox_area:
+                    continue
+                problem = str(row.get("question", "")).strip()
+                solution = str(row.get("answer", "")).strip()
+                if not problem or not solution:
+                    continue
+                img = _resolve_viscot_image(row.get("image"), row.get("dataset"), root, index)
+                if img is None:
+                    continue
+                kept.append({"image_path": img, "id": f"{domain}_{li}", "subset": domain,
+                             "problem": problem, "solution": solution, "bbox": bbox})
+                counts[domain] = counts.get(domain, 0) + 1
+    return kept, counts
+
+
 def build_index(args):
     """Lazily build the sample list WITHOUT decoding any image (filter on text/bbox
     columns only), so host RAM does not scale with dataset size. Returns
-    ``(data, image_column, kept, counts)`` where ``data`` still decodes images on
-    demand (``data[row][image_column]``) one chunk at a time during generation."""
+    ``(data, image_column, kept, counts)``: for HF datasets ``data`` decodes images
+    on demand (``data[row][image_column]``); for Visual-CoT dirs ``data`` is None and
+    each item carries an ``image_path`` (opened on demand)."""
+    from baseline.opd_dataset import _looks_like_viscot
     from baseline.probe.saliency_data import _load_hf_split, bbox_area, parse_bbox_norm
+
+    if _looks_like_viscot(args.dataset):
+        kept, counts = _build_index_viscot(args)
+        return None, None, kept, counts
 
     data = _load_hf_split(args.dataset, args.split)
     cols = list(data.column_names)
@@ -252,11 +315,16 @@ def build_index(args):
     return data, image_column, kept, counts
 
 
-def decode_image(data, image_column, row_index: int, max_side: int):
-    """Decode ONE image and downscale it if its longest side exceeds ``max_side``."""
+def decode_image(data, image_column, item, max_side: int):
+    """Decode ONE image (HF row OR Visual-CoT path), downscale if longest side > max_side."""
+    from PIL import Image
+
     from baseline.probe.saliency_data import _to_pil
 
-    image = _to_pil(data[row_index][image_column])
+    if "image_path" in item:  # Visual-CoT: image is a resolved file path
+        image = Image.open(item["image_path"]).convert("RGB")
+    else:
+        image = _to_pil(data[item["row"]][image_column])
     if max_side and max(image.size) > max_side:
         image = image.copy()
         image.thumbnail((max_side, max_side))
@@ -313,7 +381,7 @@ def run_worker(args) -> None:
             chunk = kept[start:start + bs]
             requests, meta = [], []
             for item in chunk:  # decode only this chunk's images (then let them be freed)
-                image = decode_image(data, image_column, item["row"], args.max_image_side)
+                image = decode_image(data, image_column, item, args.max_image_side)
                 for sc in schemes:
                     problem_text, img = build_scheme_item(item["problem"], item["bbox"], image, sc, args)
                     prompt = build_general_eval_prompt(
