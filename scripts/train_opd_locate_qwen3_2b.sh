@@ -81,9 +81,13 @@ ANSWER_FIELD="${ANSWER_FIELD:-solution}"
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
 # OPD teacher channel (FIX for the box-death collapse). The student emits a <box>, so the
 # teacher must share that distribution or reverse-KL kills the format:
-#   shared (default) = teacher uses the SAME structured locate prompt, no coordinate hint;
-#   crop             = structured teacher + image cropped to the GT box (privilege, no digits);
-#   plain_hint       = OLD plain-think + no-verbalize hint (reproduces the collapse — ablation only).
+#   gen        = teacher replicates the cold-start trace-generation prompt (structured prompt +
+#                NATURAL_GEN_TEMPLATE, GT box injected) -> teacher(gen) ~= student(SFT'd) AND
+#                grounded. RECOMMENDED when cold-started with TRACE_MODE=natural.
+#   shared (default) = teacher uses the SAME structured locate prompt, no coordinate hint (safe,
+#                but drops the spatial privilege);
+#   crop       = structured teacher + image cropped to the GT box (privilege, no digits);
+#   plain_hint = OLD plain-think + no-verbalize hint (reproduces the collapse — ablation only).
 LOCATE_TEACHER_MODE="${LOCATE_TEACHER_MODE:-shared}"
 # Also drop the box-emission decision token (before "<box>") from OPD so RL/SFT own localization.
 MASK_BOX_TRANSITION="${MASK_BOX_TRANSITION:-true}"

@@ -93,13 +93,19 @@ class OPDLocateScriptArguments(OPDHintScriptArguments):
     locate_system_prompt: str = LOCATE_SYSTEM_PROMPT
     # OPD teacher channel. The student is SFT'd to ALWAYS open its <think> with a <box>, so the
     # teacher MUST live in the same DISTRIBUTION (Rethinking-OPD) or reverse-KL fights the format:
+    #   "gen"     — RECOMMENDED with TRACE_MODE=natural cold-start: teacher replicates the EXACT
+    #               trace-generation prompt (structured prompt + NATURAL_GEN_TEMPLATE, GT box
+    #               injected). The student was SFT'd to reproduce this teacher's outputs, so
+    #               teacher(gen) ~= student(SFT'd) — tightest match — AND the teacher stays grounded
+    #               (sees the box). Box coords + decision token are masked and the template forbids
+    #               repeating coords, so no digits leak (the old Option-3 salad was a weak-cold-start
+    #               artifact, now fixed by the full cold-start). Needs the bbox column.
     #   "shared" (default) — teacher uses the SAME structured locate prompt as the student and
     #               gets NO coordinate hint. It then also wants a <box> at the head (reverse-KL
     #               no longer suppresses it) and carries no coordinate digits (nothing primes a
-    #               token-salad). The stronger model is the only privilege; spatial privilege off.
-    #   "crop"    — privilege-preserving: structured locate prompt + the image CROPPED to the GT
-    #               box (zoom), no coordinate text. Keeps the GHD "teacher sees the evidence" spine
-    #               without digits. (Needs GPU validation of the crop+box-frame path.)
+    #               token-salad). Safest, but drops the spatial privilege (model gap only).
+    #   "crop"    — privilege-preserving without digits: structured locate prompt + the image
+    #               CROPPED to the GT box (zoom). (Needs GPU validation of the crop+box-frame path.)
     #   "plain_hint" — OLD behaviour (plain think prompt + no-verbalize coordinate hint). Kept ONLY
     #               to reproduce the collapse: the hint orders "do NOT mention the box", so the
     #               teacher puts ~0 prob on the student's <box> and reverse-KL drives box_present
@@ -128,11 +134,12 @@ def main() -> None:
         )
     if not script_args.teacher_model_name_or_path:
         raise ValueError("--teacher_model_name_or_path is required for local_hf.")
-    if script_args.locate_teacher_mode not in {"shared", "crop", "plain_hint"}:
+    if script_args.locate_teacher_mode not in {"gen", "shared", "crop", "plain_hint"}:
         raise ValueError(
             f"Unknown --locate_teacher_mode {script_args.locate_teacher_mode!r}; "
-            "use 'shared' (default, structured teacher + no hint), 'crop' "
-            "(structured teacher + cropped evidence), or 'plain_hint' (collapse ablation)."
+            "use 'gen' (teacher replicates the cold-start generation prompt), 'shared' "
+            "(structured teacher + no hint), 'crop' (structured teacher + cropped evidence), "
+            "or 'plain_hint' (collapse ablation)."
         )
     if "<box>" not in script_args.locate_system_prompt:
         raise ValueError(
@@ -163,7 +170,18 @@ def main() -> None:
     # the teacher must not fight that, so by default it shares the student's structured prompt
     # with NO coordinate hint (same distribution, no digits). The student's <box> span (and, by
     # default, the box-emission decision token) is masked from OPD regardless.
-    if script_args.locate_teacher_mode == "shared":
+    if script_args.locate_teacher_mode == "gen":
+        # Teacher replicates the cold-start trace-generation prompt verbatim (structured locate
+        # prompt + NATURAL_GEN_TEMPLATE, GT box injected). The student was SFT'd to reproduce
+        # exactly this teacher's outputs, so teacher(gen) ~= student(SFT'd) — the tightest
+        # distribution match — and the teacher stays grounded. Box coords + decision token are
+        # masked and the template forbids repeating coords -> no digits leak into the loss.
+        from baseline.locate.prompts import NATURAL_GEN_TEMPLATE
+
+        teacher_system_prompt = script_args.locate_system_prompt
+        teacher_hint_template = NATURAL_GEN_TEMPLATE
+        teacher_privilege_mode = "hint"
+    elif script_args.locate_teacher_mode == "shared":
         teacher_system_prompt = script_args.locate_system_prompt
         teacher_hint_template = ""  # empty hint => non-privileged plain prompt, no coord digits
         teacher_privilege_mode = "hint"

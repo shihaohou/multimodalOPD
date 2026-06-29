@@ -52,7 +52,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 from baseline.eval.opd_eval_prompt import build_general_eval_messages
 from baseline.locate.locate_rl import collapse_extra_boxes, parse_student_box
-from baseline.locate.prompts import LOCATE_SYSTEM_PROMPT
+from baseline.locate.prompts import LOCATE_SYSTEM_PROMPT, NATURAL_GEN_TEMPLATE
 from baseline.opd_data_collator import (
     _safe_rgb_image,
     resolve_opd_system_prompt,
@@ -61,20 +61,12 @@ from baseline.opd_dataset import load_opd_dataset
 from baseline.probe.saliency_data import parse_bbox_norm
 from vigos.answer_utils import extract_boxed_content, normalize_reference_answer
 
-# trace_mode="natural": the teacher is SHOWN the GT box and writes the WHOLE locate trace
-# (box woven into the reasoning) itself, used verbatim — vs "inject", which generates plain
-# reasoning and bolts a <box>[GT]</box> onto the head. Natural traces match the teacher's
-# own thinking pattern (Rethinking-OPD: OPD needs compatible student/teacher patterns), so
-# the cold-started student's reasoning is closer to the OPD target.
-NATURAL_GEN_TEMPLATE = (
-    "Hint: the region that contains the answer is <box>{bbox}</box> (coordinates normalized "
-    "to [0,1], top-left origin, [x1, y1, x2, y2]). Inside <think>, follow three steps: "
-    "(1) state this region once as <box>{bbox}</box>; (2) describe what is in that region "
-    "(the visual details relevant to the question); (3) reason from that description to the "
-    "answer. Refer to it as \"that region\" afterwards and do not repeat the coordinates. "
-    "Then give the final answer in \\boxed{{}}."
-)
-
+# trace_mode="natural" uses NATURAL_GEN_TEMPLATE (imported from prompts.py — the single
+# source of truth, also reused by the OPD teacher's `gen` mode): the teacher is SHOWN the GT
+# box and writes the WHOLE locate trace (box woven into the reasoning) itself, used verbatim —
+# vs "inject", which generates plain reasoning and bolts a <box>[GT]</box> onto the head.
+# Natural traces match the teacher's own thinking pattern (Rethinking-OPD: OPD needs compatible
+# student/teacher patterns), so the cold-started student's reasoning is closer to the OPD target.
 
 JUDGE_PROMPT = (
     "You are grading whether a model's answer to a visual question is correct.\n"

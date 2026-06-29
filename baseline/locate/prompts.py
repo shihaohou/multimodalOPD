@@ -23,15 +23,21 @@ LOCATE_SYSTEM_PROMPT = (
     "Then give the final answer in \\boxed{}."
 )
 
-# OPD teacher hint (appended to the teacher's question; the teacher is privileged with
-# the GT box). It STATES the box (no no-verbalize clause — post-cold-start the student
-# emits boxes, so a box-stating teacher matches its pattern; the de1e4c5 collapse needed
-# a box-FREE student). The box coordinate span is still masked from the OPD loss in the
-# trainer (Option 3: OPD distills how-to-think; RL owns where-to-look). ``{bbox}`` is the
-# per-sample normalized box.
-LOCATE_TEACHER_HINT_TEMPLATE = (
-    "Hint: the region that contains the answer is <box>{bbox}</box> (normalized to [0,1], "
-    "top-left origin, [x1, y1, x2, y2]). Inside <think>, state this region once as "
-    "<box>{bbox}</box>, then describe what is in it, then reason to the answer. Refer to "
-    "it as \"that region\" afterwards; do not repeat the coordinates."
+# The cold-start trace GENERATION prompt (single source of truth, imported by
+# coldstart_build's natural mode AND the OPD teacher's `gen` mode). In `natural` cold-start
+# the teacher is shown the GT box and writes the whole structured trace under this prompt;
+# the student is then SFT'd to reproduce those outputs from the box-FREE student prompt.
+# So scoring the OPD teacher under this SAME prompt makes teacher(gen) ~= student(SFT'd) —
+# the tightest distribution match (Rethinking-OPD) — while the teacher stays grounded (it
+# sees the box). Safe for OPD because the box COORD span (+ its decision token) is masked
+# from the loss and the template orders "do not repeat the coordinates", so no coordinate
+# digits leak into the supervised describe/reason span (the old Option-3 salad was a
+# weak-cold-start artifact, not this template). ``{bbox}`` = per-sample normalized box.
+NATURAL_GEN_TEMPLATE = (
+    "Hint: the region that contains the answer is <box>{bbox}</box> (coordinates normalized "
+    "to [0,1], top-left origin, [x1, y1, x2, y2]). Inside <think>, follow three steps: "
+    "(1) state this region once as <box>{bbox}</box>; (2) describe what is in that region "
+    "(the visual details relevant to the question); (3) reason from that description to the "
+    "answer. Refer to it as \"that region\" afterwards and do not repeat the coordinates. "
+    "Then give the final answer in \\boxed{{}}."
 )
