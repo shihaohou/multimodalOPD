@@ -128,6 +128,27 @@ def bbox_area(bbox: BoxNorm) -> float:
     return (x2 - x1) * (y2 - y1)
 
 
+# Subset-name aliases: saliency-r1-8k stores the *Visual-CoT source* in `dataset`
+# under short names (e.g. ``v7w``, ``openimages``), but callers naturally type the
+# long forms (``visual7w``, ``open_images``). We canonicalize BOTH the requested
+# names and each row's `dataset` for filter-matching only — ``SaliencySample.subset``
+# keeps the raw value, so records/analysis still group by the real dataset name.
+_SUBSET_ALIASES = {
+    "visual7w": "v7w",
+    "visualgenome7w": "v7w",
+    "v7w": "v7w",
+    "openimages": "openimages",
+    "flickr": "flickr30k",
+    "flickr30k": "flickr30k",
+}
+
+
+def canon_subset(name: str) -> str:
+    """Lowercase, drop separators, map known aliases → canonical (for matching)."""
+    n = "".join(ch for ch in str(name).strip().lower() if ch.isalnum())
+    return _SUBSET_ALIASES.get(n, n)
+
+
 def load_saliency_samples(
     dataset: str = "peterant330/saliency-r1-8k",
     split: str = "train",
@@ -157,7 +178,7 @@ def load_saliency_samples(
     pass leave ``limit=None`` so the shards partition the data evenly.
     """
     data = _load_hf_split(dataset, split)
-    subset_filter = {s.strip().lower() for s in subsets} if subsets else None
+    subset_filter = {canon_subset(s) for s in subsets} if subsets else None
     sharded = bool(num_shards and num_shards > 1)
     counts: Counter[str] = Counter()
     samples: list[SaliencySample] = []
@@ -169,7 +190,7 @@ def load_saliency_samples(
             continue
         record = data[index]
         subset = str(record.get("dataset", "")).strip() or "unknown"
-        if subset_filter is not None and subset.lower() not in subset_filter:
+        if subset_filter is not None and canon_subset(subset) not in subset_filter:
             continue
         if limit is not None and counts[subset] >= limit:
             continue
@@ -198,4 +219,10 @@ def load_saliency_samples(
         f"[saliency]{shard_tag} loaded {len(samples)} samples ({summary}); skipped "
         f"{skipped_bbox} bad-bbox, {skipped_area} out-of-area, {skipped_field} missing-field"
     )
+    if subset_filter is not None and not sharded:  # flag typos (only on the unsharded view)
+        seen = {canon_subset(k) for k in counts}
+        missing = sorted(subset_filter - seen)
+        if missing:
+            print(f"[saliency] WARNING: requested subset(s) matched 0 rows: {missing} "
+                  f"(check spelling; aliases handled: visual7w→v7w, flickr→flickr30k)")
     return samples
