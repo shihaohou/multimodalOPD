@@ -146,6 +146,30 @@ def load_g0_model(
 
 
 # ------------------------------------------------------------------------ prompts
+def build_messages(
+    image: Any,
+    problem: str,
+    *,
+    hint_bbox: Optional[BoxNorm] = None,
+    system_prompt: Optional[str] = None,
+    hint_decimals: int = 2,
+) -> list:
+    """The chat messages for a condition (plain vs C2 silent-hint).
+
+    Factored out of :func:`build_inputs` so the EAGLE adaptor can build the chat
+    *text* once and re-run the processor over many perturbed images.
+    """
+    from baseline.hint.opd_hint_collator import build_hint_teacher_messages, format_bbox_hint
+    from baseline.opd_data_collator import OPD_SYSTEM_PROMPT, build_opd_messages
+
+    if system_prompt is None:
+        system_prompt = OPD_SYSTEM_PROMPT
+    if hint_bbox is None:
+        return build_opd_messages(problem, image, system_prompt=system_prompt, suffix="")
+    hint = format_bbox_hint(hint_bbox, decimals=hint_decimals)
+    return build_hint_teacher_messages(problem, image, hint, system_prompt=system_prompt, suffix="")
+
+
 def build_inputs(
     gm: G0Model,
     image: Any,
@@ -165,18 +189,9 @@ def build_inputs(
     the shared ``OPD_SYSTEM_PROMPT`` (the one prompt teacher GRPO / student / eval
     all agree on).
     """
-    from baseline.hint.opd_hint_collator import build_hint_teacher_messages, format_bbox_hint
-    from baseline.opd_data_collator import OPD_SYSTEM_PROMPT, build_opd_messages
-
-    if system_prompt is None:
-        system_prompt = OPD_SYSTEM_PROMPT
-    if hint_bbox is None:
-        messages = build_opd_messages(problem, image, system_prompt=system_prompt, suffix="")
-    else:
-        hint = format_bbox_hint(hint_bbox, decimals=hint_decimals)
-        messages = build_hint_teacher_messages(
-            problem, image, hint, system_prompt=system_prompt, suffix=""
-        )
+    messages = build_messages(
+        image, problem, hint_bbox=hint_bbox, system_prompt=system_prompt, hint_decimals=hint_decimals
+    )
     text = gm.processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
     )
