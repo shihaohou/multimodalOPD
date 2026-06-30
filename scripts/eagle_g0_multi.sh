@@ -23,6 +23,13 @@ M="${M:-models}"
 OUTPUT_BASE="${OUTPUT_BASE:-eval_outputs/eagle_g0}"
 mkdir -p "$OUTPUT_BASE"
 
+# Python runner — use an already-active venv directly (see eagle_g0.sh). Workers go
+# through eagle_g0.sh (which inherits $VIRTUAL_ENV and does the same), so this only
+# covers the judge/analyze calls below. Override with PYRUN=...
+if [[ -n "${PYRUN:-}" ]]; then read -r -a PY <<< "$PYRUN";
+elif [[ -n "${VIRTUAL_ENV:-}" ]]; then PY=(python);
+else PY=(uv run python); fi
+
 # 5 models, "name=path" pairs separated by ';'. Students keep relative run paths.
 MODELS="${MODELS:-\
 qwen3vl-8b=$M/Qwen3-VL-8B-Instruct;\
@@ -82,12 +89,12 @@ if [[ "$JUDGE" == "1" || "$JUDGE" == "true" ]]; then
     JFLAGS=(--run-dir "$d" --judge-api-url "$JUDGE_API_URL" --judge-model "$JUDGE_MODEL")
     [[ "$JUDGE_NO_THINK" == "1" || "$JUDGE_NO_THINK" == "true" ]] && JFLAGS+=(--judge-no-think)
     echo "[eagle_multi] judging $d ..."
-    uv run python -m baseline.g0.judge_g0 "${JFLAGS[@]}" || echo "[eagle_multi] judge failed for $d; using rule."
+    "${PY[@]}" -m baseline.g0.judge_g0 "${JFLAGS[@]}" || echo "[eagle_multi] judge failed for $d; using rule."
   done
   USE_JUDGE_FLAG=(--use-judge)
 fi
 
 echo "[eagle_multi] cross-model analysis ..."
-uv run python -m baseline.g0.analyze_eagle_g0 --run-dirs "${run_dirs[@]}" \
+"${PY[@]}" -m baseline.g0.analyze_eagle_g0 --run-dirs "${run_dirs[@]}" \
   --output-dir "$OUTPUT_BASE" "${USE_JUDGE_FLAG[@]}"
 echo "[eagle_multi] done → $OUTPUT_BASE/eagle_report.md"

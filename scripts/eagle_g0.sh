@@ -25,6 +25,14 @@ export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
+# Python runner. If a venv is already active, use it DIRECTLY — `uv run` ignores a
+# $VIRTUAL_ENV that doesn't match the project's .venv and bootstraps a fresh
+# ./.venv on the (shared) repo, re-downloading everything. Override with
+# PYRUN="uv run python" or PYRUN=/abs/path/to/python.
+if [[ -n "${PYRUN:-}" ]]; then read -r -a PY <<< "$PYRUN";
+elif [[ -n "${VIRTUAL_ENV:-}" ]]; then PY=(python);
+else PY=(uv run python); fi
+
 DATASET="${DATASET:-peterant330/saliency-r1-8k}"
 SPLIT="${SPLIT:-train}"
 # Fail fast on the classic offline trap (HF id under HF_HUB_OFFLINE=1).
@@ -89,7 +97,7 @@ pids=()
 for ((i = 0; i < NUM_SHARDS; i++)); do
   gpu="${GPU_ARR[$i]}"
   CUDA_VISIBLE_DEVICES="$gpu" \
-    uv run python -m baseline.g0.run_eagle_g0 "${common_flags[@]}" \
+    "${PY[@]}" -m baseline.g0.run_eagle_g0 "${common_flags[@]}" \
       --num-shards "$NUM_SHARDS" --shard-index "$i" \
       > "$OUTPUT_DIR/shard${i}.log" 2>&1 &
   pids+=($!)
@@ -104,10 +112,10 @@ if [[ -z "$SKIP_ANALYZE" ]]; then
     echo "[eagle_g0] LLM-judge ..."
     JFLAGS=(--run-dir "$OUTPUT_DIR" --judge-api-url "$JUDGE_API_URL" --judge-model "$JUDGE_MODEL")
     [[ "$JUDGE_NO_THINK" == "1" || "$JUDGE_NO_THINK" == "true" ]] && JFLAGS+=(--judge-no-think)
-    uv run python -m baseline.g0.judge_g0 "${JFLAGS[@]}" || echo "[eagle_g0] judge failed; continuing with rule grader."
-    uv run python -m baseline.g0.analyze_eagle_g0 --run-dirs "$OUTPUT_DIR" --use-judge
+    "${PY[@]}" -m baseline.g0.judge_g0 "${JFLAGS[@]}" || echo "[eagle_g0] judge failed; continuing with rule grader."
+    "${PY[@]}" -m baseline.g0.analyze_eagle_g0 --run-dirs "$OUTPUT_DIR" --use-judge
   else
-    uv run python -m baseline.g0.analyze_eagle_g0 --run-dirs "$OUTPUT_DIR"
+    "${PY[@]}" -m baseline.g0.analyze_eagle_g0 --run-dirs "$OUTPUT_DIR"
   fi
   echo "[eagle_g0] done → $OUTPUT_DIR (eagle_report.md, eagle_analysis.json, viz/)"
 fi
