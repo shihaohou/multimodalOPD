@@ -347,6 +347,23 @@ def run_condition(gm, sample, *, hint=False, condition=None, selected_heads=None
     return record, (eg, gl_res, lh_first, salr1_res), (completion_ids.detach().cpu(), text)
 
 
+def _token_plot_inputs(eg):
+    words, scores = [], []
+    for detail in getattr(eg, "token_details", None) or []:
+        raw = str(detail.get("token_text", ""))
+        label = raw.replace("\n", "\\n").replace("\t", "\\t")
+        label = label if label.strip() else "<space>"
+        score = detail.get("visual_log_lift", detail.get("visual_reliance"))
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(score):
+            words.append(label)
+            scores.append(score)
+    return words, scores
+
+
 def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir="viz"):
     """Save the EAGLE official-style explanation heatmap for the final aggregate map."""
     image = sample.image.convert("RGB")
@@ -356,6 +373,7 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
     if getattr(eg, "attribution_map", None) is None:
         print(f"[eagle_g0] viz skip {sample.subset}/{sample.sample_id}: no EAGLE attribution_map")
         return None
+    token_words, token_scores = _token_plot_inputs(eg)
 
     eagle_repo = os.environ.get("EAGLE_REPO", "/Users/houshihao/project/code/EAGLE-master")
     eagle_viz_py = os.path.join(eagle_repo, "visualization", "visualization.py")
@@ -373,7 +391,22 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
             os.close(fd)
             try:
                 image.save(image_path)
-                if (
+                if token_words and hasattr(mod, "visualize_explanation"):
+                    amap = np.asarray(eg.attribution_map, dtype=np.float32)
+                    amap = amap - float(np.nanmin(amap))
+                    amap = amap / (float(np.nanmax(amap)) + 1e-8)
+                    image_bgr = mod.cv2.imread(image_path)
+                    amap = mod.cv2.resize(
+                        amap,
+                        (image_bgr.shape[1], image_bgr.shape[0]),
+                        interpolation=mod.cv2.INTER_LINEAR,
+                    )
+                    amap = mod.norm_image(amap)
+                    vis_saliency_map, _ = mod.gen_cam(image_path, amap)
+                    mod.visualize_explanation(vis_saliency_map, token_words, token_scores)
+                    mod.plt.savefig(path, bbox_inches="tight", pad_inches=0, dpi=600)
+                    mod.plt.close()
+                elif (
                     getattr(eg, "token_map_mode", "span") == "span"
                     and getattr(eg, "eagle_s_set", None) is not None
                     and isinstance(getattr(eg, "eagle_json_file", None), dict)
@@ -419,8 +452,11 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
 
     fixed_width = 6
     top_h = fixed_width * h / max(1, w)
-    fig = plt.figure(figsize=(fixed_width, top_h))
-    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.0, 0.035])
+    bottom_h = 1.2 if token_words else 0.0
+    fig = plt.figure(figsize=(fixed_width, top_h + bottom_h))
+    rows = 2 if token_words else 1
+    height_ratios = [top_h, bottom_h] if token_words else [top_h]
+    gs = fig.add_gridspec(nrows=rows, ncols=2, height_ratios=height_ratios, width_ratios=[1.0, 0.035])
     ax = fig.add_subplot(gs[0, 0])
     ax.axis("off")
     ax.set_aspect("equal", adjustable="box")
@@ -431,7 +467,35 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
         spine.set_visible(False)
     cbar.ax.tick_params(length=0, labelbottom=False, labelleft=False)
     cbar.ax.set_yticklabels([])
-    fig.subplots_adjust(left=0.02, right=0.985, top=0.985, bottom=0.02, wspace=0.04)
+    if token_words:
+        ax_txt = fig.add_subplot(gs[1, :])
+        ax_txt.axis("off")
+        ax_txt.set_xlim(0, 1)
+        ax_txt.set_ylim(0, 1)
+        norm = plt.Normalize(vmin=min(token_scores), vmax=max(token_scores))
+        cmap = plt.get_cmap("bwr")
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        inv = ax_txt.transAxes.inverted()
+        x, y = 0.02, 0.72
+        for word, score in zip(token_words, token_scores):
+            t = ax_txt.text(
+                x, y, word, transform=ax_txt.transAxes, fontsize=12,
+                ha="left", va="center",
+                bbox=dict(facecolor=cmap(norm(score)), edgecolor="none", boxstyle="round,pad=0.25"),
+            )
+            fig.canvas.draw()
+            bb = t.get_window_extent(renderer=renderer)
+            (x0, _), (x1, _) = inv.transform([(bb.x0, bb.y0), (bb.x1, bb.y1)])
+            w_axes = x1 - x0
+            if x + w_axes > 0.98:
+                y -= 0.28
+                x = 0.02
+                t.set_position((x, y))
+                x += w_axes + 0.02
+            else:
+                x += w_axes + 0.02
+    fig.subplots_adjust(left=0.02, right=0.985, top=0.985, bottom=0.02, wspace=0.04, hspace=0.04)
     fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=600)
     plt.close(fig)
     return path
@@ -442,6 +506,7 @@ def save_eagle_artifacts(out_dir, sample, eg, tag, subdir="eagle_artifacts"):
     os.makedirs(art_dir, exist_ok=True)
     json_path = os.path.join(art_dir, f"{tag}.json")
     npz_path = os.path.join(art_dir, f"{tag}.npz")
+    response_tokens, response_scores = _token_plot_inputs(eg)
     meta = {
         "sample_id": str(sample.sample_id),
         "subset": sample.subset,
@@ -449,6 +514,8 @@ def save_eagle_artifacts(out_dir, sample, eg, tag, subdir="eagle_artifacts"):
         "token_map_count": eg.token_map_count,
         "token_indices": eg.token_indices,
         "token_details": eg.token_details,
+        "response_tokens": response_tokens,
+        "response_visual_log_lift": response_scores,
         "metrics": {
             "iou_eagle": eg.iou_eagle,
             "pointing_at1": eg.pointing_at1,

@@ -374,6 +374,8 @@ def eagle_probe(
     if token_map_mode == "span":
         S_set, jf, amap = run_once(s, e)
         token_indices = list(range(s, e))
+        org_scores = np.asarray(jf.get("org_score", []), dtype=np.float64)
+        base_scores = np.asarray(jf.get("baseline_score", []), dtype=np.float64)
         token_details = [
             {
                 "token_index": int(j),
@@ -381,8 +383,24 @@ def eagle_probe(
                 "token_text": gm.tokenizer.decode([int(comp[j].detach().cpu().item())],
                                                   skip_special_tokens=False,
                                                   clean_up_tokenization_spaces=False),
+                "org_prob": float(org_scores[k]) if k < org_scores.size else float("nan"),
+                "baseline_prob": float(base_scores[k]) if k < base_scores.size else float("nan"),
+                "org_logp": _mean_log_probs([org_scores[k]]) if k < org_scores.size else float("nan"),
+                "baseline_logp": _mean_log_probs([base_scores[k]]) if k < base_scores.size else float("nan"),
+                "visual_log_lift": (
+                    _mean_log_probs([org_scores[k]]) - _mean_log_probs([base_scores[k]])
+                    if k < min(org_scores.size, base_scores.size) else float("nan")
+                ),
+                "visual_reliance": (
+                    float(org_scores[k] - base_scores[k])
+                    if k < min(org_scores.size, base_scores.size) else float("nan")
+                ),
+                "visual_fraction": (
+                    float((org_scores[k] - base_scores[k]) / org_scores[k])
+                    if k < min(org_scores.size, base_scores.size) and org_scores[k] > 1e-6 else float("nan")
+                ),
             }
-            for j in token_indices
+            for k, j in enumerate(token_indices)
         ]
         agg_jf = jf
         agg_s_set = S_set
