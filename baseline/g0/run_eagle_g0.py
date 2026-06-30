@@ -93,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--answer-tokens", type=int, default=8, help="Last-K fallback when no \\boxed{} (EAGLE target span).")
     p.add_argument("--eagle-threshold", default="mean", choices=["mean", "top_frac"])
     p.add_argument("--eagle-top-frac", type=float, default=0.25)
+    p.add_argument("--explain-span-mode", default="answer", choices=["answer", "sentence"],
+                   help="EAGLE target tokens: boxed/last-K answer span, or the whole generated completion.")
     # grad probes (LH + GLIMPSE) on the same rollout
     p.add_argument("--grad-probes", dest="grad_probes", action="store_true", default=True,
                    help="Also compute LH + GLIMPSE (default ON) → EAGLE-vs-LH comparison.")
@@ -226,6 +228,13 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
     device = inputs["input_ids"].device
     full_ids = torch.cat([inputs["input_ids"][0], completion_ids.to(device)])
     spans = resolve_answer_spans(completion_ids, gm.tokenizer, args.answer_tokens)
+    explain_span_mode = getattr(args, "explain_span_mode", "answer")
+    if explain_span_mode == "sentence":
+        eagle_span = (0, int(completion_ids.numel()))
+        eagle_span_label = "sentence"
+    else:
+        eagle_span = spans.primary
+        eagle_span_label = spans.mode
     if args.debug_mem and torch.cuda.is_available():
         S = int(full_ids.numel())
         P = int((full_ids == gm.parts.image_token_id).sum())
@@ -255,12 +264,13 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
 
     eg = eagle_mod.eagle_probe(
         gm, sample.image, sample.problem, bbox, completion_ids,
-        hint_bbox=bbox if hint else None, boxed_span=spans.primary, answer_k=args.answer_tokens,
+        hint_bbox=bbox if hint else None, boxed_span=eagle_span, answer_k=args.answer_tokens,
         n_regions=args.n_regions, search_scope=args.search_scope, pending_samples=args.pending_samples,
         update_step=args.update_step, batch_size=args.eagle_batch_size, eagle_image_size=args.eagle_image_size,
         region_mode=args.region_mode, threshold=args.eagle_threshold, top_frac=args.eagle_top_frac,
         keep_map=want_viz,
     )
+    eg.boxed_span_mode = eagle_span_label
 
     record = {
         "sample_id": str(sample.sample_id), "subset": sample.subset, "model": gm.name,
@@ -268,6 +278,8 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
         "correct": bool(is_correct(text, sample.solution)),
         "bbox_area": float(bbox_area(bbox)), "gt_bbox": [float(x) for x in bbox],
         "boxed_span_mode": eg.boxed_span_mode, "region_mode_used": eg.region_mode_used,
+        "eagle_target_span_mode": explain_span_mode,
+        "eagle_target_span": [int(eagle_span[0]), int(eagle_span[1])],
         "prompt_len": prompt_len, "completion_len": int(completion_ids.numel()),
         # EAGLE — looking (causal) + using (reliance) + faithfulness
         "iou_eagle": eg.iou_eagle, "eagle_bbox_iou": eg.bbox_iou, "pointing_eagle": eg.pointing_eagle,
@@ -299,8 +311,9 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
         import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
         from PIL import Image as _Im
-    except Exception:
-        return
+    except Exception as exc:
+        print(f"[eagle_g0] viz skip {sample.subset}/{sample.sample_id}: matplotlib import failed: {exc}")
+        return None
     image = sample.image.convert("RGB")
     W, H = image.size
     bbox = sample.bbox_norm
@@ -348,7 +361,9 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
                  f"vis_frac={eg.visual_fraction:.2f} suff={eg.sufficiency:.2f} nec={eg.necessity:.2f}", fontsize=11)
     fig.tight_layout()
     viz_dir = os.path.join(out_dir, subdir); os.makedirs(viz_dir, exist_ok=True)
-    fig.savefig(os.path.join(viz_dir, f"{tag}.png"), dpi=90); plt.close(fig)
+    path = os.path.join(viz_dir, f"{tag}.png")
+    fig.savefig(path, dpi=90); plt.close(fig)
+    return path
 
 
 def main() -> None:

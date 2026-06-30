@@ -9,7 +9,7 @@ set -euo pipefail
 #
 # Examples:
 #   RUN_DIRS=eval_outputs/eagle_g0/qwen3vl-8b bash scripts/eagle_g0_viz.sh
-#   SELECT=low_iou_eagle PER_SUBSET=5 GPU=0 bash scripts/eagle_g0_viz.sh
+#   SELECTS=wrong,correct SPAN_MODES=answer,sentence PER_SUBSET=1 GPU=0 bash scripts/eagle_g0_viz.sh
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
@@ -28,6 +28,8 @@ else PY=(uv run python); fi
 
 OUTPUT_BASE="${OUTPUT_BASE:-eval_outputs/eagle_g0}"
 SELECT="${SELECT:-wrong}"
+SELECTS="${SELECTS:-$SELECT}"
+SPAN_MODES="${SPAN_MODES:-answer}"
 RANK_CONDITION="${RANK_CONDITION:-plain}"
 CONDITIONS="${CONDITIONS:-plain,hint}"
 PER_SUBSET="${PER_SUBSET:-3}"
@@ -37,7 +39,7 @@ OUTPUT_SUBDIR="${OUTPUT_SUBDIR:-}"
 EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-128}"
 EAGLE_IMAGE_SIZE="${EAGLE_IMAGE_SIZE:-}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
-ATTN="${ATTN:-}"
+ATTN="${ATTN:-sdpa}"
 WITH_SALR1="${WITH_SALR1:-0}"
 NO_USE_JUDGE="${NO_USE_JUDGE:-0}"
 
@@ -64,7 +66,8 @@ for d in "${run_dirs[@]}"; do
 
   args=(
     --run-dir "$d"
-    --select "$SELECT"
+    --selects "$SELECTS"
+    --span-modes "$SPAN_MODES"
     --rank-condition "$RANK_CONDITION"
     --conditions "$CONDITIONS"
     --per-subset "$PER_SUBSET"
@@ -79,6 +82,6 @@ for d in "${run_dirs[@]}"; do
   [[ "$WITH_SALR1" == "1" || "$WITH_SALR1" == "true" ]] && args+=(--with-salr1)
   [[ "$NO_USE_JUDGE" == "1" || "$NO_USE_JUDGE" == "true" ]] && args+=(--no-use-judge)
 
-  echo "[eagle_viz] rendering $d select=$SELECT per_subset=$PER_SUBSET conditions=$CONDITIONS"
+  echo "[eagle_viz] rendering $d selects=$SELECTS span_modes=$SPAN_MODES per_subset=$PER_SUBSET conditions=$CONDITIONS"
   "${PY[@]}" -m baseline.g0.viz_eagle_g0 "${args[@]}"
 done

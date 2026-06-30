@@ -8,8 +8,8 @@ Example:
 
     python -m baseline.g0.viz_eagle_g0 \
       --run-dir eval_outputs/eagle_g0/qwen3vl-2b-opd \
-      --select wrong --rank-condition plain --conditions plain,hint \
-      --per-subset 3
+      --selects wrong,correct --span-modes answer,sentence \
+      --rank-condition plain --conditions plain,hint --per-subset 1
 """
 
 from __future__ import annotations
@@ -170,6 +170,7 @@ def _viz_args_from_config(cfg: dict, cli: argparse.Namespace) -> Namespace:
         ns.max_new_tokens = cli.max_new_tokens
     if cli.attn is not None:
         ns.attn = cli.attn
+    ns.explain_span_mode = "answer"
     if not hasattr(ns, "sample"):
         ns.sample = False
     if not hasattr(ns, "temperature"):
@@ -185,6 +186,9 @@ def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Render selected post-hoc EAGLE-G0 visualizations.")
     ap.add_argument("--run-dir", required=True, help="One model directory under eval_outputs/eagle_g0.")
     ap.add_argument("--select", default="wrong", choices=sorted(SELECTORS))
+    ap.add_argument("--selects", default="", help="Comma list of selectors; overrides --select.")
+    ap.add_argument("--span-modes", default="answer",
+                    help="Comma list: answer,sentence. answer = boxed/last-K; sentence = whole completion.")
     ap.add_argument("--rank-condition", default="plain")
     ap.add_argument("--conditions", default="plain,hint", help="Conditions to render for each selected sample.")
     ap.add_argument("--subsets", default="", help="Optional comma list; default uses all subsets present in records.")
@@ -202,6 +206,36 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-new-tokens", type=int, default=None)
     ap.add_argument("--debug-mem", action="store_true")
     return ap.parse_args()
+
+
+def _split_csv(text: str) -> list[str]:
+    return [x.strip() for x in str(text).split(",") if x.strip()]
+
+
+def _resolve_selects(args: argparse.Namespace) -> list[str]:
+    selects = _split_csv(args.selects) if args.selects else [args.select]
+    bad = [s for s in selects if s not in SELECTORS]
+    if bad:
+        raise SystemExit(f"[eagle.viz] bad selector(s): {','.join(bad)}")
+    return list(dict.fromkeys(selects))
+
+
+def _resolve_span_modes(args: argparse.Namespace) -> list[str]:
+    modes = _split_csv(args.span_modes) or ["answer"]
+    bad = [m for m in modes if m not in {"answer", "sentence"}]
+    if bad:
+        raise SystemExit(f"[eagle.viz] bad span mode(s): {','.join(bad)}")
+    return list(dict.fromkeys(modes))
+
+
+def _subdir_name(base: str | None, select: str, span_mode: str, multi_span: bool) -> str:
+    if base:
+        if multi_span:
+            return f"{base}_{select}_{span_mode}"
+        return f"{base}_{select}"
+    if span_mode == "answer" and not multi_span:
+        return f"viz_{select}"
+    return f"viz_{select}_{span_mode}"
 
 
 def main() -> None:
@@ -223,14 +257,26 @@ def main() -> None:
         render_conditions = ["plain"] + render_conditions
 
     subset_filter = {canon_subset(s) for s in args.subsets.split(",") if s.strip()} or None
-    chosen = select_cases(
-        records, select=args.select, rank_condition=rank_condition, subsets=subset_filter,
-        per_subset=args.per_subset, max_cases=args.max_cases, seed=args.seed,
-    )
-    if not chosen:
-        raise SystemExit(f"[eagle.viz] no cases selected for {args.select}/{rank_condition}")
+    selects = _resolve_selects(args)
+    span_modes = _resolve_span_modes(args)
+    chosen_by_select: dict[str, list[dict]] = {}
+    for select in selects:
+        chosen = select_cases(
+            records, select=select, rank_condition=rank_condition, subsets=subset_filter,
+            per_subset=args.per_subset, max_cases=args.max_cases, seed=args.seed,
+        )
+        if not chosen:
+            print(f"[eagle.viz] WARNING: no cases selected for {select}/{rank_condition}")
+            continue
+        chosen_by_select[select] = chosen
+    if not chosen_by_select:
+        raise SystemExit(f"[eagle.viz] no cases selected for {','.join(selects)}/{rank_condition}")
 
-    keys = {(str(r["subset"]), str(r["sample_id"])) for r in chosen}
+    keys = {
+        (str(r["subset"]), str(r["sample_id"]))
+        for chosen in chosen_by_select.values()
+        for r in chosen
+    }
     samples = load_selected_samples(cfg, keys)
     missing = sorted({(canon_subset(subset), sample_id) for subset, sample_id in keys} - set(samples))
     if missing:
@@ -243,37 +289,55 @@ def main() -> None:
         min_pixels=getattr(ns, "min_pixels", None), max_pixels=getattr(ns, "max_pixels", None),
     )
 
-    subdir = args.output_subdir or f"viz_{args.select}"
+    explicit_subdir = args.output_subdir
+    multi_span = len(span_modes) > 1 or any(mode != "answer" for mode in span_modes)
     wrote = 0
-    for rec in chosen:
-        sample = samples.get((canon_subset(rec["subset"]), str(rec["sample_id"])))
-        if sample is None:
-            continue
-        plain_completion = None
-        for cond in render_conditions:
-            hint = cond == "hint"
-            reuse = plain_completion if (hint and ns.hint_mode == "score_plain_y") else None
-            try:
-                record, (eg, gl_res, lh_first, salr1_res), comp = run_condition(
-                    gm, sample, hint=hint, selected_heads=None, args=ns,
-                    want_viz=True, reuse_completion=reuse,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[eagle.viz] skip {sample.subset}/{sample.sample_id} {cond}: {exc}")
+    completion_cache: dict[tuple[str, str, str], tuple] = {}
+    output_dirs: set[str] = set()
+    for select, chosen in chosen_by_select.items():
+        for rec in chosen:
+            sample_key = (canon_subset(rec["subset"]), str(rec["sample_id"]))
+            sample = samples.get(sample_key)
+            if sample is None:
                 continue
-            if cond == "plain":
-                plain_completion = comp
-            save_viz(
-                args.run_dir, sample, eg, gl_res, lh_first,
-                tag=f"{sample.subset}_{sample.sample_id}_{cond}",
-                salr1_res=salr1_res, subdir=subdir,
-            )
-            print(f"[eagle.viz] wrote {sample.subset}/{sample.sample_id} {cond} "
-                  f"(correct={record['correct']}, IoU={record['iou_eagle']:.3f})")
-            wrote += 1
+            for cond in render_conditions:
+                hint = cond == "hint"
+                cache_key = (sample_key[0], sample_key[1], cond)
+                for span_mode in span_modes:
+                    ns.explain_span_mode = span_mode
+                    reuse = completion_cache.get(cache_key)
+                    if hint and ns.hint_mode == "score_plain_y":
+                        reuse = completion_cache.get((sample_key[0], sample_key[1], "plain"))
+                    try:
+                        record, (eg, gl_res, lh_first, salr1_res), comp = run_condition(
+                            gm, sample, hint=hint, selected_heads=None, args=ns,
+                            want_viz=True, reuse_completion=reuse,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[eagle.viz] skip {sample.subset}/{sample.sample_id} {cond}/{span_mode}: {exc}")
+                        continue
+                    if cache_key not in completion_cache and not (hint and ns.hint_mode == "score_plain_y"):
+                        completion_cache[cache_key] = comp
 
-    out_dir = os.path.join(args.run_dir, subdir)
-    print(f"[eagle.viz] wrote {wrote} PNG(s) -> {out_dir}/")
+                    subdir = _subdir_name(explicit_subdir, select, span_mode, multi_span)
+                    path = save_viz(
+                        args.run_dir, sample, eg, gl_res, lh_first,
+                        tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}",
+                        salr1_res=salr1_res, subdir=subdir,
+                    )
+                    out_dir = os.path.join(args.run_dir, subdir)
+                    output_dirs.add(out_dir)
+                    if path and os.path.exists(path):
+                        print(f"[eagle.viz] wrote {path} "
+                              f"(correct={record['correct']}, IoU={record['iou_eagle']:.3f})")
+                        wrote += 1
+                    else:
+                        print(f"[eagle.viz] WARNING: save_viz did not create a PNG for "
+                              f"{sample.subset}/{sample.sample_id} {cond}/{span_mode}")
+
+    for out_dir in sorted(output_dirs):
+        print(f"[eagle.viz] output -> {os.path.abspath(out_dir)}/")
+    print(f"[eagle.viz] wrote {wrote} PNG(s)")
 
 
 if __name__ == "__main__":
