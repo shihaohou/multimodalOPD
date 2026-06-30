@@ -39,6 +39,7 @@ class SaliencySample:
     solution: str
     image: Image.Image  # RGB
     bbox_norm: BoxNorm  # (x1, y1, x2, y2) in [0, 1]
+    image_source: Optional[str] = None
 
 
 def _to_pil(value: Any) -> Image.Image:
@@ -53,6 +54,15 @@ def _to_pil(value: Any) -> Image.Image:
     if isinstance(value, str) and value:
         return Image.open(value).convert("RGB")
     raise TypeError(f"Unsupported image field type for saliency-r1-8k: {type(value)!r}")
+
+
+def _image_source(value: Any) -> Optional[str]:
+    """Best-effort source path for an image field, if the dataset exposes one."""
+    if isinstance(value, dict) and value.get("path"):
+        return str(value["path"])
+    if isinstance(value, str) and value:
+        return value
+    return None
 
 
 def parse_bbox_norm(raw: Any) -> Optional[BoxNorm]:
@@ -238,9 +248,10 @@ def load_saliency_samples(
                 continue
         elif limit is not None and counts[subset] >= limit:
             continue
-        image = _to_pil(record.get("image"))
+        image_field = record.get("image")
+        image = _to_pil(image_field)
         sample_id = str(record.get("question_id", index))
-        samples.append(SaliencySample(sample_id, subset, problem, solution, image, bbox))
+        samples.append(SaliencySample(sample_id, subset, problem, solution, image, bbox, _image_source(image_field)))
         counts[subset] += 1
     summary = ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "(none)"
     shard_tag = f" [shard {shard_index}/{num_shards}]" if sharded else ""

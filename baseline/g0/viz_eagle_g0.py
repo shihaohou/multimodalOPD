@@ -28,11 +28,18 @@ if __package__ is None or __package__ == "":
 
 from baseline.g0.analyze_g0 import apply_judge, load_records
 from baseline.g0.engine import load_g0_model
-from baseline.g0.run_eagle_g0 import _condition_prompt, run_condition, save_eagle_artifacts, save_viz
+from baseline.g0.run_eagle_g0 import (
+    _condition_prompt,
+    run_condition,
+    save_eagle_artifacts,
+    save_viz,
+    save_viz_markdown,
+)
 from baseline.probe.saliency_data import (
     SaliencySample,
     _avoid_eager_image_decode,
     _load_hf_split,
+    _image_source,
     _to_pil,
     bbox_area,
     canon_subset,
@@ -149,7 +156,10 @@ def load_selected_samples(cfg: dict, keys: set[tuple[str, str]]) -> dict[tuple[s
         solution = str(record.get("solution", "")).strip()
         if not problem or not solution:
             continue
-        sample = SaliencySample(sample_id, subset, problem, solution, _to_pil(record.get("image")), bbox)
+        image_field = record.get("image")
+        sample = SaliencySample(
+            sample_id, subset, problem, solution, _to_pil(image_field), bbox, _image_source(image_field)
+        )
         out[(canon_subset(subset), sample_id)] = sample
         if len(out) == len(wanted):
             break
@@ -336,6 +346,11 @@ def main() -> None:
                         args.run_dir, sample, eg, gl_res, lh_first,
                         tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
                         salr1_res=salr1_res, subdir=subdir,
+                    )
+                    save_viz_markdown(
+                        args.run_dir, sample, record, eg,
+                        tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
+                        viz_path=path,
                     )
                     if ns.save_eagle_artifacts:
                         save_eagle_artifacts(

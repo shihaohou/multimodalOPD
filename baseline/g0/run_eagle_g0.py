@@ -46,6 +46,7 @@ from baseline.g0.engine import (
     HIDDEN_HINT_TEMPLATE,
     VISIBLE_HINT_TEMPLATE,
     build_inputs,
+    build_messages,
     generate_completion,
     grad_attention_forward,
     is_correct,
@@ -244,6 +245,8 @@ def run_condition(gm, sample, *, hint=False, condition=None, selected_heads=None
     bbox = sample.bbox_norm
     cond_name, hint_bbox, hint_template = _condition_prompt(condition or ("hint" if hint else "plain"), bbox)
     inputs = build_inputs(gm, sample.image, sample.problem, hint_bbox=hint_bbox, hint_template=hint_template)
+    prompt_messages = build_messages(sample.image, sample.problem, hint_bbox=hint_bbox, hint_template=hint_template)
+    prompt_text = gm.processor.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
     prompt_len = int(inputs["input_ids"].shape[1])
     if reuse_completion is not None:
         completion_ids, text = reuse_completion
@@ -340,7 +343,10 @@ def run_condition(gm, sample, *, hint=False, condition=None, selected_heads=None
         "eagle_pred_box": list(eg.pred_box_norm) if eg.pred_box_norm else None,
         # judge fields
         "question": sample.problem, "solution": sample.solution, "pred_boxed": pred_boxed,
-        "completion": text[:600],
+        "prompt": prompt_text,
+        "completion": text,
+        "completion_preview": text[:600],
+        "image_source": getattr(sample, "image_source", None),
     }
     record.update(grad)
     record.update(salr1)
@@ -501,6 +507,128 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
     return path
 
 
+def _md_text(value) -> str:
+    text = "" if value is None else str(value)
+    return text.replace("```", "'''")
+
+
+def _md_cell(value) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\n", "\\n").replace("\r", "\\r").replace("|", "\\|")
+    return text
+
+
+def _fmt_float(value) -> str:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{v:.4f}" if np.isfinite(v) else ""
+
+
+def save_viz_markdown(out_dir, sample, record, eg, tag, viz_path=None, subdir="viz_md"):
+    md_dir = os.path.join(out_dir, subdir)
+    img_dir = os.path.join(md_dir, "images")
+    os.makedirs(img_dir, exist_ok=True)
+    image_copy = os.path.join(img_dir, f"{tag}.png")
+    sample.image.convert("RGB").save(image_copy)
+    md_path = os.path.join(md_dir, f"{tag}.md")
+
+    image_source = getattr(sample, "image_source", None) or (record or {}).get("image_source")
+    response_tokens, response_scores = _token_plot_inputs(eg)
+    lines = [
+        f"# EAGLE Viz: {tag}",
+        "",
+        "## Files",
+        "",
+        f"- Heatmap PNG: `{os.path.abspath(viz_path) if viz_path else ''}`",
+        f"- Image source: `{image_source or ''}`",
+        f"- Image copy: `{os.path.abspath(image_copy)}`",
+        "",
+        "## Case",
+        "",
+        f"- Model: `{(record or {}).get('model', '')}`",
+        f"- Condition: `{(record or {}).get('condition', '')}`",
+        f"- Subset: `{sample.subset}`",
+        f"- Sample ID: `{sample.sample_id}`",
+        f"- Correct: `{(record or {}).get('correct', '')}`",
+        f"- GT bbox: `{(record or {}).get('gt_bbox', list(sample.bbox_norm))}`",
+        f"- Pred box: `{(record or {}).get('eagle_pred_box', '')}`",
+        f"- Target span mode: `{(record or {}).get('eagle_target_span_mode', '')}`",
+        f"- Target span: `{(record or {}).get('eagle_target_span', '')}`",
+        f"- Token map mode: `{(record or {}).get('eagle_token_mode', getattr(eg, 'token_map_mode', ''))}`",
+        f"- Token count: `{(record or {}).get('eagle_token_count', getattr(eg, 'token_map_count', ''))}`",
+        "",
+        "## Metrics",
+        "",
+        f"- IoU_EAGLE: `{_fmt_float((record or {}).get('iou_eagle'))}`",
+        f"- Pointing@1: `{_fmt_float((record or {}).get('pointing_at1'))}`",
+        f"- Energy-in-box: `{_fmt_float((record or {}).get('energy_in_box'))}`",
+        f"- IoU@top10: `{_fmt_float((record or {}).get('iou_top10'))}`",
+        f"- IoU@top20: `{_fmt_float((record or {}).get('iou_top20'))}`",
+        f"- Deletion drop@top20: `{_fmt_float((record or {}).get('deletion_logp_drop_top20'))}`",
+        f"- Insertion recovery@top20: `{_fmt_float((record or {}).get('insertion_logp_recovery_top20'))}`",
+        f"- Visual log lift: `{_fmt_float((record or {}).get('visual_log_lift'))}`",
+        "",
+        "## Question",
+        "",
+        "```text",
+        _md_text((record or {}).get("question", sample.problem)),
+        "```",
+        "",
+        "## Prompt",
+        "",
+        "```text",
+        _md_text((record or {}).get("prompt", "")),
+        "```",
+        "",
+        "## Ground Truth Answer",
+        "",
+        "```text",
+        _md_text((record or {}).get("solution", sample.solution)),
+        "```",
+        "",
+        "## Response",
+        "",
+        "```text",
+        _md_text((record or {}).get("completion", "")),
+        "```",
+        "",
+        "## Response Token Visual Reliance",
+        "",
+    ]
+    if response_tokens:
+        lines += [
+            "| idx | token | visual_log_lift |",
+            "|-----|-------|-----------------|",
+        ]
+        for idx, (tok, score) in enumerate(zip(response_tokens, response_scores)):
+            lines.append(f"| {idx} | `{_md_cell(tok)}` | {_fmt_float(score)} |")
+    else:
+        lines.append("(no token scores)")
+
+    details = getattr(eg, "token_details", None) or []
+    if details:
+        lines += [
+            "",
+            "## Per-token Details",
+            "",
+            "| token_index | token | visual_log_lift | visual_fraction | Point@1 | Energy | IoU@20 |",
+            "|-------------|-------|-----------------|-----------------|---------|--------|--------|",
+        ]
+        for d in details:
+            lines.append(
+                f"| {d.get('token_index', '')} | `{_md_cell(d.get('token_text', ''))}` | "
+                f"{_fmt_float(d.get('visual_log_lift'))} | {_fmt_float(d.get('visual_fraction'))} | "
+                f"{_fmt_float(d.get('pointing_at1'))} | {_fmt_float(d.get('energy_in_box'))} | "
+                f"{_fmt_float(d.get('iou_top20'))} |"
+            )
+
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return md_path
+
+
 def save_eagle_artifacts(out_dir, sample, eg, tag, subdir="eagle_artifacts"):
     art_dir = os.path.join(out_dir, subdir)
     os.makedirs(art_dir, exist_ok=True)
@@ -516,6 +644,9 @@ def save_eagle_artifacts(out_dir, sample, eg, tag, subdir="eagle_artifacts"):
         "token_details": eg.token_details,
         "response_tokens": response_tokens,
         "response_visual_log_lift": response_scores,
+        "question": sample.problem,
+        "solution": sample.solution,
+        "image_source": getattr(sample, "image_source", None),
         "metrics": {
             "iou_eagle": eg.iou_eagle,
             "pointing_at1": eg.pointing_at1,
@@ -639,8 +770,9 @@ def main() -> None:
                 n_done += 1
                 if want_viz:
                     tag = f"{sample.subset}_{sample.sample_id}_{cond}_{args.explain_span_mode}_{args.eagle_token_mode}"
-                    save_viz(args.output_dir, sample, eg, gl_res, lh_first,
-                             tag=tag, salr1_res=salr1_res)
+                    path = save_viz(args.output_dir, sample, eg, gl_res, lh_first,
+                                    tag=tag, salr1_res=salr1_res)
+                    save_viz_markdown(args.output_dir, sample, record, eg, tag, viz_path=path)
                     used_viz = True
                 if want_viz or args.save_eagle_artifacts:
                     tag = f"{sample.subset}_{sample.sample_id}_{cond}_{args.explain_span_mode}_{args.eagle_token_mode}"
