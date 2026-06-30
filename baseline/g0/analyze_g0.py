@@ -78,6 +78,37 @@ def load_head_stats(run_dir: str, tag: str) -> Optional[dict]:
         return json.load(f)
 
 
+def apply_judge(run_dir: str, records: list[dict]) -> int:
+    """Overlay ``judgments.jsonl`` (from :mod:`baseline.g0.judge_g0`) onto records.
+
+    Replaces each matched record's rule ``correct`` with the LLM ``correct_judge``
+    (the trustworthy correctness for the looking-vs-using correlations). Returns the
+    number of records overridden; 0 (with a warning) if there is no judgments file.
+    """
+    path = os.path.join(run_dir, "judgments.jsonl")
+    if not os.path.exists(path):
+        print(f"[g0.analyze] --use-judge but {path} not found — run baseline.g0.judge_g0 first. "
+              "Falling back to the rule grader.")
+        return 0
+    jmap: dict[tuple, bool] = {}
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            j = json.loads(line)
+            jmap[(j.get("model", ""), j.get("condition", ""), j.get("subset", ""), str(j.get("sample_id", "")))] = bool(
+                j.get("correct_judge", False))
+    n = 0
+    for r in records:
+        k = (r.get("model", ""), r.get("condition", ""), r.get("subset", ""), str(r.get("sample_id", "")))
+        if k in jmap:
+            r["correct"] = jmap[k]
+            n += 1
+    print(f"[g0.analyze] applied LLM judge to {n}/{len(records)} records (correct_judge overrides rule).")
+    return n
+
+
 # ------------------------------------------------------------------- stats utils
 def _vals(records, key, *, drop_nan=True) -> np.ndarray:
     arr = np.array([r[key] for r in records], dtype=np.float64)
@@ -160,10 +191,13 @@ def analysis_2_looking_vs_using(records_c3, *, iou_threshold=None, abs_iou_thres
         return {}
     iou = _vals(records_c3, iou_key, drop_nan=False)
     correct = np.array([float(r["correct"]) for r in records_c3])
-    vt = np.array([r["vt_ratio"] for r in records_c3], dtype=np.float64)
-    # Match the pointing key to the IoU variant (answer-span analysis must use the
-    # answer-span pointing, not the first-gen-step one).
-    pointing_key = "lh_answer_pointing" if iou_key == "iou_lh_answer" else "lh_pointing"
+    # Match the pointing + vt keys to the IoU variant so each looking-vs-using
+    # flavor is internally consistent (boxed IoU ↔ boxed pointing ↔ boxed vt).
+    _POINTING = {"iou_lh": "lh_pointing", "iou_lh_answer": "lh_answer_pointing", "iou_lh_boxed": "lh_boxed_pointing"}
+    _VT = {"iou_lh": "vt_ratio", "iou_lh_answer": "vt_ratio_answer", "iou_lh_boxed": "vt_ratio_boxed"}
+    pointing_key = _POINTING.get(iou_key, "lh_pointing")
+    vt_key = _VT.get(iou_key, "vt_ratio")
+    vt = np.array([r.get(vt_key, r.get("vt_ratio", float("nan"))) for r in records_c3], dtype=np.float64)
     pointing = np.array([float(r.get(pointing_key, 0.0)) for r in records_c3])
     right = correct >= 0.5
     n_wrong = int(np.sum(~right))
@@ -212,6 +246,35 @@ def analysis_2_looking_vs_using(records_c3, *, iou_threshold=None, abs_iou_thres
         res["verdict"] = (f"mixed / inconclusive (corr(correct,IoU_LH)={lc:+.2f}, "
                           f"corr(correct,vt)={uc:+.2f}) — inspect tables + answer-span variant")
     return res
+
+
+def looking_vs_using_by_subset(records_c3, *, iou_key="iou_lh_boxed", min_n=15) -> dict:
+    """Per-task-type (Visual-CoT subset) looking-vs-using on the student.
+
+    The G0 verdict can flip by task type (object/spatial vs OCR/doc), so we break
+    the key correlations down per subset. Subsets with < ``min_n`` samples are
+    reported but flagged (corr is noisy). Uses the boxed-span IoU by default.
+    """
+    if not records_c3:
+        return {}
+    by_sub: dict[str, list[dict]] = defaultdict(list)
+    for r in records_c3:
+        by_sub[r.get("subset", "?")].append(r)
+    out = {}
+    for sub, recs in sorted(by_sub.items()):
+        a = analysis_2_looking_vs_using(recs, iou_key=iou_key)
+        if not a:
+            continue
+        out[sub] = {
+            "n": a["n"],
+            "accuracy": a["accuracy"],
+            "corr_correct_iou_lh": a["corr_correct_iou_lh"],
+            "corr_correct_vt": a["corr_correct_vt"],
+            "looked_right_rate_abs": a.get("looked_right_rate_abs"),
+            "verdict_short": a["verdict"].split(":")[0],
+            "low_n": a["n"] < min_n,
+        }
+    return out
 
 
 # ------------------------------------------------- analysis 3: hint mechanism
@@ -360,9 +423,27 @@ def make_figures(run_dir, conds, a1, a2) -> None:
 
 
 # ------------------------------------------------------------------------ report
+def _render_lvu_compact(L: list, a: dict, label: str) -> None:
+    """Compact looking-vs-using block (headline corr + absolute 2x2 + verdict)."""
+    if not a:
+        return
+    t = a["tables"]["absolute"]
+    L.append(f"### looking-vs-using [{label}]  (n={a['n']}, acc={_fmt(a['accuracy'])})")
+    L.append(f"- corr(correct, IoU)={_fmt(a['corr_correct_iou_lh'])}, "
+             f"corr(correct, vt)={_fmt(a['corr_correct_vt'])}, "
+             f"median IoU={_fmt(a.get('median_iou'))}, looked-right@{_fmt(t['threshold'])}={_fmt(a.get('looked_right_rate_abs'))}")
+    L.append(f"- looked-right→correct {t['high_iou_correct']}/{t['high_iou_correct'] + t['high_iou_wrong']}, "
+             f"looked-wrong→correct {t['low_iou_correct']}/{t['low_iou_correct'] + t['low_iou_wrong']}")
+    L.append(f"- **verdict: {a['verdict']}**")
+    L.append("")
+
+
 def write_report(run_dir, analysis) -> None:
     a1, a2, a3, a4 = (analysis.get(k, {}) for k in ("head_usability", "looking_vs_using", "hint_mechanism", "gap"))
     L = ["# G0 grounding diagnostic — report", ""]
+    L.append(f"_correctness source: **{analysis.get('correctness_source', 'rule')}** · "
+             f"headline span: **{analysis.get('headline_span', 'first')}**_")
+    L.append("")
 
     L.append("## Analysis 1 — head usability (can attention localize at all?)")
     for tag in ("teacher", "student"):
@@ -404,6 +485,25 @@ def write_report(run_dir, analysis) -> None:
         L.append(f"- **verdict: {a2['verdict']}**")
         L.append("")
 
+    # Answer-span + boxed-span variants (boxed = the precise final answer; preferred).
+    _render_lvu_compact(L, analysis.get("looking_vs_using_answer", {}), "answer-span (last-K)")
+    _render_lvu_compact(L, analysis.get("looking_vs_using_boxed", {}), "boxed-span (\\boxed{}, PRIMARY)")
+
+    by_sub = analysis.get("looking_vs_using_by_subset", {})
+    if by_sub:
+        L.append(f"## Looking-vs-using by task type ({analysis.get('headline_span','first')}-span)")
+        L.append("")
+        L.append("| subset | n | acc | corr(c,IoU) | corr(c,vt) | look-right | verdict |")
+        L.append("|--------|---|-----|-------------|------------|-----------|---------|")
+        for sub, e in by_sub.items():
+            flag = " ⚠low-n" if e.get("low_n") else ""
+            L.append(f"| {sub}{flag} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['corr_correct_iou_lh'])} | "
+                     f"{_fmt(e['corr_correct_vt'])} | {_fmt(e.get('looked_right_rate_abs'))} | {e['verdict_short']} |")
+        L.append("")
+        L.append("_Object/spatial subsets (gqa/openimages/vsr/visual7w) vs OCR/doc (docvqa/textvqa/sroie) "
+                 "often give different verdicts — read this table, not just the pooled number._")
+        L.append("")
+
     if a3:
         L.append("## Analysis 3 — hint mechanism (C1 vs C2, paired)")
         L.append(f"- n_paired={a3['n_paired']}, Δaccuracy={_fmt(a3.get('delta_accuracy'))} "
@@ -428,7 +528,9 @@ def write_report(run_dir, analysis) -> None:
         L.append("")
 
     L.append("## Decision (G0 manual §7)")
-    L.append(_decision(a1, a2, a3))
+    # Prefer the boxed-span verdict (precise final answer) for the decision.
+    a2_primary = analysis.get("looking_vs_using_boxed") or analysis.get("looking_vs_using_answer") or a2
+    L.append(_decision(a1, a2_primary, a3))
     with open(os.path.join(run_dir, "report.md"), "w") as f:
         f.write("\n".join(L) + "\n")
 
@@ -463,9 +565,18 @@ def main() -> None:
     ap.add_argument("--abs-iou-threshold", type=float, default=0.30,
                     help="ABSOLUTE 'looked right' IoU bar (the verdict uses correlations, not this).")
     ap.add_argument("--no-figs", action="store_true", help="Skip figures (faster mid-run preview).")
+    ap.add_argument("--use-judge", action="store_true",
+                    help="Overlay judgments.jsonl (baseline.g0.judge_g0) — use LLM correct_judge "
+                         "instead of the rule grader for the correctness axis.")
+    ap.add_argument("--span", default="boxed", choices=["boxed", "answer", "first"],
+                    help="Which answer span drives the headline looking-vs-using + per-subset tables "
+                         "(boxed=\\boxed{} primary; answer=last-K; first=first-gen-step). All variants "
+                         "are still computed.")
     args = ap.parse_args()
 
     records = load_records(args.run_dir)
+    if args.use_judge:
+        apply_judge(args.run_dir, records)
     conds = by_condition(records)
     # Live progress line (handy when previewing a still-running sharded job).
     prog = " ".join(f"{c}={len(v)}" for c, v in sorted(conds.items()))
@@ -479,11 +590,24 @@ def main() -> None:
         "hint_mechanism": analysis_3_hint_mechanism(conds.get("c1", []), conds.get("c2", [])),
         "gap": analysis_4_gap(conds.get("c1", []), conds.get("c3", [])),
     }
-    # If answer-span LH was recorded (newer runs), also run the KEY analysis on it.
-    if any("iou_lh_answer" in r for r in conds.get("c3", [])):
+    c3 = conds.get("c3", [])
+    # If answer-span / boxed-span LH was recorded (newer runs), also run the KEY
+    # analysis on each — the verdict prefers the boxed span (precise final answer).
+    if any("iou_lh_answer" in r for r in c3):
         analysis["looking_vs_using_answer"] = analysis_2_looking_vs_using(
-            conds.get("c3", []), iou_threshold=args.iou_threshold,
+            c3, iou_threshold=args.iou_threshold,
             abs_iou_threshold=args.abs_iou_threshold, iou_key="iou_lh_answer")
+    if any("iou_lh_boxed" in r for r in c3):
+        analysis["looking_vs_using_boxed"] = analysis_2_looking_vs_using(
+            c3, iou_threshold=args.iou_threshold,
+            abs_iou_threshold=args.abs_iou_threshold, iou_key="iou_lh_boxed")
+    # Per-task-type (Visual-CoT subset) breakdown of the headline correlations.
+    span_iou_key = {"boxed": "iou_lh_boxed", "answer": "iou_lh_answer", "first": "iou_lh"}[args.span]
+    if not any(span_iou_key in r for r in c3):
+        span_iou_key = "iou_lh"
+    analysis["looking_vs_using_by_subset"] = looking_vs_using_by_subset(c3, iou_key=span_iou_key)
+    analysis["headline_span"] = args.span
+    analysis["correctness_source"] = "llm_judge" if args.use_judge else "rule"
     with open(os.path.join(args.run_dir, "analysis.json"), "w") as f:
         json.dump(analysis, f, indent=2)
     if not args.no_figs:
