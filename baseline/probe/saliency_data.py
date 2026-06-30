@@ -123,6 +123,23 @@ def _load_hf_split(dataset: str, split: str):
         raise
 
 
+def _avoid_eager_image_decode(data):
+    """Keep image rows as bytes/paths until a sample is actually selected.
+
+    This matters for global-limit sharding: workers may scan metadata for rows that
+    belong to another shard, and decoding every skipped image is pure overhead.
+    """
+    try:
+        from datasets import Image as HFImage
+
+        features = getattr(data, "features", {}) or {}
+        if "image" in features and isinstance(features["image"], HFImage):
+            return data.cast_column("image", HFImage(decode=False))
+    except Exception:
+        pass
+    return data
+
+
 def bbox_area(bbox: BoxNorm) -> float:
     x1, y1, x2, y2 = bbox
     return (x2 - x1) * (y2 - y1)
@@ -159,6 +176,7 @@ def load_saliency_samples(
     min_bbox_area: float | None = None,
     num_shards: int | None = None,
     shard_index: int = 0,
+    limit_before_shard: bool = False,
 ) -> list[SaliencySample]:
     """Load probe samples (those with a valid evidence bbox).
 
@@ -174,25 +192,28 @@ def load_saliency_samples(
     ``num_shards`` / ``shard_index`` stride the **raw dataset rows** (``index %
     num_shards == shard_index``) BEFORE the image is decoded, so N data-parallel
     workers each touch only 1/N of the images (no N× decode / RAM blow-up). With
-    ``limit`` set, the per-subset cap then applies *within each shard*; for a full
-    pass leave ``limit=None`` so the shards partition the data evenly.
+    ``limit`` set, the per-subset cap normally applies *within each shard*.
+
+    Set ``limit_before_shard=True`` to apply that cap globally first, then shard
+    the capped sample list. This is useful when launching multiple workers on the
+    same GPU: more shards increase parallelism without increasing total eval size.
     """
-    data = _load_hf_split(dataset, split)
+    data = _avoid_eager_image_decode(_load_hf_split(dataset, split))
     subset_filter = {canon_subset(s) for s in subsets} if subsets else None
     sharded = bool(num_shards and num_shards > 1)
+    global_cap = bool(sharded and limit_before_shard and limit is not None)
+    global_counts: Counter[str] = Counter()
     counts: Counter[str] = Counter()
     samples: list[SaliencySample] = []
     skipped_bbox = 0
     skipped_field = 0
     skipped_area = 0
     for index in range(len(data)):
-        if sharded and (index % num_shards) != shard_index:
+        if sharded and not global_cap and (index % num_shards) != shard_index:
             continue
         record = data[index]
         subset = str(record.get("dataset", "")).strip() or "unknown"
         if subset_filter is not None and canon_subset(subset) not in subset_filter:
-            continue
-        if limit is not None and counts[subset] >= limit:
             continue
         bbox = parse_bbox_norm(record.get("bbox"))
         if bbox is None:
@@ -208,6 +229,14 @@ def load_saliency_samples(
         solution = str(record.get("solution", "")).strip()
         if not problem or not solution:
             skipped_field += 1
+            continue
+        if global_cap:
+            if global_counts[subset] >= limit:
+                continue
+            global_counts[subset] += 1
+            if (index % num_shards) != shard_index:
+                continue
+        elif limit is not None and counts[subset] >= limit:
             continue
         image = _to_pil(record.get("image"))
         sample_id = str(record.get("question_id", index))

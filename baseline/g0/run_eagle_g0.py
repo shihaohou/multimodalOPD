@@ -57,6 +57,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--subsets", default="gqa,openimages,vsr,textvqa",
                    help="Task types (Visual-CoT subsets). Default = object/spatial/OCR signal set.")
     p.add_argument("--limit", type=int, default=50, help="Per-subset cap (EAGLE is expensive; keep small).")
+    p.add_argument("--limit-mode", default="per_shard", choices=["per_shard", "global"],
+                   help="per_shard keeps the historical behavior: LIMIT applies inside each shard. "
+                        "global applies LIMIT before sharding, so extra shards/workers split the same eval set.")
     p.add_argument("--conditions", default="plain,hint", help="plain (no hint) and/or hint (silent GT-box).")
     p.add_argument("--hint-mode", default="generate", choices=["generate", "score_plain_y"],
                    help="generate: the hint condition re-generates under the hint prompt (natural behavior). "
@@ -372,14 +375,16 @@ def main() -> None:
             max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area)
     calib_keys = {(s.subset, s.sample_id) for s in calib}
 
-    # Eval set: load with headroom for the calib drop, then re-cap per subset to
-    # args.limit so LIMIT is the EFFECTIVE eval cap (per shard) regardless of grad
-    # probes. Total across shards ≈ num_shards × LIMIT per subset.
+    # Eval set: load with headroom for the calib drop, then re-cap per subset.
+    # In per_shard mode, LIMIT is the effective cap inside each shard. In global
+    # mode, the loader caps before sharding, so increasing worker count does not
+    # increase total eval size.
     raw_limit = None if args.limit <= 0 else (args.limit + (args.calib_limit if args.grad_probes else 0))
     samples = load_saliency_samples(
         args.dataset, args.split, limit=raw_limit, subsets=subsets,
         max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area,
         num_shards=args.num_shards, shard_index=args.shard_index,
+        limit_before_shard=(args.limit_mode == "global"),
     )
     samples = [s for s in samples if (s.subset, s.sample_id) not in calib_keys]
     if args.limit > 0:
@@ -404,7 +409,7 @@ def main() -> None:
         selected_heads = stats.selected_heads
 
     print(f"[eagle_g0] model={name} shard {args.shard_index}/{args.num_shards}: {len(samples)} eval samples "
-          f"(≈{args.limit}/subset/shard), conditions={conditions}, hint_mode={args.hint_mode}, "
+          f"(limit={args.limit}/subset, mode={args.limit_mode}), conditions={conditions}, hint_mode={args.hint_mode}, "
           f"grad_probes={args.grad_probes}")
 
     rec_path = _records_path(args.output_dir, args.num_shards, args.shard_index)

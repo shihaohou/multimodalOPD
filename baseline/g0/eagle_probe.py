@@ -133,13 +133,29 @@ class G0EagleAdaptor:
             return [self._to_pil(im) for im in images], False
         return [self._to_pil(images)], True
 
+    def _process_images(self, pils):
+        image_processor = getattr(self.gm.processor, "image_processor", None)
+        if image_processor is not None:
+            try:
+                proc = image_processor(images=pils, return_tensors="pt")
+                if "pixel_values" in proc and "image_grid_thw" in proc:
+                    grid = proc["image_grid_thw"][0]
+                    merge = int(self.gm.parts.spatial_merge_size)
+                    got = int(grid[0]) * (int(grid[1]) // merge) * (int(grid[2]) // merge)
+                    return proc, got
+            except Exception:
+                pass
+
+        proc = self.gm.processor(text=[self.text] * len(pils), images=pils, return_tensors="pt")
+        got = int((proc["input_ids"] == self.image_token_id).sum()) // max(1, len(pils))
+        return proc, got
+
     @torch.no_grad()
     def __call__(self, images):
         pils, single = self._normalize(images)
         b = len(pils)
-        proc = self.gm.processor(text=[self.text] * b, images=pils, return_tensors="pt")
+        proc, got = self._process_images(pils)
         # Visual-token count must match the precomputed prompt's (same dims ⇒ it does).
-        got = int((proc["input_ids"] == self.image_token_id).sum()) // max(1, b)
         if got != self._n_img_tokens:
             raise ValueError(f"EAGLE adaptor: perturbed image yields {got} visual tokens, "
                              f"prompt expects {self._n_img_tokens} (resize/grid mismatch).")

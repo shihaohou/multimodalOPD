@@ -56,6 +56,7 @@ DTYPE="${DTYPE:-bfloat16}"
 MAX_PIXELS="${MAX_PIXELS:-602112}"                 # grad-probe (full-res) cap
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-192}"
 SEED="${SEED:-0}"
+LIMIT_MODE="${LIMIT_MODE:-per_shard}"              # per_shard | global
 
 # EAGLE cost levers
 EAGLE_IMAGE_SIZE="${EAGLE_IMAGE_SIZE:-448}"
@@ -74,22 +75,44 @@ SALR1_LAYERS="${SALR1_LAYERS:-all}"                # layers summed for SalR1 ('a
 SALR1_THINK_ROW_MODE="${SALR1_THINK_ROW_MODE:-state}"  # state | predictor (think-row ablation)
 CALIB_LIMIT="${CALIB_LIMIT:-30}"
 VIZ_PER_SUBSET="${VIZ_PER_SUBSET:-2}"
+WORKERS_PER_GPU="${WORKERS_PER_GPU:-1}"            # >1 duplicates model workers per listed GPU; use LIMIT_MODE=global
+if [[ -z "${ATTN:-}" ]]; then
+  if [[ "$GRAD_PROBES" == "1" || "$GRAD_PROBES" == "true" ]]; then
+    ATTN="eager"
+  else
+    ATTN="sdpa"
+  fi
+fi
 
 # judge (only used when SKIP_ANALYZE is empty AND JUDGE=1)
 JUDGE="${JUDGE:-}"
 JUDGE_API_URL="${JUDGE_API_URL:-http://localhost:8000/v1}"
 JUDGE_MODEL="${JUDGE_MODEL:-Qwen3-30B-A3B}"
 JUDGE_NO_THINK="${JUDGE_NO_THINK:-1}"
+JUDGE_WORKERS="${JUDGE_WORKERS:-16}"
 
-IFS=',' read -r -a GPU_ARR <<< "$GPUS"
+if ! [[ "$WORKERS_PER_GPU" =~ ^[1-9][0-9]*$ ]]; then
+  echo "[eagle_g0] WORKERS_PER_GPU must be a positive integer, got '$WORKERS_PER_GPU'." >&2
+  exit 1
+fi
+IFS=',' read -r -a BASE_GPU_ARR <<< "$GPUS"
+GPU_ARR=()
+for gpu in "${BASE_GPU_ARR[@]}"; do
+  for ((w = 0; w < WORKERS_PER_GPU; w++)); do
+    GPU_ARR+=("$gpu")
+  done
+done
 NUM_SHARDS="${#GPU_ARR[@]}"
 mkdir -p "$OUTPUT_DIR"
+if [[ "$WORKERS_PER_GPU" -gt 1 && "$LIMIT_MODE" != "global" ]]; then
+  echo "[eagle_g0] WARNING: WORKERS_PER_GPU=$WORKERS_PER_GPU with LIMIT_MODE=$LIMIT_MODE increases total eval samples. Use LIMIT_MODE=global to split the same capped set." >&2
+fi
 
 common_flags=(
   --model "$MODEL" --model-name "$MODEL_NAME" --output-dir "$OUTPUT_DIR"
-  --dataset "$DATASET" --split "$SPLIT" --subsets "$SUBSETS" --limit "$LIMIT"
+  --dataset "$DATASET" --split "$SPLIT" --subsets "$SUBSETS" --limit "$LIMIT" --limit-mode "$LIMIT_MODE"
   --conditions "$CONDITIONS" --hint-mode "$HINT_MODE" --max-bbox-area "$MAX_BBOX_AREA"
-  --dtype "$DTYPE" --max-pixels "$MAX_PIXELS" --max-new-tokens "$MAX_NEW_TOKENS" --seed "$SEED"
+  --attn "$ATTN" --dtype "$DTYPE" --max-pixels "$MAX_PIXELS" --max-new-tokens "$MAX_NEW_TOKENS" --seed "$SEED"
   --eagle-image-size "$EAGLE_IMAGE_SIZE" --n-regions "$N_REGIONS"
   --search-scope "$SEARCH_SCOPE" --pending-samples "$PENDING_SAMPLES" --update-step "$UPDATE_STEP"
   --eagle-batch-size "$EAGLE_BATCH_SIZE" --region-mode "$REGION_MODE" --answer-tokens "$ANSWER_TOKENS"
@@ -100,7 +123,7 @@ common_flags=(
 [[ "$GRAD_PROBES" == "1" || "$GRAD_PROBES" == "true" ]] || common_flags+=(--no-grad-probes)
 [[ "$SALR1" == "1" || "$SALR1" == "true" ]] || common_flags+=(--no-salr1)
 
-echo "[eagle_g0] model=$MODEL_NAME gpus=$GPUS shards=$NUM_SHARDS conditions=$CONDITIONS out=$OUTPUT_DIR"
+echo "[eagle_g0] model=$MODEL_NAME gpus=$GPUS workers_per_gpu=$WORKERS_PER_GPU shards=$NUM_SHARDS attn=$ATTN limit_mode=$LIMIT_MODE conditions=$CONDITIONS out=$OUTPUT_DIR"
 pids=()
 for ((i = 0; i < NUM_SHARDS; i++)); do
   gpu="${GPU_ARR[$i]}"
@@ -120,6 +143,7 @@ if [[ -z "$SKIP_ANALYZE" ]]; then
     echo "[eagle_g0] LLM-judge ..."
     JFLAGS=(--run-dir "$OUTPUT_DIR" --judge-api-url "$JUDGE_API_URL" --judge-model "$JUDGE_MODEL")
     [[ "$JUDGE_NO_THINK" == "1" || "$JUDGE_NO_THINK" == "true" ]] && JFLAGS+=(--judge-no-think)
+    JFLAGS+=(--judge-workers "$JUDGE_WORKERS")
     "${PY[@]}" -m baseline.g0.judge_g0 "${JFLAGS[@]}" || echo "[eagle_g0] judge failed; continuing with rule grader."
     "${PY[@]}" -m baseline.g0.analyze_eagle_g0 --run-dirs "$OUTPUT_DIR" --use-judge
   else
