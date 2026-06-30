@@ -144,6 +144,8 @@ def table1_region_accuracy(by_model) -> dict:
             "visual_log_lift": _mean(p, "visual_log_lift"),
             "iou_lh": _mean(p, "iou_lh") if any("iou_lh" in r for r in p) else None,
             "iou_lh_boxed": _mean(p, "iou_lh_boxed") if any("iou_lh_boxed" in r for r in p) else None,
+            "salr1_mass_gt": _mean(p, "salr1_mass_gt") if any("salr1_mass_gt" in r for r in p) else None,
+            "salr1_iou_top20": _mean(p, "salr1_iou_top20") if any("salr1_iou_top20" in r for r in p) else None,
         }
     return out
 
@@ -158,6 +160,9 @@ def table2_looking_vs_using(recs, *, min_n=10) -> dict:
     vfrac = np.array([r.get("visual_fraction", np.nan) for r in p], dtype=np.float64)
     vrel = np.array([r.get("visual_reliance", np.nan) for r in p], dtype=np.float64)
     vlog = np.array([r.get("visual_log_lift", np.nan) for r in p], dtype=np.float64)
+    # Saliency-R1 cross-check: does the salr1 localization metric track correctness?
+    salm = np.array([r.get("salr1_mass_gt", np.nan) for r in p], dtype=np.float64)
+    saliou = np.array([r.get("salr1_iou_top20", np.nan) for r in p], dtype=np.float64)
     m = ~np.isnan(vfrac)
     ml = ~np.isnan(vlog)
     lc = safe_corr(iou, correct)
@@ -172,6 +177,9 @@ def table2_looking_vs_using(recs, *, min_n=10) -> dict:
         "corr_correct_visual_fraction": uc,
         "corr_correct_visual_log_lift": ulc,
         "corr_correct_visual_reliance": safe_corr(vrel[~np.isnan(vrel)], correct[~np.isnan(vrel)]),
+        # Saliency-R1 cross-check (secondary baseline): a localization metric.
+        "corr_correct_salr1_mass": safe_corr(salm[~np.isnan(salm)], correct[~np.isnan(salm)]),
+        "corr_correct_salr1_iou": safe_corr(saliou[~np.isnan(saliou)], correct[~np.isnan(saliou)]),
         "mean_iou_eagle_right": float(iou[correct >= 0.5].mean()) if (correct >= 0.5).any() else float("nan"),
         "mean_iou_eagle_wrong": float(iou[correct < 0.5].mean()) if (correct < 0.5).any() else float("nan"),
         "mean_vlog_right": float(np.nanmean(vlog[correct >= 0.5])) if (correct >= 0.5).any() else float("nan"),
@@ -302,15 +310,17 @@ def write_report(out_dir, analysis) -> None:
     if t1:
         L.append("## Table 1 — region accuracy (plain)")
         L.append("")
-        L.append("| model | n | acc | IoU_EAGLE | point | area | suff | nec | vis_frac | IoU_LH | IoU_LH_boxed |")
-        L.append("|-------|---|-----|-----------|-------|------|------|-----|----------|--------|--------------|")
+        L.append("| model | n | acc | IoU_EAGLE | point | area | suff | nec | vis_frac | IoU_LH | IoU_LH_boxed | SalR1_mass | SalR1_IoU |")
+        L.append("|-------|---|-----|-----------|-------|------|------|-----|----------|--------|--------------|------------|-----------|")
         for m, e in t1.items():
             L.append(f"| {m} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['iou_eagle'])} | {_fmt(e['pointing_eagle'])} | "
                      f"{_fmt(e['area_eagle'])} | {_fmt(e['sufficiency'])} | {_fmt(e['necessity'])} | "
-                     f"{_fmt(e['visual_fraction'])} | {_fmt(e['iou_lh'])} | {_fmt(e['iou_lh_boxed'])} |")
+                     f"{_fmt(e['visual_fraction'])} | {_fmt(e['iou_lh'])} | {_fmt(e['iou_lh_boxed'])} | "
+                     f"{_fmt(e.get('salr1_mass_gt'))} | {_fmt(e.get('salr1_iou_top20'))} |")
         L.append("")
         L.append("_IoU_EAGLE ≫ IoU_LH ⇒ LH attention under-measured localization (causal region is better). "
-                 "sufficiency=insertion AUC (↑ better), necessity=deletion AUC (↓ ⇒ region is necessary)._")
+                 "sufficiency=insertion AUC (↑ better), necessity=deletion AUC (↓ ⇒ region is necessary). "
+                 "SalR1 = Saliency-R1 map (mass@GT / top-20% IoU) — secondary attribution baseline._")
         L.append("")
 
     ga = analysis.get("group_averages", {})
@@ -353,6 +363,19 @@ def write_report(out_dir, analysis) -> None:
         for m, a in t2.items():
             L.append(f"- **{m}**: {a['verdict']}")
         L.append("")
+        # Saliency-R1 cross-check: does the secondary map agree on the looking axis?
+        if any(a.get("corr_correct_salr1_mass") == a.get("corr_correct_salr1_mass") for a in t2.values()):
+            L.append("**Saliency-R1 cross-check** (does the secondary map agree the looking axis is flat?):")
+            L.append("")
+            L.append("| model | corr(c,IoU_EAGLE) | corr(c,SalR1_mass) | corr(c,SalR1_IoU) | corr(c,vlog) |")
+            L.append("|-------|-------------------|--------------------|-------------------|--------------|")
+            for m, a in t2.items():
+                L.append(f"| {m} | {_fmt(a['corr_correct_iou_eagle'])} | {_fmt(a.get('corr_correct_salr1_mass'))} | "
+                         f"{_fmt(a.get('corr_correct_salr1_iou'))} | {_fmt(a['corr_correct_visual_log_lift'])} |")
+            L.append("")
+            L.append("_If EAGLE and Saliency-R1 both show localization corr≈0 while the reliance/log-lift corr is "
+                     "positive, the 'using-bottleneck' verdict is robust to the attribution method (not an LH artifact)._")
+            L.append("")
 
     t2s = analysis.get("table2_by_subset", {})
     if t2s:

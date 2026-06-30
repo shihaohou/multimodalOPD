@@ -213,3 +213,20 @@ looking-vs-using via `corr(correct, iou_eagle)` vs `corr(correct, visual_fractio
 hint mechanism plain-vs-hint; OPD/hint training ↑ image-reliance) + per-task-type.
 Region division degrades gracefully: SLICO → skimage SLIC → numpy grid, so it runs
 without `opencv-contrib`.
+
+### Saliency-R1 — secondary attribution baseline (`salr1`)
+
+EAGLE is the causal arbiter; **Saliency-R1** (CVPR'26, arXiv 2604.04500) is a
+cheaper *value-weighted logit-lens routed through the thinking bottleneck* — the
+exact map its alignment-reward optimizes, reimplemented for Qwen3-VL in
+`salr1_probe.py` from **one eager teacher-forcing forward** (a `v_proj` forward-hook
+grabs value states; no patched `transformers`). `run_eagle_g0` computes it by
+default (`SALR1=1`, `--no-salr1` to disable) on the same rollout, recording
+`salr1_mass_gt` (the paper's reward, with its `y2` height/width bug fixed),
+`salr1_pointing`, `salr1_iou_top20/30`, and the **signed** `salr1_{neg,abs}_mass_gt`
+(image-OPPOSES vs |contribution| — the OPD signed-VD intuition the official
+ReLU-only reward discards). `analyze_eagle_g0` adds it to Table 1 and a
+**cross-check** table: if EAGLE *and* Saliency-R1 both show localization corr≈0 while
+reliance/log-lift corr is positive, the using-bottleneck verdict is robust to the
+attribution method (not an LH artifact). It is a *baseline*, not the judge — when
+EAGLE and Saliency-R1 disagree, trust EAGLE (causal > direct-contribution).

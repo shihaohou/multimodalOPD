@@ -40,6 +40,7 @@ import torch
 from baseline.g0 import eagle_probe as eagle_mod
 from baseline.g0 import glimpse as glimpse_mod
 from baseline.g0 import localization_heads as lh_mod
+from baseline.g0 import salr1_probe as salr1_mod
 from baseline.g0.answer_spans import resolve_answer_spans, span_predictor_rows
 from baseline.g0.engine import build_inputs, generate_completion, grad_attention_forward, is_correct, load_g0_model, visual_grid
 from baseline.g0.run_g0 import _json_safe, resolve_glimpse_layers, save_head_stats
@@ -93,6 +94,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-probes", dest="grad_probes", action="store_true", default=True,
                    help="Also compute LH + GLIMPSE (default ON) → EAGLE-vs-LH comparison.")
     p.add_argument("--no-grad-probes", dest="grad_probes", action="store_false")
+    p.add_argument("--salr1", dest="salr1", action="store_true", default=True,
+                   help="Also compute the Saliency-R1 map (default ON) — secondary attribution baseline.")
+    p.add_argument("--no-salr1", dest="salr1", action="store_false")
     p.add_argument("--calib-limit", type=int, default=30, help="Per-subset LH head-calibration cap.")
     p.add_argument("--top-k-heads", type=int, default=3)
     p.add_argument("--min-layer", type=int, default=2)
@@ -141,6 +145,39 @@ def grad_probe_block(gm, inputs, full_ids, prompt_len, completion_ids, bbox, spa
     return d, gl, lh_first, lh_boxed
 
 
+@torch.no_grad()
+def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, spans, args, want_viz):
+    """Saliency-R1 holistic/direct map (signed) on the rollout. Returns (dict, Salr1Result|None).
+
+    Its own no-grad eager forward (output_attentions + output_hidden_states) with a
+    v_proj hook for value states — independent of the grad probes / GRAD_PROBES.
+    """
+    from baseline.g0.engine import _forward_kwargs
+
+    visual_positions, grid_hw = visual_grid(gm, full_ids, inputs["image_grid_thw"])
+    think_span = salr1_mod.parse_think_span(text, completion_ids, gm.tokenizer)
+    layers = resolve_glimpse_layers(args.glimpse_layers, gm.num_layers)
+    kwargs = _forward_kwargs(inputs, full_ids)
+    kwargs["output_hidden_states"] = True
+    with salr1_mod._capture_value_states(gm) as values:
+        out = gm.model(**kwargs)
+    res = salr1_mod.salr1_probe(
+        gm, out, values, visual_positions=visual_positions, grid_hw=grid_hw,
+        prompt_len=prompt_len, completion_ids=completion_ids, bbox=bbox,
+        answer_span=spans.primary, think_span=think_span, layers=layers, keep_map=want_viz,
+    )
+    del out, values
+    d = {
+        "salr1_span_mode": res.span_mode,
+        "salr1_mass_gt": res.pos["mass_gt"], "salr1_pointing": res.pos["pointing"],
+        "salr1_iou_top20": res.pos["iou_top20"], "salr1_iou_top30": res.pos["iou_top30"],
+        "salr1_area_top20": res.pos["area_top20"], "salr1_entropy": res.pos["entropy"],
+        "salr1_neg_mass_gt": res.neg["mass_gt"], "salr1_abs_mass_gt": res.abs["mass_gt"],
+        "salr1_abs_iou_top20": res.abs["iou_top20"],
+    }
+    return d, res
+
+
 def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_completion=None):
     """One (sample, condition) → (record, viz_handles, (completion_ids, text)).
 
@@ -177,6 +214,15 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
         grad, gl_res, lh_first, lh_boxed = grad_probe_block(
             gm, inputs, full_ids, prompt_len, completion_ids, bbox, spans, selected_heads, args, want_viz)
 
+    salr1 = {}
+    salr1_res = None
+    if args.salr1:
+        try:
+            salr1, salr1_res = salr1_block(
+                gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, spans, args, want_viz)
+        except Exception as exc:  # don't let a salr1 hiccup sink the whole sample
+            print(f"[eagle_g0] salr1 skip {sample.subset}/{sample.sample_id}: {exc}")
+
     eg = eagle_mod.eagle_probe(
         gm, sample.image, sample.problem, bbox, completion_ids,
         hint_bbox=bbox if hint else None, boxed_span=spans.primary, answer_k=args.answer_tokens,
@@ -207,11 +253,12 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
         "completion": text[:600],
     }
     record.update(grad)
-    return record, (eg, gl_res, lh_first), (completion_ids.detach().cpu(), text)
+    record.update(salr1)
+    return record, (eg, gl_res, lh_first, salr1_res), (completion_ids.detach().cpu(), text)
 
 
-def save_viz(out_dir, sample, eg, gl_res, lh_first, tag):
-    """Panels: image+GT · EAGLE heatmap · EAGLE keep · EAGLE masked · GLIMPSE(answer) · LH.
+def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None):
+    """Panels: image+GT · EAGLE heatmap · EAGLE keep · EAGLE masked · GLIMPSE(answer) · LH · Saliency-R1.
 
     GT box drawn green, predicted box red. "keep"/"masked" show the model's view
     if only the important region were kept / removed (EAGLE's causal region)."""
@@ -234,6 +281,8 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag):
         heat_panels.append(("GLIMPSE (answer)", gl_res.visual_map_boxed, None))
     if lh_first is not None and getattr(lh_first, "assembled_map", None) is not None:
         heat_panels.append(("LH (first-step)", lh_first.assembled_map, lh_first.pred_box_norm))
+    if salr1_res is not None and getattr(salr1_res, "pos_map", None) is not None:
+        heat_panels.append((f"Saliency-R1 ({salr1_res.span_mode})", salr1_res.pos_map, None))
 
     # EAGLE keep / masked images (resize the downsized region mask to image size).
     keep_arr = masked_arr = None
@@ -343,7 +392,7 @@ def main() -> None:
                 hint = cond == "hint"
                 reuse = plain_completion if (hint and args.hint_mode == "score_plain_y") else None
                 try:
-                    record, (eg, gl_res, lh_first), comp = run_condition(
+                    record, (eg, gl_res, lh_first, salr1_res), comp = run_condition(
                         gm, sample, hint=hint, selected_heads=selected_heads, args=args,
                         want_viz=want_viz, reuse_completion=reuse)
                 except Exception as exc:
@@ -358,7 +407,7 @@ def main() -> None:
                 n_done += 1
                 if want_viz:
                     save_viz(args.output_dir, sample, eg, gl_res, lh_first,
-                             tag=f"{sample.subset}_{sample.sample_id}_{cond}")
+                             tag=f"{sample.subset}_{sample.sample_id}_{cond}", salr1_res=salr1_res)
                     used_viz = True
             if used_viz:
                 viz_count[sample.subset] = viz_count.get(sample.subset, 0) + 1

@@ -66,6 +66,7 @@ EAGLE_THRESHOLD="${EAGLE_THRESHOLD:-mean}"         # mean|top_frac — DO a sens
 EAGLE_TOP_FRAC="${EAGLE_TOP_FRAC:-0.25}"
 ANSWER_TOKENS="${ANSWER_TOKENS:-8}"
 GRAD_PROBES="${GRAD_PROBES:-1}"                    # 1 = also run LH+GLIMPSE (EAGLE-vs-LH); 0 = EAGLE only (cleaner n, faster)
+SALR1="${SALR1:-1}"                                # 1 = also compute Saliency-R1 map (secondary baseline); 0 = off
 CALIB_LIMIT="${CALIB_LIMIT:-30}"
 VIZ_PER_SUBSET="${VIZ_PER_SUBSET:-2}"
 
@@ -91,6 +92,7 @@ common_flags=(
   --calib-limit "$CALIB_LIMIT" --viz-per-subset "$VIZ_PER_SUBSET"
 )
 [[ "$GRAD_PROBES" == "1" || "$GRAD_PROBES" == "true" ]] || common_flags+=(--no-grad-probes)
+[[ "$SALR1" == "1" || "$SALR1" == "true" ]] || common_flags+=(--no-salr1)
 
 echo "[eagle_g0] model=$MODEL_NAME gpus=$GPUS shards=$NUM_SHARDS conditions=$CONDITIONS out=$OUTPUT_DIR"
 pids=()

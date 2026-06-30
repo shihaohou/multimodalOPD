@@ -55,6 +55,7 @@ export EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-8}"
 export EAGLE_THRESHOLD="${EAGLE_THRESHOLD:-mean}"  # run again with top_frac for a sensitivity check
 export EAGLE_TOP_FRAC="${EAGLE_TOP_FRAC:-0.25}"
 export GRAD_PROBES="${GRAD_PROBES:-1}"
+export SALR1="${SALR1:-1}"                         # Saliency-R1 secondary attribution baseline
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-192}"
 
 JUDGE="${JUDGE:-}"
