@@ -42,8 +42,11 @@ GPU_GROUPS="${GPU_GROUPS:-0,1;2,3;4;5;6,7}"
 
 # pass-through knobs
 export DATASET="${DATASET:-${D:+$D/saliency-r1-8k}}"; export DATASET="${DATASET:-peterant330/saliency-r1-8k}"
-export SUBSETS="${SUBSETS-gqa,openimages,vsr,textvqa}"
-export LIMIT="${LIMIT:-50}"
+# Default = ALL 10 saliency-r1-8k subsets (flickr30k/gqa/openimages/docvqa/textcap/
+# v7w/textvqa/infographicsvqa/cub/vsr). Free-form ones (flickr30k/textcap/v7w) need
+# the LLM judge — keep JUDGE=1. Override e.g. SUBSETS=gqa,openimages,v7w,vsr,textvqa.
+export SUBSETS="${SUBSETS-}"
+export LIMIT="${LIMIT:-60}"
 export CONDITIONS="${CONDITIONS:-plain,hint}"
 export HINT_MODE="${HINT_MODE:-generate}"          # generate | score_plain_y (OPD-faithful table 3)
 export EAGLE_IMAGE_SIZE="${EAGLE_IMAGE_SIZE:-448}"

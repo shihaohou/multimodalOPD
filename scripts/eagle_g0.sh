@@ -40,10 +40,10 @@ if [[ "$HF_HUB_OFFLINE" == "1" && "$DATASET" != /* && ! -d "$DATASET" ]]; then
   echo "[eagle_g0] HF_HUB_OFFLINE=1 but DATASET is not a local dir: '$DATASET'. Pass DATASET=\$D/saliency-r1-8k." >&2
   exit 1
 fi
-SUBSETS="${SUBSETS-gqa,openimages,vsr,textvqa}"   # single-dash: ""=all subsets
+SUBSETS="${SUBSETS-gqa,openimages,vsr,textvqa}"   # single-dash: ""=all 10 subsets
 # LIMIT = EFFECTIVE per-subset eval cap PER SHARD (calib hold-out already accounted
 # for). Total ≈ (#GPUs in $GPUS) × LIMIT per subset.
-LIMIT="${LIMIT:-50}"
+LIMIT="${LIMIT:-60}"
 CONDITIONS="${CONDITIONS:-plain,hint}"            # plain (no hint) and/or hint (silent GT-box)
 HINT_MODE="${HINT_MODE:-generate}"                # generate | score_plain_y (OPD-faithful: rescore plain rollout)
 MAX_BBOX_AREA="${MAX_BBOX_AREA:-0.5}"

@@ -60,6 +60,70 @@ def _plain(recs):
     return [r for r in recs if r.get("condition", "plain") == "plain"]
 
 
+# Canonical subset groups (saliency-r1-8k = Visual-CoT sources). PRIMARY = the
+# local-evidence subsets where "looking" is meaningful (object/spatial + scene text);
+# the rest are OCR/doc/caption controls. The user asked for a first-5 average and an
+# all-10 average — these define the first-5.
+PRIMARY5 = ["gqa", "openimages", "v7w", "textvqa", "vsr"]
+from baseline.probe.saliency_data import canon_subset  # noqa: E402
+
+
+def _group_subsets(by_sub: dict, which: str) -> list[str]:
+    """Subset names present in ``by_sub`` belonging to a group ('primary5'|'all')."""
+    if which == "all":
+        return sorted(by_sub)
+    prim = {canon_subset(s) for s in PRIMARY5}
+    return sorted(s for s in by_sub if canon_subset(s) in prim)
+
+
+def _pooled_and_macro(recs, subset_names, metrics) -> dict:
+    """Two averages over a group of subsets, per metric.
+
+    * **pooled** = mean over all records in the group (size-weighted — dominated by
+      big subsets like gqa/flickr30k).
+    * **macro**  = mean over per-subset means (each subset counts equally — the
+      right "average across task types" when sizes differ 25× across subsets).
+    """
+    p = _plain(recs)
+    in_group = [r for r in p if r.get("subset") in subset_names]
+    by_sub = defaultdict(list)
+    for r in in_group:
+        by_sub[r["subset"]].append(r)
+    out = {"subsets": sorted(by_sub), "n_subsets": len(by_sub), "n": len(in_group)}
+    for m in metrics:
+        pooled = _mean(in_group, m) if m != "accuracy" else (
+            float(np.mean([r["correct"] for r in in_group])) if in_group else float("nan"))
+        per_sub = []
+        for s, rs in by_sub.items():
+            v = (float(np.mean([r["correct"] for r in rs])) if m == "accuracy" else _mean(rs, m))
+            if v == v:  # not NaN
+                per_sub.append(v)
+        macro = float(np.mean(per_sub)) if per_sub else float("nan")
+        out[f"{m}_pooled"] = pooled
+        out[f"{m}_macro"] = macro
+    return out
+
+
+_AVG_METRICS = ["accuracy", "iou_eagle", "pointing_eagle", "visual_reliance",
+                "visual_log_lift", "visual_fraction", "sufficiency", "necessity"]
+
+
+def group_averages(by_model) -> dict:
+    """Per-model first-5 (primary) and all-10 averages (pooled + macro)."""
+    out = {}
+    for model, recs in by_model.items():
+        by_sub = defaultdict(list)
+        for r in _plain(recs):
+            by_sub[r.get("subset", "?")].append(r)
+        if not by_sub:
+            continue
+        out[model] = {
+            "primary5": _pooled_and_macro(recs, _group_subsets(by_sub, "primary5"), _AVG_METRICS),
+            "all": _pooled_and_macro(recs, _group_subsets(by_sub, "all"), _AVG_METRICS),
+        }
+    return out
+
+
 # --------------------------------------------------- table 1: region accuracy
 def table1_region_accuracy(by_model) -> dict:
     out = {}
@@ -249,6 +313,32 @@ def write_report(out_dir, analysis) -> None:
                  "sufficiency=insertion AUC (↑ better), necessity=deletion AUC (↓ ⇒ region is necessary)._")
         L.append("")
 
+    ga = analysis.get("group_averages", {})
+    if ga:
+        L.append("## Group averages (plain) — first-5 (primary local-evidence) vs all-10")
+        L.append("")
+        L.append("_macro = mean over per-subset means (each task type counts equally); "
+                 "pooled = size-weighted mean over records (dominated by big subsets gqa/flickr30k). "
+                 "**Prefer macro** — subset sizes differ ~25× (gqa 1765 vs vsr 70)._")
+        L.append("")
+        for grp, label in (("primary5", "first-5 (gqa/openimages/v7w/textvqa/vsr)"), ("all", "all-10")):
+            L.append(f"### {label} average")
+            L.append("")
+            L.append("| model | #sub | n | acc | IoU_EAGLE | point | vis_log_lift | vis_reliance | suff | nec |")
+            L.append("|-------|------|---|-----|-----------|-------|--------------|--------------|------|-----|")
+            for m, e in ga.items():
+                g = e.get(grp)
+                if not g or not g.get("n"):
+                    continue
+                def mm(metric):  # "macro (pooled)"
+                    return f"{_fmt(g.get(metric + '_macro'))} ({_fmt(g.get(metric + '_pooled'))})"
+                L.append(f"| {m} | {g['n_subsets']} | {g['n']} | {mm('accuracy')} | {mm('iou_eagle')} | "
+                         f"{mm('pointing_eagle')} | {mm('visual_log_lift')} | {mm('visual_reliance')} | "
+                         f"{mm('sufficiency')} | {mm('necessity')} |")
+            L.append("")
+        L.append("_cells are `macro (pooled)`._")
+        L.append("")
+
     t2 = analysis.get("table2_looking_vs_using", {})
     if t2:
         L.append("## Table 2 — looking vs using (per model, plain)")
@@ -333,6 +423,7 @@ def main() -> None:
         "models": sorted(by_model),
         "correctness_source": "llm_judge" if args.use_judge else "rule",
         "table1_region_accuracy": table1_region_accuracy(by_model),
+        "group_averages": group_averages(by_model),
         "table2_looking_vs_using": {m: table2_looking_vs_using(recs) for m, recs in by_model.items()},
         "table2_by_subset": {m: table2_by_subset(recs) for m, recs in by_model.items()},
         "table3_hint_mechanism": {m: table3_hint_mechanism(recs) for m, recs in by_model.items()
