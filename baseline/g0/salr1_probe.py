@@ -240,17 +240,20 @@ def _answer_logit_lens(
         sv = sv.permute(0, 2, 1, 3).reshape(A, P, -1)  # [A,P,H*d]
         contrib = text.layers[l].self_attn.o_proj(sv)  # [A,P,d_model]
         acc = contrib if acc is None else acc + contrib
+        del a, V, Vv, agg, sv, contrib  # free per-layer GPU tensors immediately
 
-    # norm-scale (official: norm(logits)*||logits|| / ||hidden||), then lm_head.
+    # norm-scale (official: norm(logits)*||logits|| / ||hidden||), then project ONTO
+    # the target token's lm_head row only — never materialize [A,P,vocab] (≈A·P·151k
+    # floats OOMs on Qwen's grids; we only need the target-token logit per position).
     acc = text.norm(acc) * acc.norm(dim=-1, keepdim=True)  # [A,P,d_model]
     try:
         hidden = torch.stack([out.hidden_states[-1][0, r] for r in answer_rows.tolist()], 0)  # [A,d]
         acc = acc / hidden.norm(dim=-1, keepdim=True).unsqueeze(1).clamp_min(1e-6)
     except Exception:
         pass  # hidden_states unavailable → skip the per-token normalization
-    logits = lm_head(acc)  # [A,P,vocab]
-    tgt = target_ids.to(device).view(A, 1, 1).expand(A, P, 1)
-    sel = logits.gather(2, tgt).squeeze(-1)  # [A,P] signed contribution of each visual pos
+    W = lm_head.weight if hasattr(lm_head, "weight") else lm_head.get_parameter("weight")
+    w_tgt = W.index_select(0, target_ids.to(device)).to(acc.dtype)  # [A, d_model]
+    sel = (acc * w_tgt.unsqueeze(1)).sum(-1)  # [A,P] = acc[a,p]·W[target_a]  (no [A,P,vocab])
     signed = sel.sum(0)  # [P]  sum over answer span
     return signed.detach().float().cpu().numpy().reshape(h_grid, w_grid)
 

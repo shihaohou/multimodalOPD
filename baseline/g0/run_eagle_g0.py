@@ -165,15 +165,22 @@ def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, sp
     layers = resolve_glimpse_layers(args.salr1_layers, gm.num_layers)
     kwargs = _forward_kwargs(inputs, full_ids)
     kwargs["output_hidden_states"] = True
-    with salr1_mod._capture_value_states(gm) as values:
-        out = gm.model(**kwargs)
-    res = salr1_mod.salr1_probe(
-        gm, out, values, visual_positions=visual_positions, grid_hw=grid_hw,
-        prompt_len=prompt_len, completion_ids=completion_ids, bbox=bbox,
-        answer_span=spans.primary, think_span=think_span, layers=layers,
-        think_row_mode=args.salr1_think_row_mode, keep_map=want_viz,
-    )
-    del out, values
+    out = None
+    try:
+        with salr1_mod._capture_value_states(gm) as values:
+            out = gm.model(**kwargs)
+            res = salr1_mod.salr1_probe(
+                gm, out, values, visual_positions=visual_positions, grid_hw=grid_hw,
+                prompt_len=prompt_len, completion_ids=completion_ids, bbox=bbox,
+                answer_span=spans.primary, think_span=think_span, layers=layers,
+                think_row_mode=args.salr1_think_row_mode, keep_map=want_viz,
+            )
+    finally:
+        # Free the full-attention/hidden-state forward + captured value states even on
+        # error, so a single OOM/skip doesn't accumulate across the loop.
+        del out
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     d = {
         "salr1_span_mode": res.span_mode,
         "salr1_holistic": int(res.span_mode == "holistic"),

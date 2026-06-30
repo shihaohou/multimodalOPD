@@ -24,6 +24,9 @@ export TRANSFORMERS_NO_TF=1
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
+# Reduce allocator fragmentation (the salr1/EAGLE forwards alloc large transient
+# attention tensors); the OOM message recommends this.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # Python runner. If a venv is already active, use it DIRECTLY — `uv run` ignores a
 # $VIRTUAL_ENV that doesn't match the project's .venv and bootstraps a fresh
