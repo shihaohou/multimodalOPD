@@ -287,7 +287,7 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
     return record, (eg, gl_res, lh_first, salr1_res), (completion_ids.detach().cpu(), text)
 
 
-def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None):
+def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir="viz"):
     """Panels: image+GT · EAGLE heatmap · EAGLE keep · EAGLE masked · GLIMPSE(answer) · LH · Saliency-R1.
 
     GT box drawn green, predicted box red. "keep"/"masked" show the model's view
@@ -347,7 +347,7 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None):
     fig.suptitle(f"{sample.subset} {sample.sample_id} | EAGLE IoU={eg.iou_eagle:.2f} "
                  f"vis_frac={eg.visual_fraction:.2f} suff={eg.sufficiency:.2f} nec={eg.necessity:.2f}", fontsize=11)
     fig.tight_layout()
-    viz_dir = os.path.join(out_dir, "viz"); os.makedirs(viz_dir, exist_ok=True)
+    viz_dir = os.path.join(out_dir, subdir); os.makedirs(viz_dir, exist_ok=True)
     fig.savefig(os.path.join(viz_dir, f"{tag}.png"), dpi=90); plt.close(fig)
 
 
