@@ -58,39 +58,61 @@ from baseline.g0.engine import BoxNorm, G0Model
 
 # --------------------------------------------------------------- value-vector hook
 @contextmanager
-def _capture_value_states(gm: G0Model):
-    """Hook each decoder layer's ``self_attn`` to capture its value projection.
+def _capture_qkv(gm: G0Model):
+    """Hook each decoder layer's ``self_attn`` to capture q/k/v projections.
 
-    Yields a dict ``{layer_idx: V}`` where ``V`` is ``[B, n_kv_heads, S, d_head]``
-    (pre-GQA-repeat), matching ``past_key_values.layers[ℓ].values``. We read it from
-    the attention module's ``v_proj`` output reshaped to heads — robust across the
-    Qwen2.5/Qwen3 VL text stacks (both expose ``self_attn.v_proj`` + ``num_key_value_heads``).
+    Yields ``{layer_idx: (q, k, v)}`` with ``q``/``k``/``v`` reshaped to heads:
+    ``q`` ``[B, n_heads, S, d]``, ``k``/``v`` ``[B, n_kv, S, d]`` (pre-GQA-repeat).
+    We capture projections rather than the full ``[H,S,S]`` attention probs so the
+    probe can compute attention for ONLY the needed query rows — the full-attention
+    ``output_attentions`` tuple over all layers is what OOMs at long S on Qwen.
     """
     layers = gm.parts.text_model.layers
-    store: dict[int, torch.Tensor] = {}
+    store: dict[int, tuple] = {}
     handles = []
 
     def mk_hook(idx, attn_mod):
         n_kv = getattr(attn_mod, "num_key_value_heads", None) or getattr(
-            attn_mod.config, "num_key_value_heads", None)
-        v_proj = attn_mod.v_proj
+            getattr(attn_mod, "config", None), "num_key_value_heads", None)
+        n_head = getattr(attn_mod, "num_heads", None) or getattr(
+            getattr(attn_mod, "config", None), "num_attention_heads", None)
 
         def hook(_mod, inp, _out):
             x = inp[0]  # [B, S, hidden]
-            v = v_proj(x)  # [B, S, n_kv*d_head]
-            b, s, _ = v.shape
-            d_head = v.shape[-1] // n_kv
-            store[idx] = v.view(b, s, n_kv, d_head).transpose(1, 2).detach()  # [B,n_kv,S,d]
+            b, s, _ = x.shape
+            q = attn_mod.q_proj(x); k = attn_mod.k_proj(x); v = attn_mod.v_proj(x)
+            dk = q.shape[-1] // n_head
+            q = q.view(b, s, n_head, dk).transpose(1, 2)  # [B,H,S,d]
+            k = k.view(b, s, n_kv, dk).transpose(1, 2)     # [B,n_kv,S,d]
+            v = v.view(b, s, n_kv, dk).transpose(1, 2)     # [B,n_kv,S,d]
+            store[idx] = (q.detach(), k.detach(), v.detach())
         return hook
 
     for idx, layer in enumerate(layers):
-        attn_mod = layer.self_attn
-        handles.append(attn_mod.register_forward_hook(mk_hook(idx, attn_mod)))
+        handles.append(layer.self_attn.register_forward_hook(mk_hook(idx, layer.self_attn)))
     try:
         yield store
     finally:
         for h in handles:
             h.remove()
+
+
+@contextmanager
+def _capture_value_states(gm: G0Model):
+    """Backwards-compat shim (kept for the older code path / tests): value states only.
+
+    Prefer :func:`_capture_qkv` — it lets the probe avoid ``output_attentions`` (the
+    OOM source). This shim still works for callers that pass a precomputed
+    ``out.attentions``.
+    """
+    with _capture_qkv(gm) as qkv:
+        class _V:
+            def __getitem__(self, k):
+                return qkv[k][2]
+
+            def __contains__(self, k):
+                return k in qkv
+        yield _V()
 
 
 def _repeat_kv(v: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -190,10 +212,26 @@ class Salr1Result:
     signed_map: Optional[np.ndarray] = None
 
 
-def _answer_logit_lens(
+def _rows_attn(q, k, rows, *, causal_offset, scale):
+    """Softmax attention of query ``rows`` over all keys: ``[H, |rows|, S]``.
+
+    ``q`` ``[H,S,d]``, ``k`` ``[H,S,d]`` (already GQA-repeated). Causal: query at
+    absolute position ``r`` may attend to keys ``≤ r``. Bounds memory by |rows|, not S².
+    """
+    H, S, d = q.shape
+    qr = q.index_select(1, rows)  # [H, R, d]
+    scores = torch.matmul(qr, k.transpose(1, 2)) * scale  # [H, R, S]
+    # causal mask: key index j must be ≤ row position. rows are absolute positions.
+    j = torch.arange(S, device=q.device).view(1, 1, S)
+    allowed = j <= rows.view(1, -1, 1)
+    scores = scores.masked_fill(~allowed, float("-inf"))
+    return torch.softmax(scores, dim=-1)  # [H, R, S]
+
+
+def _answer_logit_lens_qkv(
     gm: G0Model,
-    out,
-    values: dict[int, torch.Tensor],
+    qkv: dict,
+    hidden_last,
     *,
     visual_positions: torch.Tensor,
     answer_rows: torch.Tensor,
@@ -201,68 +239,76 @@ def _answer_logit_lens(
     target_ids: torch.Tensor,
     grid_hw: tuple[int, int],
     layers: tuple[int, ...],
+    think_cap: int = 64,
 ) -> np.ndarray:
-    """Signed per-visual-position contribution to the answer tokens' logits.
+    """Signed visual→(thinking→)answer contribution map, computed from captured q/k/v.
 
-    Returns the SIGNED holistic map ``[H_grid, W_grid]`` (sum over the answer span);
-    the caller derives pos/neg/abs. ``think_rows=None`` → direct-answer route
-    (answer rows attend straight to the visual tokens).
+    Memory-safe variant of the Saliency-R1 logit-lens: never materializes the full
+    ``[H,S,S]`` attention (the OOM source). For each layer it computes attention for
+    only the answer (and capped thinking) query rows.
     """
     device = next(gm.model.parameters()).device
     text = gm.parts.text_model
     lm_head = gm.model.lm_head if hasattr(gm.model, "lm_head") else gm.model.get_output_embeddings()
     h_grid, w_grid = grid_hw
-    P = int(visual_positions.numel())
-    A = int(answer_rows.numel())
     vis = visual_positions.to(device)
+    P = int(vis.numel())
+    A = int(answer_rows.numel())
+    answer_rows = answer_rows.to(device)
+    # Cap thinking tokens (subsample evenly) so [H,A,T]@[H,T,P] stays small on long CoT.
+    if think_rows is not None and int(think_rows.numel()) > think_cap:
+        idx = torch.linspace(0, int(think_rows.numel()) - 1, think_cap, device=think_rows.device).round().long()
+        think_rows = think_rows.index_select(0, idx)
+    if think_rows is not None:
+        think_rows = think_rows.to(device)
 
-    # attentions[ℓ]: [B,H,S,S]; we read query rows (answer / think) over key cols.
-    attn = out.attentions
-    acc = None  # accumulated [A, P, d_model] over layers
+    acc = None
     for l in layers:
-        a = attn[l][0].to(device)  # [H,S,S]
-        H = a.shape[0]
-        V = values[l].to(device)  # [B,n_kv,S,d]
-        n_kv = V.shape[1]
-        V = _repeat_kv(V, H // n_kv)[0]  # [H,S,d]
-        Vv = V.index_select(1, vis)  # [H,P,d] value of visual positions
+        q, k, v = qkv[l]
+        q = q[0].to(device); k = k[0].to(device); v = v[0].to(device)  # [H,S,d] / [n_kv,S,d]
+        H = q.shape[0]
+        rep = H // k.shape[0]
+        k = _repeat_kv(k.unsqueeze(0), rep)[0]  # [H,S,d]
+        v = _repeat_kv(v.unsqueeze(0), rep)[0]  # [H,S,d]
+        scale = 1.0 / (q.shape[-1] ** 0.5)
+        Vv = v.index_select(1, vis)  # [H,P,d]
 
         if think_rows is not None and int(think_rows.numel()) > 0:
-            T = int(think_rows.numel())
-            think_attn = a.index_select(1, answer_rows.to(device)).index_select(2, think_rows.to(device))  # [H,A,T]
-            token_attn = a.index_select(1, think_rows.to(device)).index_select(2, vis)  # [H,T,P]
-            agg = think_attn @ token_attn  # [H,A,P]  visual→thinking→answer
+            a_ans = _rows_attn(q, k, answer_rows, causal_offset=0, scale=scale)  # [H,A,S]
+            a_thk = _rows_attn(q, k, think_rows, causal_offset=0, scale=scale)   # [H,T,S]
+            think_attn = a_ans.index_select(2, think_rows)  # [H,A,T]
+            token_attn = a_thk.index_select(2, vis)         # [H,T,P]
+            agg = think_attn @ token_attn                   # [H,A,P]
+            del a_ans, a_thk, think_attn, token_attn
         else:
-            agg = a.index_select(1, answer_rows.to(device)).index_select(2, vis)  # [H,A,P] direct
+            a_ans = _rows_attn(q, k, answer_rows, causal_offset=0, scale=scale)  # [H,A,S]
+            agg = a_ans.index_select(2, vis)  # [H,A,P]
+            del a_ans
 
-        # sv[a,p] = Σ_head agg[h,a,p] * V[h,p,:]  →  [A,P,d_model_per_o_proj]
         sv = (agg.unsqueeze(-1) * Vv.unsqueeze(1)).transpose(0, 1)  # [A,H,P,d]
         sv = sv.permute(0, 2, 1, 3).reshape(A, P, -1)  # [A,P,H*d]
         contrib = text.layers[l].self_attn.o_proj(sv)  # [A,P,d_model]
         acc = contrib if acc is None else acc + contrib
-        del a, V, Vv, agg, sv, contrib  # free per-layer GPU tensors immediately
+        del q, k, v, Vv, agg, sv, contrib
 
-    # norm-scale (official: norm(logits)*||logits|| / ||hidden||), then project ONTO
-    # the target token's lm_head row only — never materialize [A,P,vocab] (≈A·P·151k
-    # floats OOMs on Qwen's grids; we only need the target-token logit per position).
     acc = text.norm(acc) * acc.norm(dim=-1, keepdim=True)  # [A,P,d_model]
-    try:
-        hidden = torch.stack([out.hidden_states[-1][0, r] for r in answer_rows.tolist()], 0)  # [A,d]
-        acc = acc / hidden.norm(dim=-1, keepdim=True).unsqueeze(1).clamp_min(1e-6)
-    except Exception:
-        pass  # hidden_states unavailable → skip the per-token normalization
+    if hidden_last is not None:
+        try:
+            hidden = torch.stack([hidden_last[0, r] for r in answer_rows.tolist()], 0)  # [A,d]
+            acc = acc / hidden.norm(dim=-1, keepdim=True).unsqueeze(1).clamp_min(1e-6)
+        except Exception:
+            pass
     W = lm_head.weight if hasattr(lm_head, "weight") else lm_head.get_parameter("weight")
     w_tgt = W.index_select(0, target_ids.to(device)).to(acc.dtype)  # [A, d_model]
-    sel = (acc * w_tgt.unsqueeze(1)).sum(-1)  # [A,P] = acc[a,p]·W[target_a]  (no [A,P,vocab])
-    signed = sel.sum(0)  # [P]  sum over answer span
+    signed = (acc * w_tgt.unsqueeze(1)).sum(-1).sum(0)  # [P]
     return signed.detach().float().cpu().numpy().reshape(h_grid, w_grid)
 
 
 def salr1_probe(
     gm: G0Model,
-    out,
-    values: dict[int, torch.Tensor],
+    qkv: dict,
     *,
+    hidden_last=None,
     visual_positions: torch.Tensor,
     grid_hw: tuple[int, int],
     prompt_len: int,
@@ -272,20 +318,21 @@ def salr1_probe(
     think_span: Optional[CompletionSpan],
     layers: Optional[tuple[int, ...]] = None,
     think_row_mode: str = "state",
+    think_cap: int = 64,
     keep_map: bool = False,
 ) -> Salr1Result:
     """Saliency-R1 holistic (or direct-fallback) map + signed metrics for one sample.
 
-    ``out`` = an eager forward with ``output_attentions=True`` (and ideally
-    ``output_hidden_states=True``) over ``prompt+completion``; ``values`` = the
-    per-layer value states captured by :func:`_capture_value_states` around it.
-    ``answer_span`` / ``think_span`` are completion-token coords.
+    ``qkv`` = the per-layer q/k/v captured by :func:`_capture_qkv` around a plain
+    forward (NO ``output_attentions`` — that full ``[H,S,S]`` tuple is the OOM
+    source; we compute attention for only the answer/thinking query rows here).
+    ``hidden_last`` is the last hidden state ``[1,S,d]`` for the official per-token
+    norm (optional). ``answer_span`` / ``think_span`` are completion-token coords.
 
     ``think_row_mode``: ``"state"`` reads the thinking tokens' own rows (answer
     attends to the existing thinking *states* that carry visual info — matches the
     official code's ``-1`` query slicing intent); ``"predictor"`` shifts them −1 to
-    the rows that PREDICTED each thinking token (strict "visual → generating-think"
-    causal reading). Kept switchable for the ablation.
+    the rows that PREDICTED each thinking token (strict causal). Switchable ablation.
     """
     device = next(gm.model.parameters()).device
     comp_len = int(completion_ids.numel())
@@ -310,9 +357,9 @@ def salr1_probe(
                 think_rows = torch.arange(prompt_len + t0, prompt_len + t1, device=device)
             span_mode = "holistic"
 
-    signed = _answer_logit_lens(
-        gm, out, values, visual_positions=visual_positions, answer_rows=answer_rows,
-        think_rows=think_rows, target_ids=target_ids, grid_hw=grid_hw, layers=layers,
+    signed = _answer_logit_lens_qkv(
+        gm, qkv, hidden_last, visual_positions=visual_positions, answer_rows=answer_rows,
+        think_rows=think_rows, target_ids=target_ids, grid_hw=grid_hw, layers=layers, think_cap=think_cap,
     )
     pos = np.clip(signed, 0.0, None)
     neg = np.clip(-signed, 0.0, None)

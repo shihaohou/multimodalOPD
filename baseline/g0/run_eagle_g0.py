@@ -103,6 +103,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--salr1-think-row-mode", default="state", choices=["state", "predictor"],
                    help="state: answer attends to thinking tokens' own rows (official intent); "
                         "predictor: shift -1 to the rows that generated each thinking token (strict causal). Ablation.")
+    p.add_argument("--debug-mem", action="store_true",
+                   help="Print sequence length + CUDA alloc per sample (to find the OOM source).")
     p.add_argument("--calib-limit", type=int, default=30, help="Per-subset LH head-calibration cap.")
     p.add_argument("--top-k-heads", type=int, default=3)
     p.add_argument("--min-layer", type=int, default=2)
@@ -155,8 +157,9 @@ def grad_probe_block(gm, inputs, full_ids, prompt_len, completion_ids, bbox, spa
 def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, spans, args, want_viz):
     """Saliency-R1 holistic/direct map (signed) on the rollout. Returns (dict, Salr1Result|None).
 
-    Its own no-grad eager forward (output_attentions + output_hidden_states) with a
-    v_proj hook for value states — independent of the grad probes / GRAD_PROBES.
+    Captures per-layer q/k/v with a hook (NO output_attentions — the full [H,S,S]
+    tuple over all layers is what OOMs at long S) and computes attention for only
+    the answer/think query rows. Its own no-grad forward, independent of grad probes.
     """
     from baseline.g0.engine import _forward_kwargs
 
@@ -164,13 +167,15 @@ def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, sp
     think_span = salr1_mod.parse_think_span(text, completion_ids, gm.tokenizer)
     layers = resolve_glimpse_layers(args.salr1_layers, gm.num_layers)
     kwargs = _forward_kwargs(inputs, full_ids)
+    kwargs["output_attentions"] = False  # we compute the needed attention rows ourselves
     kwargs["output_hidden_states"] = True
     out = None
     try:
-        with salr1_mod._capture_value_states(gm) as values:
+        with salr1_mod._capture_qkv(gm) as qkv:
             out = gm.model(**kwargs)
+            hidden_last = out.hidden_states[-1] if getattr(out, "hidden_states", None) else None
             res = salr1_mod.salr1_probe(
-                gm, out, values, visual_positions=visual_positions, grid_hw=grid_hw,
+                gm, qkv, hidden_last=hidden_last, visual_positions=visual_positions, grid_hw=grid_hw,
                 prompt_len=prompt_len, completion_ids=completion_ids, bbox=bbox,
                 answer_span=spans.primary, think_span=think_span, layers=layers,
                 think_row_mode=args.salr1_think_row_mode, keep_map=want_viz,
@@ -218,6 +223,11 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
     device = inputs["input_ids"].device
     full_ids = torch.cat([inputs["input_ids"][0], completion_ids.to(device)])
     spans = resolve_answer_spans(completion_ids, gm.tokenizer, args.answer_tokens)
+    if args.debug_mem and torch.cuda.is_available():
+        S = int(full_ids.numel())
+        P = int((full_ids == gm.parts.image_token_id).sum())
+        print(f"[mem] {sample.subset}/{sample.sample_id} S={S} visual={P} "
+              f"alloc={torch.cuda.memory_allocated()/1e9:.1f}G", flush=True)
     try:
         from vigos.answer_utils import extract_boxed_content
 
