@@ -264,6 +264,8 @@ def _answer_logit_lens_qkv(
 
     acc = None
     for l in layers:
+        if l not in qkv:  # layer index outside what the hook captured — skip defensively
+            continue
         q, k, v = qkv[l]
         q = q[0].to(device); k = k[0].to(device); v = v[0].to(device)  # [H,S,d] / [n_kv,S,d]
         H = q.shape[0]
