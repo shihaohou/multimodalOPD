@@ -145,7 +145,10 @@ def table1_region_accuracy(by_model) -> dict:
             "iou_lh": _mean(p, "iou_lh") if any("iou_lh" in r for r in p) else None,
             "iou_lh_boxed": _mean(p, "iou_lh_boxed") if any("iou_lh_boxed" in r for r in p) else None,
             "salr1_mass_gt": _mean(p, "salr1_mass_gt") if any("salr1_mass_gt" in r for r in p) else None,
+            "salr1_mass_enrich": _mean(p, "salr1_mass_enrich") if any("salr1_mass_enrich" in r for r in p) else None,
             "salr1_iou_top20": _mean(p, "salr1_iou_top20") if any("salr1_iou_top20" in r for r in p) else None,
+            "salr1_holistic_rate": _mean(p, "salr1_holistic") if any("salr1_holistic" in r for r in p) else None,
+            "salr1_valid_rate": _mean(p, "salr1_valid") if any("salr1_valid" in r for r in p) else None,
         }
     return out
 
@@ -239,23 +242,49 @@ def table3_hint_mechanism(recs) -> dict:
     acc_h = np.array([float(h[i]["correct"]) for i in common])
     iou_p, iou_h = paired("iou_eagle")
     vr_p, vr_h = paired("visual_reliance")
+    logp_p, logp_h = paired("org_logp")
+    vlog_p, vlog_h = paired("visual_log_lift")
+    nec_p, nec_h = paired("necessity")
+    # In score_plain_y the hint condition re-scores the SAME plain rollout, so its
+    # completion (hence correctness) is identical → Δaccuracy is structurally 0 and
+    # must NOT be read as "no help". We branch the verdict on the hint mode.
+    hint_mode = next((r.get("hint_mode", "generate") for r in recs if r.get("condition") == "hint"), "generate")
     res = {
         "n_paired": len(common),
+        "hint_mode": hint_mode,
         "delta_accuracy": float(acc_h.mean() - acc_p.mean()),
         "acc_plain": float(acc_p.mean()), "acc_hint": float(acc_h.mean()),
         "delta_iou_eagle": float((iou_h - iou_p).mean()) if iou_p.size else float("nan"),
         "delta_visual_reliance": float((vr_h - vr_p).mean()) if vr_p.size else float("nan"),
+        "delta_org_logp": float((logp_h - logp_p).mean()) if logp_p.size else float("nan"),
+        "delta_visual_log_lift": float((vlog_h - vlog_p).mean()) if vlog_p.size else float("nan"),
+        "delta_necessity": float((nec_h - nec_p).mean()) if nec_p.size else float("nan"),
     }
     moves = (not np.isnan(res["delta_iou_eagle"])) and res["delta_iou_eagle"] >= 0.03
-    helps = res["delta_accuracy"] >= 0.01
-    if moves and helps:
-        res["verdict"] = "attentional+causal: hint moves the needed region toward GT and helps → region distillation motivated"
-    elif helps and not moves:
-        res["verdict"] = "output-level: hint helps with ~unchanged causal region (likely text-routing on the hint coords)"
-    elif moves and not helps:
-        res["verdict"] = "region moved but accuracy flat → looking wasn't the bottleneck"
+    if hint_mode == "score_plain_y":
+        # Same rollout → judge by whether the hint raises the model's SUPPORT for it.
+        d_logp = res["delta_org_logp"]
+        lifts = (not np.isnan(d_logp)) and d_logp > 0
+        if lifts and moves:
+            res["verdict"] = ("score_plain_y: hint raises teacher support (Δorg_logp>0) AND moves the causal "
+                              "region toward GT → the silent hint redirects attention to the evidence")
+        elif lifts:
+            res["verdict"] = ("score_plain_y: hint raises teacher support for the SAME rollout (Δorg_logp>0) with "
+                              "~unchanged region → output-level reweighting (text-routing on the hint coords); "
+                              "this is the distillable hidden-hint signal")
+        else:
+            res["verdict"] = "score_plain_y: hint does not raise support for the plain rollout (Δorg_logp≤0)"
+        res["note"] = "Δaccuracy is 0 by construction here (same completion) — ignore it; read Δorg_logp / Δvisual_log_lift."
     else:
-        res["verdict"] = "no effect"
+        helps = res["delta_accuracy"] >= 0.01
+        if moves and helps:
+            res["verdict"] = "attentional+causal: hint moves the needed region toward GT and helps → region distillation motivated"
+        elif helps and not moves:
+            res["verdict"] = "output-level: hint helps with ~unchanged causal region (likely text-routing on the hint coords)"
+        elif moves and not helps:
+            res["verdict"] = "region moved but accuracy flat → looking wasn't the bottleneck"
+        else:
+            res["verdict"] = "no effect"
     return res
 
 
@@ -321,6 +350,15 @@ def write_report(out_dir, analysis) -> None:
         L.append("_IoU_EAGLE ≫ IoU_LH ⇒ LH attention under-measured localization (causal region is better). "
                  "sufficiency=insertion AUC (↑ better), necessity=deletion AUC (↓ ⇒ region is necessary). "
                  "SalR1 = Saliency-R1 map (mass@GT / top-20% IoU) — secondary attribution baseline._")
+        # Saliency-R1 health: holistic-rate (went through the thinking bottleneck) and
+        # valid-rate (non-empty positive map). Low → read salr1_abs_*, not salr1_pos_*.
+        health = [f"{m}: holistic={_fmt(e.get('salr1_holistic_rate'))} valid={_fmt(e.get('salr1_valid_rate'))} "
+                  f"mass_enrich={_fmt(e.get('salr1_mass_enrich'))}"
+                  for m, e in t1.items() if e.get("salr1_holistic_rate") is not None]
+        if health:
+            L.append("")
+            L.append("_SalR1 health (low holistic/valid ⇒ map is direct-answer/unstable — trust abs over pos): "
+                     + "; ".join(health) + "_")
         L.append("")
 
     ga = analysis.get("group_averages", {})
@@ -394,10 +432,18 @@ def write_report(out_dir, analysis) -> None:
     if t3:
         L.append("## Table 3 — hint mechanism (plain vs hint, paired)")
         for m, a in t3.items():
-            L.append(f"- **{m}**: n={a['n_paired']}, Δacc={_fmt(a['delta_accuracy'])} "
-                     f"(plain {_fmt(a['acc_plain'])}→hint {_fmt(a['acc_hint'])}), "
-                     f"ΔIoU_EAGLE={_fmt(a['delta_iou_eagle'])}, Δvisual_reliance={_fmt(a['delta_visual_reliance'])} "
-                     f"→ {a['verdict']}")
+            if a.get("hint_mode") == "score_plain_y":
+                # same rollout → Δacc is 0 by construction; report support deltas.
+                L.append(f"- **{m}** [score_plain_y]: n={a['n_paired']}, "
+                         f"Δorg_logp={_fmt(a.get('delta_org_logp'))}, "
+                         f"Δvisual_log_lift={_fmt(a.get('delta_visual_log_lift'))}, "
+                         f"ΔIoU_EAGLE={_fmt(a['delta_iou_eagle'])}, Δnecessity={_fmt(a.get('delta_necessity'))} "
+                         f"→ {a['verdict']}")
+            else:
+                L.append(f"- **{m}** [generate]: n={a['n_paired']}, Δacc={_fmt(a['delta_accuracy'])} "
+                         f"(plain {_fmt(a['acc_plain'])}→hint {_fmt(a['acc_hint'])}), "
+                         f"ΔIoU_EAGLE={_fmt(a['delta_iou_eagle'])}, Δvisual_reliance={_fmt(a['delta_visual_reliance'])} "
+                         f"→ {a['verdict']}")
         L.append("")
 
     t4 = analysis.get("table4_training", {})

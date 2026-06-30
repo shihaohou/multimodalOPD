@@ -67,6 +67,8 @@ EAGLE_TOP_FRAC="${EAGLE_TOP_FRAC:-0.25}"
 ANSWER_TOKENS="${ANSWER_TOKENS:-8}"
 GRAD_PROBES="${GRAD_PROBES:-1}"                    # 1 = also run LH+GLIMPSE (EAGLE-vs-LH); 0 = EAGLE only (cleaner n, faster)
 SALR1="${SALR1:-1}"                                # 1 = also compute Saliency-R1 map (secondary baseline); 0 = off
+SALR1_LAYERS="${SALR1_LAYERS:-all}"                # layers summed for SalR1 ('all' faithful; 'last8' = SalR1-lite)
+SALR1_THINK_ROW_MODE="${SALR1_THINK_ROW_MODE:-state}"  # state | predictor (think-row ablation)
 CALIB_LIMIT="${CALIB_LIMIT:-30}"
 VIZ_PER_SUBSET="${VIZ_PER_SUBSET:-2}"
 
@@ -89,6 +91,7 @@ common_flags=(
   --search-scope "$SEARCH_SCOPE" --pending-samples "$PENDING_SAMPLES" --update-step "$UPDATE_STEP"
   --eagle-batch-size "$EAGLE_BATCH_SIZE" --region-mode "$REGION_MODE" --answer-tokens "$ANSWER_TOKENS"
   --eagle-threshold "$EAGLE_THRESHOLD" --eagle-top-frac "$EAGLE_TOP_FRAC"
+  --salr1-layers "$SALR1_LAYERS" --salr1-think-row-mode "$SALR1_THINK_ROW_MODE"
   --calib-limit "$CALIB_LIMIT" --viz-per-subset "$VIZ_PER_SUBSET"
 )
 [[ "$GRAD_PROBES" == "1" || "$GRAD_PROBES" == "true" ]] || common_flags+=(--no-grad-probes)

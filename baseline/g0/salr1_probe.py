@@ -34,9 +34,10 @@ we fall back to the **direct-answer** map (answer rows attend straight to the
 visual tokens, same value-weighted lens without the thinking hop).
 
 Metrics (per map): ``mass_gt`` = saliency in GT box / total (the paper's reward —
-NOTE we fix its ``y2 = shape[1]`` height/width bug to ``shape[0]``), ``pointing``,
-``iou_top20``/``iou_top30`` (top-k% threshold → bbox IoU), ``area_top20``,
-``entropy``, plus a ``deletion_drop`` faithfulness check.
+NOTE we fix its ``y2 = shape[1]`` height/width bug to ``shape[0]``), the
+area-adjusted ``mass_enrich`` (mass_gt / bbox-area, since the random baseline of
+mass_gt is the box area, not 0), ``pointing``, and ``iou_top20``/``iou_top30``
+(top-k% positive cells → bbox IoU).
 
 CPU self-test: ``python -m baseline.g0.salr1_probe`` (geometry/mass only).
 """
@@ -102,13 +103,21 @@ def _repeat_kv(v: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 # --------------------------------------------------------------- map metrics
 def _topk_mask(map_2d: np.ndarray, frac: float) -> np.ndarray:
-    """Keep the top ``frac`` of cells by value (≈ Saliency-R1's threshold-then-box)."""
-    arr = np.asarray(map_2d, dtype=np.float64)
-    if arr.size == 0:
+    """Keep the top ``frac`` of cells by value, among POSITIVE cells only.
+
+    Guards the flat/all-zero case: a naive ``arr >= partition(...)`` picks ``thr=0``
+    when the map is empty/constant and floods the whole grid, turning ``iou_top*``
+    into a full-image-box IoU that silently inflates ``corr(correct, salr1_iou)``.
+    Here an all-zero (or all-≤0) map yields an EMPTY mask, and the threshold is taken
+    over the positive support so a sparse map can't select non-positive cells.
+    """
+    arr = np.nan_to_num(np.asarray(map_2d, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    if arr.size == 0 or float(arr.max()) <= 0:
         return np.zeros_like(arr, dtype=bool)
-    k = max(1, int(round(frac * arr.size)))
-    thr = np.partition(arr.ravel(), -k)[-k]
-    return arr >= thr
+    pos = arr[arr > 0]
+    k = min(max(1, int(round(frac * arr.size))), int(pos.size))
+    thr = np.partition(pos, -k)[-k]
+    return (arr >= thr) & (arr > 0)
 
 
 def mass_in_box(map_2d: np.ndarray, bbox: BoxNorm) -> float:
@@ -137,14 +146,27 @@ def _entropy(map_2d: np.ndarray) -> float:
 
 
 def map_metrics(map_2d: np.ndarray, bbox: BoxNorm) -> dict:
-    """All single-map metrics for a (positive) saliency map vs the GT box."""
+    """All single-map metrics for a (positive) saliency map vs the GT box.
+
+    ``mass_enrich`` / ``mass_minus_area`` area-adjust ``mass_gt`` (whose random
+    baseline is the GT-box AREA fraction, not 0): a diffuse map over a box covering
+    30% of the image already scores mass_gt≈0.30, so cross-subset comparison needs
+    the area-relative version. ``valid`` flags a non-empty positive map.
+    """
     arr = np.clip(np.asarray(map_2d, dtype=np.float64), 0.0, None)
     h, w = arr.shape
     gt = metrics.gt_box_to_grid_mask(bbox, h, w)
+    pos_sum = float(arr.sum())
+    bbox_area = float((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]))
+    mass = mass_in_box(arr, bbox)
     out = {
-        "mass_gt": mass_in_box(arr, bbox),
+        "mass_gt": mass,
+        "mass_enrich": (mass / bbox_area) if (mass == mass and bbox_area > 1e-6) else float("nan"),
+        "mass_minus_area": (mass - bbox_area) if mass == mass else float("nan"),
         "pointing": float(metrics.pointing_hit(arr, gt)),
         "entropy": _entropy(arr),
+        "pos_sum": pos_sum,
+        "valid": bool(pos_sum > 0),
     }
     for frac, tag in ((0.2, "top20"), (0.3, "top30")):
         m = _topk_mask(arr, frac)
@@ -246,6 +268,7 @@ def salr1_probe(
     answer_span: CompletionSpan,
     think_span: Optional[CompletionSpan],
     layers: Optional[tuple[int, ...]] = None,
+    think_row_mode: str = "state",
     keep_map: bool = False,
 ) -> Salr1Result:
     """Saliency-R1 holistic (or direct-fallback) map + signed metrics for one sample.
@@ -254,6 +277,12 @@ def salr1_probe(
     ``output_hidden_states=True``) over ``prompt+completion``; ``values`` = the
     per-layer value states captured by :func:`_capture_value_states` around it.
     ``answer_span`` / ``think_span`` are completion-token coords.
+
+    ``think_row_mode``: ``"state"`` reads the thinking tokens' own rows (answer
+    attends to the existing thinking *states* that carry visual info — matches the
+    official code's ``-1`` query slicing intent); ``"predictor"`` shifts them −1 to
+    the rows that PREDICTED each thinking token (strict "visual → generating-think"
+    causal reading). Kept switchable for the ablation.
     """
     device = next(gm.model.parameters()).device
     comp_len = int(completion_ids.numel())
@@ -272,7 +301,10 @@ def salr1_probe(
     if think_span is not None:
         t0, t1 = think_span
         if t1 > t0:
-            think_rows = torch.arange(prompt_len + t0, prompt_len + t1, device=device)
+            if think_row_mode == "predictor":
+                think_rows = torch.arange(prompt_len + t0 - 1, prompt_len + t1 - 1, device=device).clamp_min(prompt_len - 1)
+            else:  # "state": the thinking tokens' own rows
+                think_rows = torch.arange(prompt_len + t0, prompt_len + t1, device=device)
             span_mode = "holistic"
 
     signed = _answer_logit_lens(
@@ -294,14 +326,20 @@ def salr1_probe(
 
 
 def parse_think_span(text: str, completion_ids: torch.Tensor, tokenizer) -> Optional[CompletionSpan]:
-    """Completion-token span of the ``<think>…</think>`` content, or None.
+    """Completion-token span of the ``<think>…</think>`` (or ``<reason>…</reason>``)
+    content, or None.
 
     Char→token via incremental decode (same trick as answer_spans), so it lines up
-    with the rollout's tokenization.
+    with the rollout's tokenization. Supports both CoT tag styles since the OPD
+    prompt line has used ``<reason>`` as well as ``<think>``.
     """
     import re
 
-    m = re.search(r"<think>\s*(\S.*?)\s*</think>", text, re.DOTALL)
+    m = None
+    for tag in ("think", "reason"):
+        m = re.search(rf"<{tag}>\s*(\S.*?)\s*</{tag}>", text, re.DOTALL | re.IGNORECASE)
+        if m:
+            break
     if not m:
         return None
     ids = [int(x) for x in completion_ids.tolist()]

@@ -97,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--salr1", dest="salr1", action="store_true", default=True,
                    help="Also compute the Saliency-R1 map (default ON) — secondary attribution baseline.")
     p.add_argument("--no-salr1", dest="salr1", action="store_false")
+    p.add_argument("--salr1-layers", default="all",
+                   help="Layers summed for the Saliency-R1 map ('all'|'lastN'|comma list). The paper sums all "
+                        "layers; 'all' is the faithful setting (last8 = a cheaper 'SalR1-lite').")
+    p.add_argument("--salr1-think-row-mode", default="state", choices=["state", "predictor"],
+                   help="state: answer attends to thinking tokens' own rows (official intent); "
+                        "predictor: shift -1 to the rows that generated each thinking token (strict causal). Ablation.")
     p.add_argument("--calib-limit", type=int, default=30, help="Per-subset LH head-calibration cap.")
     p.add_argument("--top-k-heads", type=int, default=3)
     p.add_argument("--min-layer", type=int, default=2)
@@ -156,7 +162,7 @@ def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, sp
 
     visual_positions, grid_hw = visual_grid(gm, full_ids, inputs["image_grid_thw"])
     think_span = salr1_mod.parse_think_span(text, completion_ids, gm.tokenizer)
-    layers = resolve_glimpse_layers(args.glimpse_layers, gm.num_layers)
+    layers = resolve_glimpse_layers(args.salr1_layers, gm.num_layers)
     kwargs = _forward_kwargs(inputs, full_ids)
     kwargs["output_hidden_states"] = True
     with salr1_mod._capture_value_states(gm) as values:
@@ -164,12 +170,16 @@ def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, sp
     res = salr1_mod.salr1_probe(
         gm, out, values, visual_positions=visual_positions, grid_hw=grid_hw,
         prompt_len=prompt_len, completion_ids=completion_ids, bbox=bbox,
-        answer_span=spans.primary, think_span=think_span, layers=layers, keep_map=want_viz,
+        answer_span=spans.primary, think_span=think_span, layers=layers,
+        think_row_mode=args.salr1_think_row_mode, keep_map=want_viz,
     )
     del out, values
     d = {
         "salr1_span_mode": res.span_mode,
-        "salr1_mass_gt": res.pos["mass_gt"], "salr1_pointing": res.pos["pointing"],
+        "salr1_holistic": int(res.span_mode == "holistic"),
+        "salr1_valid": int(bool(res.pos.get("valid", False))),
+        "salr1_mass_gt": res.pos["mass_gt"], "salr1_mass_enrich": res.pos.get("mass_enrich"),
+        "salr1_pointing": res.pos["pointing"],
         "salr1_iou_top20": res.pos["iou_top20"], "salr1_iou_top30": res.pos["iou_top30"],
         "salr1_area_top20": res.pos["area_top20"], "salr1_entropy": res.pos["entropy"],
         "salr1_neg_mass_gt": res.neg["mass_gt"], "salr1_abs_mass_gt": res.abs["mass_gt"],
