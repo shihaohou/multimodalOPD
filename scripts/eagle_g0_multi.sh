@@ -5,9 +5,11 @@ set -uo pipefail
 # Then (optionally) LLM-judge each, and one cross-model EAGLE analysis (tables
 # 1-4 + per-task-type). Mirrors the bbox-A/B/C orchestrator: one worker/model.
 #
-# Models (override MODELS=...): teacher CapCurriculum-8B, base Qwen3-VL-8B-Instruct,
-# vanilla-OPD 2B, hint-OPD 2B. Format: "name=path;name=path;...". GPU_GROUPS pairs
-# 1:1 with models (";"-separated, each a comma list of GPU ids).
+# 5 models (override MODELS=...): teacher CapCurriculum-8B, ref Qwen3-VL-8B-Instruct,
+# RAW base student Qwen3-VL-2B-Instruct, vanilla-OPD 2B, hint-OPD 2B. The raw 2B is
+# REQUIRED for table 4 (raw → OPD → hint-OPD: did training raise image-reliance?).
+# Format: "name=path;name=path;...". GPU_GROUPS pairs 1:1 with models (";"-separated,
+# each a comma list of GPU ids).
 #
 #   export M=/.../models D=/.../datasets
 #   JUDGE=1 JUDGE_API_URL=http://localhost:8000/v1 JUDGE_MODEL=Qwen3-30B-A3B \
@@ -21,22 +23,27 @@ M="${M:-models}"
 OUTPUT_BASE="${OUTPUT_BASE:-eval_outputs/eagle_g0}"
 mkdir -p "$OUTPUT_BASE"
 
-# 4 models, "name=path" pairs separated by ';'. Students keep relative run paths.
+# 5 models, "name=path" pairs separated by ';'. Students keep relative run paths.
 MODELS="${MODELS:-\
 qwen3vl-8b=$M/Qwen3-VL-8B-Instruct;\
 capcurriculum-8b=$M/CapCurriculum-8B;\
+qwen3vl-2b=$M/Qwen3-VL-2B-Instruct;\
 qwen3vl-2b-opd=runs/opd_qwen3_CapCurriculum-8B-to-2B_Visual-CoT_20260628-044124/checkpoint-100;\
 qwen3vl-2b-hint=runs/hint_opd_qwen3_CapCurriculum-8B-to-2B_Visual-CoT_noverbalize_20260628-090259/checkpoint-100}"
-GPU_GROUPS="${GPU_GROUPS:-0,1;2,3;4,5;6,7}"
+# 8 GPUs over 5 models: the two 8B get 2 cards, the three 2B get 1-2 cards.
+GPU_GROUPS="${GPU_GROUPS:-0,1;2,3;4;5;6,7}"
 
 # pass-through knobs
 export DATASET="${DATASET:-${D:+$D/saliency-r1-8k}}"; export DATASET="${DATASET:-peterant330/saliency-r1-8k}"
 export SUBSETS="${SUBSETS-gqa,openimages,vsr,textvqa}"
 export LIMIT="${LIMIT:-50}"
 export CONDITIONS="${CONDITIONS:-plain,hint}"
+export HINT_MODE="${HINT_MODE:-generate}"          # generate | score_plain_y (OPD-faithful table 3)
 export EAGLE_IMAGE_SIZE="${EAGLE_IMAGE_SIZE:-448}"
 export N_REGIONS="${N_REGIONS:-49}"
 export EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-8}"
+export EAGLE_THRESHOLD="${EAGLE_THRESHOLD:-mean}"  # run again with top_frac for a sensitivity check
+export EAGLE_TOP_FRAC="${EAGLE_TOP_FRAC:-0.25}"
 export GRAD_PROBES="${GRAD_PROBES:-1}"
 export MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-192}"
 

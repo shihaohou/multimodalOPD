@@ -172,14 +172,18 @@ class EagleResult:
     pointing_eagle: float     # argmax pixel in GT box
     area_eagle: float         # fraction of pixels in the important region
     energy: float             # positive attribution mass in GT box
-    visual_reliance: float    # org − baseline (image lift)
+    visual_reliance: float    # org − baseline (image lift, raw prob)
     text_reliance: float      # baseline (answer prob with no image = prior)
     visual_fraction: float    # (org − baseline) / org   (∈ ~[0,1]; low ⇒ prior-driven)
-    org_score: float          # P(answer | full image)
+    visual_log_lift: float    # mean Δlog p(answer tok): org_logp − baseline_logp (less diluted by easy tokens)
+    org_score: float          # P(answer | full image)   (mean token prob)
     baseline_score: float     # P(answer | blank image)
+    org_logp: float           # mean log P(answer | full image)
+    baseline_logp: float      # mean log P(answer | blank image)
     sufficiency: float        # insertion AUC
     necessity: float          # deletion AUC (LOW ⇒ region is necessary)
     n_regions: int
+    region_mode_used: str     # slico | slic | grid (which backend actually ran)
     boxed_span_mode: str
     pred_box_norm: Optional[BoxNorm]
     attribution_map: Optional[np.ndarray] = None  # [H,W] downsized, for viz
@@ -243,7 +247,8 @@ def eagle_probe(
     )
 
     image_bgr = np.array(img)[:, :, ::-1].copy()  # RGB→BGR, HxWx3 uint8
-    V_set = sub_region_division(image_bgr.astype(np.uint8), n_regions, mode=region_mode)
+    V_set, region_mode_used = sub_region_division(
+        image_bgr.astype(np.uint8), n_regions, mode=region_mode, return_mode=True)
     explainer = EfficientMLLMSubModularExplanationVisionV2(
         adaptor, lambda1=lambda1, lambda2=lambda2, search_scope=search_scope,
         pending_samples=pending_samples, update_step=update_step, batch_size=batch_size,
@@ -260,10 +265,17 @@ def eagle_probe(
     pred_norm = metrics.grid_box_to_norm(pred_box, h_grid, w_grid) if pred_box else None
 
     # ---- reliance / faithfulness (using metrics) ----
-    org = float(np.mean(jf.get("org_score", [float("nan")])))
-    base = float(np.mean(jf.get("baseline_score", [float("nan")])))
+    org_tok = np.asarray(jf.get("org_score", []), dtype=np.float64)
+    base_tok = np.asarray(jf.get("baseline_score", []), dtype=np.float64)
+    org = float(org_tok.mean()) if org_tok.size else float("nan")
+    base = float(base_tok.mean()) if base_tok.size else float("nan")
     visual_reliance = org - base
     visual_fraction = (visual_reliance / org) if org > 1e-6 else float("nan")
+    # Log-lift: mean Δlog p over answer tokens. Less diluted than the raw-prob mean
+    # by high-prob "easy" tokens (punctuation/common words) in a multi-token answer.
+    org_logp = float(np.log(np.clip(org_tok, 1e-12, None)).mean()) if org_tok.size else float("nan")
+    base_logp = float(np.log(np.clip(base_tok, 1e-12, None)).mean()) if base_tok.size else float("nan")
+    visual_log_lift = org_logp - base_logp
     ins_auc, del_auc = faithfulness_auc(jf)
 
     return EagleResult(
@@ -275,11 +287,15 @@ def eagle_probe(
         visual_reliance=float(visual_reliance),
         text_reliance=float(base),
         visual_fraction=float(visual_fraction),
+        visual_log_lift=float(visual_log_lift),
         org_score=float(org),
         baseline_score=float(base),
+        org_logp=float(org_logp),
+        baseline_logp=float(base_logp),
         sufficiency=float(ins_auc),
         necessity=float(del_auc),
         n_regions=len(V_set),
+        region_mode_used=region_mode_used,
         boxed_span_mode=spans.mode,
         pred_box_norm=pred_norm,
         attribution_map=amap if keep_map else None,

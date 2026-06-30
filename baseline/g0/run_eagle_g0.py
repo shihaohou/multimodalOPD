@@ -57,6 +57,11 @@ def parse_args() -> argparse.Namespace:
                    help="Task types (Visual-CoT subsets). Default = object/spatial/OCR signal set.")
     p.add_argument("--limit", type=int, default=50, help="Per-subset cap (EAGLE is expensive; keep small).")
     p.add_argument("--conditions", default="plain,hint", help="plain (no hint) and/or hint (silent GT-box).")
+    p.add_argument("--hint-mode", default="generate", choices=["generate", "score_plain_y"],
+                   help="generate: the hint condition re-generates under the hint prompt (natural behavior). "
+                        "score_plain_y: score the SAME plain rollout under the hint prompt — the OPD-faithful "
+                        "'teacher rescoring the student's rollout' setup (table 3 then isolates the hint's effect "
+                        "on the identical answer). Forces a plain rollout per sample.")
     p.add_argument("--num-shards", type=int, default=1)
     p.add_argument("--shard-index", type=int, default=0)
     p.add_argument("--max-bbox-area", type=float, default=0.5)
@@ -136,15 +141,26 @@ def grad_probe_block(gm, inputs, full_ids, prompt_len, completion_ids, bbox, spa
     return d, gl, lh_first, lh_boxed
 
 
-def run_condition(gm, sample, *, hint, selected_heads, args, want_viz):
+def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_completion=None):
+    """One (sample, condition) → (record, viz_handles, (completion_ids, text)).
+
+    ``reuse_completion`` (the plain rollout) skips generation and SCORES that same
+    answer under this condition's prompt — the OPD-faithful ``score_plain_y`` mode.
+    """
     bbox = sample.bbox_norm
     inputs = build_inputs(gm, sample.image, sample.problem, hint_bbox=bbox if hint else None)
     prompt_len = int(inputs["input_ids"].shape[1])
-    completion_ids, text = generate_completion(
-        gm, inputs, max_new_tokens=args.max_new_tokens, do_sample=args.sample,
-        temperature=args.temperature, top_p=args.top_p,
-        seed=(args.seed + int(sample.sample_id) if str(sample.sample_id).isdigit() else args.seed),
-    )
+    if reuse_completion is not None:
+        completion_ids, text = reuse_completion
+        completion_ids = completion_ids.to(inputs["input_ids"].device)
+    else:
+        completion_ids, text = generate_completion(
+            gm, inputs, max_new_tokens=args.max_new_tokens, do_sample=args.sample,
+            temperature=args.temperature, top_p=args.top_p,
+            seed=(args.seed + int(sample.sample_id) if str(sample.sample_id).isdigit() else args.seed),
+        )
+    if int(completion_ids.numel()) == 0:
+        raise ValueError("empty completion")
     device = inputs["input_ids"].device
     full_ids = torch.cat([inputs["input_ids"][0], completion_ids.to(device)])
     spans = resolve_answer_spans(completion_ids, gm.tokenizer, args.answer_tokens)
@@ -172,15 +188,18 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz):
 
     record = {
         "sample_id": str(sample.sample_id), "subset": sample.subset, "model": gm.name,
-        "condition": "hint" if hint else "plain",
+        "condition": "hint" if hint else "plain", "hint_mode": args.hint_mode,
         "correct": bool(is_correct(text, sample.solution)),
         "bbox_area": float(bbox_area(bbox)), "gt_bbox": [float(x) for x in bbox],
-        "boxed_span_mode": eg.boxed_span_mode, "prompt_len": prompt_len, "completion_len": int(completion_ids.numel()),
+        "boxed_span_mode": eg.boxed_span_mode, "region_mode_used": eg.region_mode_used,
+        "prompt_len": prompt_len, "completion_len": int(completion_ids.numel()),
         # EAGLE — looking (causal) + using (reliance) + faithfulness
         "iou_eagle": eg.iou_eagle, "eagle_bbox_iou": eg.bbox_iou, "pointing_eagle": eg.pointing_eagle,
         "area_eagle": eg.area_eagle, "eagle_energy": eg.energy,
         "visual_reliance": eg.visual_reliance, "text_reliance": eg.text_reliance,
-        "visual_fraction": eg.visual_fraction, "org_score": eg.org_score, "baseline_score": eg.baseline_score,
+        "visual_fraction": eg.visual_fraction, "visual_log_lift": eg.visual_log_lift,
+        "org_score": eg.org_score, "baseline_score": eg.baseline_score,
+        "org_logp": eg.org_logp, "baseline_logp": eg.baseline_logp,
         "sufficiency": eg.sufficiency, "necessity": eg.necessity, "n_regions": eg.n_regions,
         "eagle_pred_box": list(eg.pred_box_norm) if eg.pred_box_norm else None,
         # judge fields
@@ -188,7 +207,7 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz):
         "completion": text[:600],
     }
     record.update(grad)
-    return record, (eg, gl_res, lh_first)
+    return record, (eg, gl_res, lh_first), (completion_ids.detach().cpu(), text)
 
 
 def save_viz(out_dir, sample, eg, gl_res, lh_first, tag):
@@ -259,35 +278,58 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     conditions = [c.strip().lower() for c in args.conditions.split(",") if c.strip()]
     subsets = [s for s in args.subsets.split(",") if s.strip()] or None
+    # score_plain_y needs the plain rollout, so ensure plain is present and first.
+    if args.hint_mode == "score_plain_y" and "plain" not in conditions:
+        conditions = ["plain"] + conditions
+    conditions = sorted(conditions, key=lambda c: 0 if c == "plain" else 1)
     is_main = args.shard_index == 0
     if is_main:
         with open(os.path.join(args.output_dir, "config.json"), "w") as f:
             json.dump(vars(args), f, indent=2, default=_json_safe)
 
-    eval_limit = None if args.limit <= 0 else args.limit
+    # Calibration set (unsharded, first calib_limit/subset) — used both to discover
+    # LH heads and to hold out from eval. Load it first so we can drop it cleanly.
+    calib = []
+    if args.grad_probes:
+        calib = load_saliency_samples(
+            args.dataset, args.split, limit=args.calib_limit, subsets=subsets,
+            max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area)
+    calib_keys = {(s.subset, s.sample_id) for s in calib}
+
+    # Eval set: load with headroom for the calib drop, then re-cap per subset to
+    # args.limit so LIMIT is the EFFECTIVE eval cap (per shard) regardless of grad
+    # probes. Total across shards ≈ num_shards × LIMIT per subset.
+    raw_limit = None if args.limit <= 0 else (args.limit + (args.calib_limit if args.grad_probes else 0))
     samples = load_saliency_samples(
-        args.dataset, args.split, limit=eval_limit, subsets=subsets,
+        args.dataset, args.split, limit=raw_limit, subsets=subsets,
         max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area,
         num_shards=args.num_shards, shard_index=args.shard_index,
     )
+    samples = [s for s in samples if (s.subset, s.sample_id) not in calib_keys]
+    if args.limit > 0:
+        from collections import Counter
+
+        cnt: Counter = Counter()
+        capped = []
+        for s in samples:
+            if cnt[s.subset] < args.limit:
+                capped.append(s)
+                cnt[s.subset] += 1
+        samples = capped
 
     pix = dict(min_pixels=args.min_pixels, max_pixels=args.max_pixels)
     gm = load_g0_model(args.model, name, attn=args.attn, dtype=args.dtype, device=args.device, **pix)
 
     selected_heads = None
     if args.grad_probes:
-        calib = load_saliency_samples(
-            args.dataset, args.split, limit=args.calib_limit, subsets=subsets,
-            max_bbox_area=args.max_bbox_area, min_bbox_area=args.min_bbox_area)
         stats = lh_mod.calibrate_heads(gm, calib, hint=False, top_k=args.top_k_heads, min_layer=args.min_layer)
         if is_main:
             save_head_stats(args.output_dir, stats, name.replace("/", "_"))
         selected_heads = stats.selected_heads
-        calib_keys = {(s.subset, s.sample_id) for s in calib}
-        samples = [s for s in samples if (s.subset, s.sample_id) not in calib_keys]
 
-    print(f"[eagle_g0] model={name} shard {args.shard_index}/{args.num_shards}: {len(samples)} samples, "
-          f"conditions={conditions}, grad_probes={args.grad_probes}")
+    print(f"[eagle_g0] model={name} shard {args.shard_index}/{args.num_shards}: {len(samples)} eval samples "
+          f"(≈{args.limit}/subset/shard), conditions={conditions}, hint_mode={args.hint_mode}, "
+          f"grad_probes={args.grad_probes}")
 
     rec_path = _records_path(args.output_dir, args.num_shards, args.shard_index)
     n_done = n_skip = 0
@@ -296,20 +338,25 @@ def main() -> None:
         for idx, sample in enumerate(samples):
             want_viz = is_main and viz_count.get(sample.subset, 0) < args.viz_per_subset
             used_viz = False
+            plain_completion = None
             for cond in conditions:
                 hint = cond == "hint"
+                reuse = plain_completion if (hint and args.hint_mode == "score_plain_y") else None
                 try:
-                    record, (eg, gl_res, lh_first) = run_condition(
-                        gm, sample, hint=hint, selected_heads=selected_heads, args=args, want_viz=want_viz)
+                    record, (eg, gl_res, lh_first), comp = run_condition(
+                        gm, sample, hint=hint, selected_heads=selected_heads, args=args,
+                        want_viz=want_viz, reuse_completion=reuse)
                 except Exception as exc:
                     n_skip += 1
                     print(f"[eagle_g0] skip {sample.subset}/{sample.sample_id} {cond}: {exc}")
                     if args.device == "cuda":
                         torch.cuda.empty_cache()
                     continue
+                if cond == "plain":
+                    plain_completion = comp
                 rf.write(json.dumps(record, default=_json_safe) + "\n"); rf.flush()
                 n_done += 1
-                if want_viz and not used_viz and cond == "plain":
+                if want_viz:
                     save_viz(args.output_dir, sample, eg, gl_res, lh_first,
                              tag=f"{sample.subset}_{sample.sample_id}_{cond}")
                     used_viz = True

@@ -77,6 +77,7 @@ def table1_region_accuracy(by_model) -> dict:
             "necessity": _mean(p, "necessity"),
             "visual_reliance": _mean(p, "visual_reliance"),
             "visual_fraction": _mean(p, "visual_fraction"),
+            "visual_log_lift": _mean(p, "visual_log_lift"),
             "iou_lh": _mean(p, "iou_lh") if any("iou_lh" in r for r in p) else None,
             "iou_lh_boxed": _mean(p, "iou_lh_boxed") if any("iou_lh_boxed" in r for r in p) else None,
         }
@@ -92,31 +93,39 @@ def table2_looking_vs_using(recs, *, min_n=10) -> dict:
     correct = np.array([float(r["correct"]) for r in p])
     vfrac = np.array([r.get("visual_fraction", np.nan) for r in p], dtype=np.float64)
     vrel = np.array([r.get("visual_reliance", np.nan) for r in p], dtype=np.float64)
+    vlog = np.array([r.get("visual_log_lift", np.nan) for r in p], dtype=np.float64)
     m = ~np.isnan(vfrac)
+    ml = ~np.isnan(vlog)
     lc = safe_corr(iou, correct)
     uc = safe_corr(vfrac[m], correct[m])
+    # log-lift is the PRIMARY using axis (raw-prob mean is diluted by easy tokens).
+    ulc = safe_corr(vlog[ml], correct[ml])
     res = {
         "n": len(p),
         "accuracy": float(correct.mean()),
         "mean_iou_eagle": float(np.nanmean(iou)) if iou.size else float("nan"),
         "corr_correct_iou_eagle": lc,
         "corr_correct_visual_fraction": uc,
+        "corr_correct_visual_log_lift": ulc,
         "corr_correct_visual_reliance": safe_corr(vrel[~np.isnan(vrel)], correct[~np.isnan(vrel)]),
         "mean_iou_eagle_right": float(iou[correct >= 0.5].mean()) if (correct >= 0.5).any() else float("nan"),
         "mean_iou_eagle_wrong": float(iou[correct < 0.5].mean()) if (correct < 0.5).any() else float("nan"),
-        "mean_vfrac_right": float(np.nanmean(vfrac[correct >= 0.5])) if (correct >= 0.5).any() else float("nan"),
-        "mean_vfrac_wrong": float(np.nanmean(vfrac[correct < 0.5])) if (correct < 0.5).any() else float("nan"),
+        "mean_vlog_right": float(np.nanmean(vlog[correct >= 0.5])) if (correct >= 0.5).any() else float("nan"),
+        "mean_vlog_wrong": float(np.nanmean(vlog[correct < 0.5])) if (correct < 0.5).any() else float("nan"),
     }
     lcv = lc if not np.isnan(lc) else 0.0
-    ucv = uc if not np.isnan(uc) else 0.0
+    # use the stronger of the two using signals (log-lift primary, fraction backup).
+    ucv = max(ulc if not np.isnan(ulc) else -9, uc if not np.isnan(uc) else -9)
+    ucv = ucv if ucv > -9 else 0.0
     if lcv >= 0.15:
         res["verdict"] = (f"looking matters: corr(correct, IoU_EAGLE)={lcv:+.2f} → the causally-needed region "
                           "tracks correctness; region/grounding supervision has headroom")
     elif ucv >= 0.10 and lcv <= 0.05:
-        res["verdict"] = (f"using bottleneck: IoU_EAGLE corr≈0 ({lcv:+.2f}) but visual_fraction corr={ucv:+.2f} "
-                          "→ the answer's image-reliance, not its localization, predicts correctness (output-level)")
+        res["verdict"] = (f"using bottleneck: IoU_EAGLE corr≈0 ({lcv:+.2f}) but visual-reliance corr={ucv:+.2f} "
+                          "(log-lift) → image-reliance, not localization, predicts correctness (output-level)")
     else:
-        res["verdict"] = (f"mixed (corr(correct,IoU_EAGLE)={lcv:+.2f}, corr(correct,visual_fraction)={ucv:+.2f})")
+        res["verdict"] = (f"mixed (corr(correct,IoU_EAGLE)={lcv:+.2f}, corr(correct,visual_log_lift)="
+                          f"{ulc if not np.isnan(ulc) else float('nan'):+.2f})")
     return res
 
 
@@ -133,7 +142,7 @@ def table2_by_subset(recs, *, min_n=10) -> dict:
         out[sub] = {
             "n": a["n"], "accuracy": a["accuracy"],
             "corr_correct_iou_eagle": a["corr_correct_iou_eagle"],
-            "corr_correct_visual_fraction": a["corr_correct_visual_fraction"],
+            "corr_correct_visual_log_lift": a["corr_correct_visual_log_lift"],
             "mean_iou_eagle": a["mean_iou_eagle"],
             "low_n": a["n"] < min_n,
         }
@@ -193,7 +202,9 @@ def table4_training(by_model, base_keys, opd_keys, hint_keys) -> dict:
     # Resolve hint-OPD first; the vanilla-OPD name often contains the OPD substring
     # too ("opd_qwen…" ⊂ "hint_opd_qwen…"), so exclude the hint model + avoid "hint".
     hint_model = pick(hint_keys)
-    base_model = pick(base_keys, avoid=("opd",))
+    # base = the raw student: its name ("qwen3vl-2b") is a substring of the -opd/-hint
+    # variants, so avoid both so we don't grab a trained checkpoint as "base".
+    base_model = pick(base_keys, avoid=("opd", "hint"))
     opd_model = pick(opd_keys, avoid=("hint",), exclude=(hint_model,) if hint_model else ())
     roles = {"base": base_model, "opd": opd_model, "hint_opd": hint_model}
     out = {}
@@ -208,6 +219,7 @@ def table4_training(by_model, base_keys, opd_keys, hint_keys) -> dict:
             "accuracy": float(np.mean([r["correct"] for r in p])),
             "visual_reliance": _mean(p, "visual_reliance"),
             "visual_fraction": _mean(p, "visual_fraction"),
+            "visual_log_lift": _mean(p, "visual_log_lift"),
             "iou_eagle": _mean(p, "iou_eagle"),
             "necessity": _mean(p, "necessity"),
             "sufficiency": _mean(p, "sufficiency"),
@@ -241,12 +253,12 @@ def write_report(out_dir, analysis) -> None:
     if t2:
         L.append("## Table 2 — looking vs using (per model, plain)")
         L.append("")
-        L.append("| model | n | acc | corr(c,IoU_EAGLE) | corr(c,vis_frac) | IoU right/wrong | verdict |")
-        L.append("|-------|---|-----|-------------------|------------------|----------------|---------|")
+        L.append("| model | n | acc | corr(c,IoU_EAGLE) | corr(c,vlog) | corr(c,vfrac) | IoU r/w | verdict |")
+        L.append("|-------|---|-----|-------------------|--------------|---------------|---------|---------|")
         for m, a in t2.items():
             L.append(f"| {m} | {a['n']} | {_fmt(a['accuracy'])} | {_fmt(a['corr_correct_iou_eagle'])} | "
-                     f"{_fmt(a['corr_correct_visual_fraction'])} | {_fmt(a['mean_iou_eagle_right'])}/"
-                     f"{_fmt(a['mean_iou_eagle_wrong'])} | {a['verdict'].split(':')[0]} |")
+                     f"{_fmt(a['corr_correct_visual_log_lift'])} | {_fmt(a['corr_correct_visual_fraction'])} | "
+                     f"{_fmt(a['mean_iou_eagle_right'])}/{_fmt(a['mean_iou_eagle_wrong'])} | {a['verdict'].split(':')[0]} |")
         L.append("")
         for m, a in t2.items():
             L.append(f"- **{m}**: {a['verdict']}")
@@ -257,12 +269,12 @@ def write_report(out_dir, analysis) -> None:
         L.append("## Table 2b — looking vs using by task type (plain)")
         for m, subs in t2s.items():
             L.append(f"\n**{m}**\n")
-            L.append("| subset | n | acc | corr(c,IoU_EAGLE) | corr(c,vis_frac) |")
-            L.append("|--------|---|-----|-------------------|------------------|")
+            L.append("| subset | n | acc | corr(c,IoU_EAGLE) | corr(c,vlog) |")
+            L.append("|--------|---|-----|-------------------|--------------|")
             for sub, e in subs.items():
                 flag = " ⚠" if e.get("low_n") else ""
                 L.append(f"| {sub}{flag} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['corr_correct_iou_eagle'])} | "
-                         f"{_fmt(e['corr_correct_visual_fraction'])} |")
+                         f"{_fmt(e['corr_correct_visual_log_lift'])} |")
         L.append("")
 
     t3 = analysis.get("table3_hint_mechanism", {})
@@ -279,17 +291,18 @@ def write_report(out_dir, analysis) -> None:
     if t4:
         L.append("## Table 4 — OPD / hint training raises image-reliance? (plain)")
         L.append("")
-        L.append("| role | model | n | acc | visual_reliance | visual_fraction | IoU_EAGLE | necessity |")
-        L.append("|------|-------|---|-----|-----------------|-----------------|-----------|-----------|")
+        L.append("| role | model | n | acc | visual_log_lift | visual_reliance | visual_fraction | IoU_EAGLE | necessity |")
+        L.append("|------|-------|---|-----|-----------------|-----------------|-----------------|-----------|-----------|")
         for role in ("base", "opd", "hint_opd"):
             e = t4.get(role)
             if not e:
                 continue
-            L.append(f"| {role} | {e['model']} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['visual_reliance'])} | "
-                     f"{_fmt(e['visual_fraction'])} | {_fmt(e['iou_eagle'])} | {_fmt(e['necessity'])} |")
+            L.append(f"| {role} | {e['model']} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['visual_log_lift'])} | "
+                     f"{_fmt(e['visual_reliance'])} | {_fmt(e['visual_fraction'])} | {_fmt(e['iou_eagle'])} | "
+                     f"{_fmt(e['necessity'])} |")
         L.append("")
-        L.append("_Success story = training ↑ accuracy AND ↑ visual_reliance (answer depends on the image more), "
-                 "even if IoU_EAGLE barely moves._")
+        L.append("_Success story = training ↑ accuracy AND ↑ visual_log_lift / visual_reliance (answer depends on "
+                 "the image more), even if IoU_EAGLE barely moves._")
         L.append("")
 
     with open(os.path.join(out_dir, "eagle_report.md"), "w") as f:
@@ -301,9 +314,10 @@ def main() -> None:
     ap.add_argument("--run-dirs", nargs="+", required=True, help="One or more model run dirs.")
     ap.add_argument("--output-dir", default=None, help="Where to write the report (default: first run dir).")
     ap.add_argument("--use-judge", action="store_true", help="Overlay judgments.jsonl per dir (LLM correctness).")
-    ap.add_argument("--base-keys", default="2B-Instruct,base", help="Substrings to identify the base student (table 4).")
-    ap.add_argument("--opd-keys", default="opd_qwen,vanilla,_opd_", help="Substrings for the vanilla-OPD student.")
-    ap.add_argument("--hint-keys", default="hint_opd,hint", help="Substrings for the hint-OPD student.")
+    ap.add_argument("--base-keys", default="qwen3vl-2b,2b-instruct,base",
+                    help="Substrings to identify the RAW base student (table 4); -opd/-hint variants are excluded.")
+    ap.add_argument("--opd-keys", default="opd,vanilla", help="Substrings for the vanilla-OPD student.")
+    ap.add_argument("--hint-keys", default="hint", help="Substrings for the hint-OPD student.")
     args = ap.parse_args()
 
     records = _load_all(args.run_dirs, args.use_judge)

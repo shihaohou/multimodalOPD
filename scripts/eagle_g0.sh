@@ -27,9 +27,17 @@ export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
 DATASET="${DATASET:-peterant330/saliency-r1-8k}"
 SPLIT="${SPLIT:-train}"
+# Fail fast on the classic offline trap (HF id under HF_HUB_OFFLINE=1).
+if [[ "$HF_HUB_OFFLINE" == "1" && "$DATASET" != /* && ! -d "$DATASET" ]]; then
+  echo "[eagle_g0] HF_HUB_OFFLINE=1 but DATASET is not a local dir: '$DATASET'. Pass DATASET=\$D/saliency-r1-8k." >&2
+  exit 1
+fi
 SUBSETS="${SUBSETS-gqa,openimages,vsr,textvqa}"   # single-dash: ""=all subsets
-LIMIT="${LIMIT:-50}"                               # per-subset cap (EAGLE is costly)
+# LIMIT = EFFECTIVE per-subset eval cap PER SHARD (calib hold-out already accounted
+# for). Total ≈ (#GPUs in $GPUS) × LIMIT per subset.
+LIMIT="${LIMIT:-50}"
 CONDITIONS="${CONDITIONS:-plain,hint}"            # plain (no hint) and/or hint (silent GT-box)
+HINT_MODE="${HINT_MODE:-generate}"                # generate | score_plain_y (OPD-faithful: rescore plain rollout)
 MAX_BBOX_AREA="${MAX_BBOX_AREA:-0.5}"
 SKIP_ANALYZE="${SKIP_ANALYZE:-}"
 
@@ -46,8 +54,10 @@ PENDING_SAMPLES="${PENDING_SAMPLES:-4}"
 UPDATE_STEP="${UPDATE_STEP:-10}"
 EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-8}"
 REGION_MODE="${REGION_MODE:-auto}"                 # auto|slico|slic|grid
+EAGLE_THRESHOLD="${EAGLE_THRESHOLD:-mean}"         # mean|top_frac — DO a sensitivity check both ways
+EAGLE_TOP_FRAC="${EAGLE_TOP_FRAC:-0.25}"
 ANSWER_TOKENS="${ANSWER_TOKENS:-8}"
-GRAD_PROBES="${GRAD_PROBES:-1}"                    # 1 = also run LH+GLIMPSE (EAGLE-vs-LH)
+GRAD_PROBES="${GRAD_PROBES:-1}"                    # 1 = also run LH+GLIMPSE (EAGLE-vs-LH); 0 = EAGLE only (cleaner n, faster)
 CALIB_LIMIT="${CALIB_LIMIT:-30}"
 VIZ_PER_SUBSET="${VIZ_PER_SUBSET:-2}"
 
@@ -64,11 +74,12 @@ mkdir -p "$OUTPUT_DIR"
 common_flags=(
   --model "$MODEL" --model-name "$MODEL_NAME" --output-dir "$OUTPUT_DIR"
   --dataset "$DATASET" --split "$SPLIT" --subsets "$SUBSETS" --limit "$LIMIT"
-  --conditions "$CONDITIONS" --max-bbox-area "$MAX_BBOX_AREA"
+  --conditions "$CONDITIONS" --hint-mode "$HINT_MODE" --max-bbox-area "$MAX_BBOX_AREA"
   --dtype "$DTYPE" --max-pixels "$MAX_PIXELS" --max-new-tokens "$MAX_NEW_TOKENS" --seed "$SEED"
   --eagle-image-size "$EAGLE_IMAGE_SIZE" --n-regions "$N_REGIONS"
   --search-scope "$SEARCH_SCOPE" --pending-samples "$PENDING_SAMPLES" --update-step "$UPDATE_STEP"
   --eagle-batch-size "$EAGLE_BATCH_SIZE" --region-mode "$REGION_MODE" --answer-tokens "$ANSWER_TOKENS"
+  --eagle-threshold "$EAGLE_THRESHOLD" --eagle-top-frac "$EAGLE_TOP_FRAC"
   --calib-limit "$CALIB_LIMIT" --viz-per-subset "$VIZ_PER_SUBSET"
 )
 [[ "$GRAD_PROBES" == "1" || "$GRAD_PROBES" == "true" ]] || common_flags+=(--no-grad-probes)

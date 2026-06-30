@@ -51,14 +51,20 @@ def _grid_regions(h: int, w: int, n_regions: int) -> list[np.ndarray]:
     return masks
 
 
-def sub_region_division(image: np.ndarray, n_regions: int = 49, mode: str = "auto") -> list[np.ndarray]:
+def sub_region_division(image: np.ndarray, n_regions: int = 49, mode: str = "auto",
+                        return_mode: bool = False):
     """Split ``image`` (H×W×3, cv2/BGR uint8) into ~``n_regions`` disjoint masks.
 
     ``mode``: ``"auto"`` (SLICO→SLIC→grid), ``"slico"``, ``"slic"`` or ``"grid"``.
-    Returns a list of ``(H, W, 1)`` uint8 masks (EAGLE's ``V_set``).
+    Returns a list of ``(H, W, 1)`` uint8 masks (EAGLE's ``V_set``); with
+    ``return_mode=True`` returns ``(masks, mode_used)`` so the caller can record
+    which backend actually ran (it varies by what's installed → affects IoU, so
+    log it for reproducibility).
     """
     h, w = image.shape[:2]
     region_size = max(8, int((h * w / max(1, n_regions)) ** 0.5))
+    masks: list[np.ndarray] = []
+    used = "grid"
 
     if mode in ("auto", "slico"):
         try:
@@ -70,12 +76,12 @@ def sub_region_division(image: np.ndarray, n_regions: int = 49, mode: str = "aut
             n = slic.getNumberOfSuperpixels()
             masks = _labels_to_masks(labels, n)
             if masks:
-                return masks
+                used = "slico"
         except Exception:
             if mode == "slico":
                 raise
 
-    if mode in ("auto", "slic"):
+    if not masks and mode in ("auto", "slic"):
         try:
             from skimage.segmentation import slic as sk_slic
 
@@ -83,12 +89,15 @@ def sub_region_division(image: np.ndarray, n_regions: int = 49, mode: str = "aut
             labels = sk_slic(rgb, n_segments=n_regions, compactness=10.0, start_label=0)
             masks = _labels_to_masks(labels, int(labels.max()) + 1)
             if masks:
-                return masks
+                used = "slic"
         except Exception:
             if mode == "slic":
                 raise
 
-    return _grid_regions(h, w, n_regions)
+    if not masks:
+        masks = _grid_regions(h, w, n_regions)
+        used = "grid"
+    return (masks, used) if return_mode else masks
 
 
 def add_value(S_set, json_file):
