@@ -39,6 +39,7 @@ import torch
 
 from baseline.g0 import glimpse as glimpse_mod
 from baseline.g0 import localization_heads as lh_mod
+from baseline.g0.answer_spans import resolve_answer_spans, span_predictor_rows
 from baseline.g0.engine import build_inputs, generate_completion, grad_attention_forward, is_correct, load_g0_model, visual_grid
 from baseline.probe.saliency_data import bbox_area, load_saliency_samples
 
@@ -159,7 +160,9 @@ def save_viz(out_dir, image, bbox, lh_res, gl_res, tag: str, *, subdir="viz", su
             fill=False, edgecolor=color, linewidth=2))
 
     panels = [("LH (looking)", lh_res.assembled_map, lh_res.pred_box_norm),
-              ("GLIMPSE (using)", gl_res.visual_map, gl_res.pred_box_norm)]
+              ("GLIMPSE (using, full)", gl_res.visual_map, gl_res.pred_box_norm)]
+    if getattr(gl_res, "visual_map_boxed", None) is not None:
+        panels.append(("GLIMPSE (answer/boxed)", gl_res.visual_map_boxed, None))
     fig, axes = plt.subplots(1, len(panels) + 1, figsize=(5 * (len(panels) + 1), 5))
     axes[0].imshow(image); axes[0].set_title("image + GT(green)"); _box(axes[0], bbox, "lime"); axes[0].axis("off")
     for ax, (title, m, pred) in zip(axes[1:], panels):
@@ -192,12 +195,21 @@ def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers_spec
     comp_len = int(completion_ids.numel())
     correct = is_correct(text, sample.solution)
     layers = resolve_glimpse_layers(glimpse_layers_spec, gm.num_layers)
+    # Answer spans (completion-token coords): boxed = inside \boxed{...}, else last-K.
+    spans = resolve_answer_spans(completion_ids, gm.tokenizer, args.answer_tokens)
+    try:
+        from vigos.answer_utils import extract_boxed_content
+
+        pred_boxed = extract_boxed_content(text) or ""
+    except Exception:
+        pred_boxed = ""
 
     out = grad_attention_forward(gm, inputs, full_ids)
     gl_res = glimpse_mod.glimpse_probe(
         gm, inputs, full_ids, prompt_len, completion_ids, bbox,
-        layers=layers, answer_k=args.answer_tokens, lam=args.glimpse_lambda,
-        lambda_depth=args.glimpse_lambda_depth, threshold=args.threshold, keep_map=want_viz, out=out,
+        layers=layers, answer_k=args.answer_tokens, boxed_span=spans.primary,
+        lam=args.glimpse_lambda, lambda_depth=args.glimpse_lambda_depth,
+        threshold=args.threshold, keep_map=want_viz, out=out,
     )
     visual_positions, grid_hw = visual_grid(gm, full_ids, inputs["image_grid_thw"])
     # first-gen-step LH (paper-aligned positive control)
@@ -208,7 +220,11 @@ def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers_spec
     ans_rows = torch.arange(prompt_len + comp_len - 1 - k, prompt_len + comp_len - 1, device=device).clamp_min(prompt_len - 1)
     ans_maps = lh_mod.head_visual_maps_avg(out.attentions, ans_rows, visual_positions, grid_hw)
     lh_ans = lh_mod.localize_from_maps(ans_maps, bbox, selected_heads, sigma=args.lh_sigma)
-    del out, maps, ans_maps
+    # boxed-span LH: predictor rows of the \boxed{...} tokens (precise answer; last-K fallback)
+    boxed_rows = span_predictor_rows(prompt_len, spans.primary, device=device)
+    boxed_maps = lh_mod.head_visual_maps_avg(out.attentions, boxed_rows, visual_positions, grid_hw)
+    lh_boxed = lh_mod.localize_from_maps(boxed_maps, bbox, selected_heads, sigma=args.lh_sigma)
+    del out, maps, ans_maps, boxed_maps
 
     record = {
         "sample_id": str(sample.sample_id),
@@ -219,7 +235,8 @@ def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers_spec
         "grid_hw": list(grid_hw),
         "prompt_len": prompt_len,
         "completion_len": comp_len,
-        # looking — first gen step (control) + answer span (primary for the verdict)
+        "boxed_span_mode": spans.mode,  # "boxed" (found \boxed{}) | "lastk" (fallback)
+        # looking — first gen step (control) + answer span + boxed span (primary)
         "iou_lh": lh_res.iou_lh,
         "lh_bbox_iou": lh_res.bbox_iou,
         "lh_pointing": lh_res.pointing,
@@ -229,17 +246,26 @@ def run_condition(gm, sample, *, hint, selected_heads, args, glimpse_layers_spec
         "lh_answer_pointing": lh_ans.pointing,
         "lh_answer_energy": lh_ans.energy,
         "best_single_iou_answer": lh_ans.best_single_iou,
-        # using — full response + answer span
+        "iou_lh_boxed": lh_boxed.iou_lh,
+        "lh_boxed_pointing": lh_boxed.pointing,
+        "lh_boxed_energy": lh_boxed.energy,
+        # using — full response + answer span + boxed span
         "iou_gl": gl_res.iou_gl,
         "gl_bbox_iou": gl_res.bbox_iou,
         "gl_pointing": gl_res.pointing,
         "gl_energy": gl_res.energy,
         "iou_gl_answer": gl_res.iou_gl_answer,
+        "iou_gl_boxed": gl_res.iou_gl_boxed,
         "vt_ratio": gl_res.vt_ratio,
         "vt_ratio_answer": gl_res.vt_ratio_answer,
+        "vt_ratio_boxed": gl_res.vt_ratio_boxed,
         "visual_mass": gl_res.visual_mass,
         "textual_mass": gl_res.textual_mass,
         "self_mass": gl_res.self_mass,
+        # for the LLM judge (analyze_g0 --use-judge → judge_g0)
+        "question": sample.problem,
+        "solution": sample.solution,
+        "pred_boxed": pred_boxed,
         "completion": text[:600],
     }
     return record, (lh_res, gl_res)
