@@ -104,8 +104,9 @@ def _pooled_and_macro(recs, subset_names, metrics) -> dict:
     return out
 
 
-_AVG_METRICS = ["accuracy", "iou_eagle", "pointing_eagle", "visual_reliance",
-                "visual_log_lift", "visual_fraction", "sufficiency", "necessity"]
+_AVG_METRICS = ["accuracy", "iou_eagle", "pointing_at1", "energy_in_box", "iou_top10", "iou_top20",
+                "visual_reliance", "visual_log_lift", "visual_fraction", "sufficiency", "necessity",
+                "deletion_logp_drop", "insertion_logp_recovery"]
 
 
 def group_averages(by_model) -> dict:
@@ -136,9 +137,15 @@ def table1_region_accuracy(by_model) -> dict:
             "accuracy": float(np.mean([r["correct"] for r in p])),
             "iou_eagle": _mean(p, "iou_eagle"),
             "pointing_eagle": _mean(p, "pointing_eagle"),
+            "pointing_at1": _mean(p, "pointing_at1") if any("pointing_at1" in r for r in p) else _mean(p, "pointing_eagle"),
+            "energy_in_box": _mean(p, "energy_in_box") if any("energy_in_box" in r for r in p) else _mean(p, "eagle_energy"),
+            "iou_top10": _mean(p, "iou_top10") if any("iou_top10" in r for r in p) else None,
+            "iou_top20": _mean(p, "iou_top20") if any("iou_top20" in r for r in p) else None,
             "area_eagle": _mean(p, "area_eagle"),
             "sufficiency": _mean(p, "sufficiency"),
             "necessity": _mean(p, "necessity"),
+            "deletion_logp_drop": _mean(p, "deletion_logp_drop") if any("deletion_logp_drop" in r for r in p) else None,
+            "insertion_logp_recovery": _mean(p, "insertion_logp_recovery") if any("insertion_logp_recovery" in r for r in p) else None,
             "visual_reliance": _mean(p, "visual_reliance"),
             "visual_fraction": _mean(p, "visual_fraction"),
             "visual_log_lift": _mean(p, "visual_log_lift"),
@@ -339,17 +346,18 @@ def write_report(out_dir, analysis) -> None:
     if t1:
         L.append("## Table 1 — region accuracy (plain)")
         L.append("")
-        L.append("| model | n | acc | IoU_EAGLE | point | area | suff | nec | vis_frac | IoU_LH | IoU_LH_boxed | SalR1_mass | SalR1_IoU |")
-        L.append("|-------|---|-----|-----------|-------|------|------|-----|----------|--------|--------------|------------|-----------|")
+        L.append("| model | n | acc | IoU_EAGLE | Point@1 | Energy | IoU@10 | IoU@20 | DelDrop | InsRec | vis_frac |")
+        L.append("|-------|---|-----|-----------|---------|--------|--------|--------|---------|--------|----------|")
         for m, e in t1.items():
-            L.append(f"| {m} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['iou_eagle'])} | {_fmt(e['pointing_eagle'])} | "
-                     f"{_fmt(e['area_eagle'])} | {_fmt(e['sufficiency'])} | {_fmt(e['necessity'])} | "
-                     f"{_fmt(e['visual_fraction'])} | {_fmt(e['iou_lh'])} | {_fmt(e['iou_lh_boxed'])} | "
-                     f"{_fmt(e.get('salr1_mass_gt'))} | {_fmt(e.get('salr1_iou_top20'))} |")
+            L.append(f"| {m} | {e['n']} | {_fmt(e['accuracy'])} | {_fmt(e['iou_eagle'])} | "
+                     f"{_fmt(e.get('pointing_at1'))} | {_fmt(e.get('energy_in_box'))} | "
+                     f"{_fmt(e.get('iou_top10'))} | {_fmt(e.get('iou_top20'))} | "
+                     f"{_fmt(e.get('deletion_logp_drop'))} | {_fmt(e.get('insertion_logp_recovery'))} | "
+                     f"{_fmt(e['visual_fraction'])} |")
         L.append("")
-        L.append("_IoU_EAGLE ≫ IoU_LH ⇒ LH attention under-measured localization (causal region is better). "
-                 "sufficiency=insertion AUC (↑ better), necessity=deletion AUC (↓ ⇒ region is necessary). "
-                 "SalR1 = Saliency-R1 map (mass@GT / top-20% IoU) — secondary attribution baseline._")
+        L.append("_Point@1 = max heat patch in GT. Energy = heatmap mass inside GT. "
+                 "IoU@10/20 threshold the top 10%/20% area of the final aggregate map. "
+                 "DelDrop/InsRec are target-span logp drop/recovery after deleting/keeping top-20% attributed area._")
         # Saliency-R1 health: holistic-rate (went through the thinking bottleneck) and
         # valid-rate (non-empty positive map). Low → read salr1_abs_*, not salr1_pos_*.
         health = [f"{m}: holistic={_fmt(e.get('salr1_holistic_rate'))} valid={_fmt(e.get('salr1_valid_rate'))} "
@@ -372,8 +380,8 @@ def write_report(out_dir, analysis) -> None:
         for grp, label in (("primary5", "first-5 (gqa/openimages/v7w/textvqa/vsr)"), ("all", "all-10")):
             L.append(f"### {label} average")
             L.append("")
-            L.append("| model | #sub | n | acc | IoU_EAGLE | point | vis_log_lift | vis_reliance | suff | nec |")
-            L.append("|-------|------|---|-----|-----------|-------|--------------|--------------|------|-----|")
+            L.append("| model | #sub | n | acc | IoU_EAGLE | Point@1 | Energy | IoU@20 | DelDrop | InsRec | vis_log_lift |")
+            L.append("|-------|------|---|-----|-----------|---------|--------|--------|---------|--------|--------------|")
             for m, e in ga.items():
                 g = e.get(grp)
                 if not g or not g.get("n"):
@@ -381,8 +389,8 @@ def write_report(out_dir, analysis) -> None:
                 def mm(metric):  # "macro (pooled)"
                     return f"{_fmt(g.get(metric + '_macro'))} ({_fmt(g.get(metric + '_pooled'))})"
                 L.append(f"| {m} | {g['n_subsets']} | {g['n']} | {mm('accuracy')} | {mm('iou_eagle')} | "
-                         f"{mm('pointing_eagle')} | {mm('visual_log_lift')} | {mm('visual_reliance')} | "
-                         f"{mm('sufficiency')} | {mm('necessity')} |")
+                         f"{mm('pointing_at1')} | {mm('energy_in_box')} | {mm('iou_top20')} | "
+                         f"{mm('deletion_logp_drop')} | {mm('insertion_logp_recovery')} | {mm('visual_log_lift')} |")
             L.append("")
         L.append("_cells are `macro (pooled)`._")
         L.append("")

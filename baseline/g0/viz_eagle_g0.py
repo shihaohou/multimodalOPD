@@ -28,7 +28,7 @@ if __package__ is None or __package__ == "":
 
 from baseline.g0.analyze_g0 import apply_judge, load_records
 from baseline.g0.engine import load_g0_model
-from baseline.g0.run_eagle_g0 import run_condition, save_viz
+from baseline.g0.run_eagle_g0 import _condition_prompt, run_condition, save_eagle_artifacts, save_viz
 from baseline.probe.saliency_data import (
     SaliencySample,
     _avoid_eager_image_decode,
@@ -170,6 +170,15 @@ def _viz_args_from_config(cfg: dict, cli: argparse.Namespace) -> Namespace:
         ns.max_new_tokens = cli.max_new_tokens
     if cli.attn is not None:
         ns.attn = cli.attn
+    if cli.eagle_token_mode is not None:
+        ns.eagle_token_mode = cli.eagle_token_mode
+    if cli.eagle_token_limit is not None:
+        ns.eagle_token_limit = cli.eagle_token_limit
+    if not hasattr(ns, "eagle_token_mode"):
+        ns.eagle_token_mode = "span"
+    if not hasattr(ns, "eagle_token_limit"):
+        ns.eagle_token_limit = 0
+    ns.save_eagle_artifacts = bool(cli.save_eagle_artifacts)
     ns.explain_span_mode = "answer"
     if not hasattr(ns, "sample"):
         ns.sample = False
@@ -203,7 +212,10 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--attn", default=None, help="Override config attn implementation, e.g. eager or sdpa.")
     ap.add_argument("--eagle-batch-size", type=int, default=None)
     ap.add_argument("--eagle-image-size", type=int, default=None)
+    ap.add_argument("--eagle-token-mode", default=None, choices=["span", "per_token_mean", "per_token_max"])
+    ap.add_argument("--eagle-token-limit", type=int, default=None)
     ap.add_argument("--max-new-tokens", type=int, default=None)
+    ap.add_argument("--save-eagle-artifacts", action="store_true")
     ap.add_argument("--debug-mem", action="store_true")
     return ap.parse_args()
 
@@ -249,11 +261,12 @@ def main() -> None:
     if not available:
         raise SystemExit(f"[eagle.viz] no records found in {args.run_dir}")
     rank_condition = args.rank_condition if args.rank_condition in available else available[0]
-    render_conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
-    render_conditions = [c for c in render_conditions if c in available]
+    render_conditions = [_condition_prompt(c, (0.0, 0.0, 1.0, 1.0))[0]
+                         for c in args.conditions.split(",") if c.strip()]
+    render_conditions = list(dict.fromkeys(render_conditions))
     if not render_conditions:
         render_conditions = [rank_condition]
-    if cfg.get("hint_mode") == "score_plain_y" and "hint" in render_conditions and "plain" not in render_conditions:
+    if cfg.get("hint_mode") == "score_plain_y" and any(c != "plain" for c in render_conditions) and "plain" not in render_conditions:
         render_conditions = ["plain"] + render_conditions
 
     subset_filter = {canon_subset(s) for s in args.subsets.split(",") if s.strip()} or None
@@ -301,30 +314,34 @@ def main() -> None:
             if sample is None:
                 continue
             for cond in render_conditions:
-                hint = cond == "hint"
                 cache_key = (sample_key[0], sample_key[1], cond)
                 for span_mode in span_modes:
                     ns.explain_span_mode = span_mode
                     reuse = completion_cache.get(cache_key)
-                    if hint and ns.hint_mode == "score_plain_y":
+                    if cond != "plain" and ns.hint_mode == "score_plain_y":
                         reuse = completion_cache.get((sample_key[0], sample_key[1], "plain"))
                     try:
                         record, (eg, gl_res, lh_first, salr1_res), comp = run_condition(
-                            gm, sample, hint=hint, selected_heads=None, args=ns,
+                            gm, sample, condition=cond, selected_heads=None, args=ns,
                             want_viz=True, reuse_completion=reuse,
                         )
                     except Exception as exc:  # noqa: BLE001
                         print(f"[eagle.viz] skip {sample.subset}/{sample.sample_id} {cond}/{span_mode}: {exc}")
                         continue
-                    if cache_key not in completion_cache and not (hint and ns.hint_mode == "score_plain_y"):
+                    if cache_key not in completion_cache and not (cond != "plain" and ns.hint_mode == "score_plain_y"):
                         completion_cache[cache_key] = comp
 
                     subdir = _subdir_name(explicit_subdir, select, span_mode, multi_span)
                     path = save_viz(
                         args.run_dir, sample, eg, gl_res, lh_first,
-                        tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}",
+                        tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
                         salr1_res=salr1_res, subdir=subdir,
                     )
+                    if ns.save_eagle_artifacts:
+                        save_eagle_artifacts(
+                            args.run_dir, sample, eg,
+                            tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
+                        )
                     out_dir = os.path.join(args.run_dir, subdir)
                     output_dirs.add(out_dir)
                     if path and os.path.exists(path):

@@ -31,7 +31,7 @@ is a small-budget diagnostic, not a full-8k pass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -105,6 +105,7 @@ class G0EagleAdaptor:
         eval_ids: torch.Tensor,
         target_positions: list[int],
         target_ids: torch.Tensor,
+        hint_template: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ):
         self.gm = gm
@@ -116,7 +117,10 @@ class G0EagleAdaptor:
         self.K = int(self.target_ids.numel())
         self.image_token_id = int(gm.parts.image_token_id)
         self._n_img_tokens = int((self.eval_ids == self.image_token_id).sum())
-        messages = build_messages(eval_image, problem, hint_bbox=hint_bbox, system_prompt=system_prompt)
+        messages = build_messages(
+            eval_image, problem, hint_bbox=hint_bbox, system_prompt=system_prompt,
+            hint_template=hint_template,
+        )
         self.text = gm.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
     # ---- image coercion (EAGLE BGR-float tensor → RGB PIL) ----
@@ -202,8 +206,66 @@ class EagleResult:
     region_mode_used: str     # slico | slic | grid (which backend actually ran)
     boxed_span_mode: str
     pred_box_norm: Optional[BoxNorm]
+    pointing_at1: float
+    energy_in_box: float
+    iou_top10: float
+    iou_top20: float
+    deletion_logp_drop: float
+    insertion_logp_recovery: float
+    deletion_logp_drop_top10: float
+    deletion_logp_drop_top20: float
+    insertion_logp_recovery_top10: float
+    insertion_logp_recovery_top20: float
+    insertion_recovery_frac_top20: float
+    token_map_mode: str
+    token_map_count: int
+    token_indices: list[int]
+    token_details: list[dict] = field(default_factory=list)
     attribution_map: Optional[np.ndarray] = None  # [H,W] downsized, for viz
     pred_mask: Optional[np.ndarray] = None        # [H,W] bool, the important region
+    token_maps: Optional[np.ndarray] = None       # [T,H,W] per-token EAGLE maps, for artifacts
+    eagle_s_set: Optional[np.ndarray] = None      # EAGLE greedy regions, for official visualization
+    eagle_json_file: Optional[dict] = None        # EAGLE scores, for official visualization
+
+
+def _mean_log_probs(values) -> float:
+    arr = np.asarray(values, dtype=np.float64)
+    if arr.size == 0:
+        return float("nan")
+    return float(np.log(np.clip(arr, 1e-12, None)).mean())
+
+
+def _top_area_mask(map_2d: np.ndarray, frac: float) -> np.ndarray:
+    arr = np.asarray(map_2d, dtype=np.float64)
+    if arr.size == 0:
+        return np.zeros_like(arr, dtype=bool)
+    k = max(1, int(np.ceil(arr.size * float(frac))))
+    order = np.argsort(arr, axis=None)[::-1]
+    mask = np.zeros(arr.size, dtype=bool)
+    mask[order[:k]] = True
+    return mask.reshape(arr.shape)
+
+
+def _map_metrics(amap: np.ndarray, bbox: BoxNorm, threshold: str, top_frac: float) -> tuple[dict, np.ndarray, Optional[BoxNorm]]:
+    res = metrics.iou_map_vs_gt(amap, bbox, sigma=0.0, threshold=threshold, top_frac=top_frac)
+    pred_mask = (metrics.binarize_top_frac(amap, top_frac) if threshold == "top_frac"
+                 else metrics.binarize_mean_relu(amap))
+    pred_box = metrics.bbox_from_mask(pred_mask)
+    h_grid, w_grid = amap.shape
+    pred_norm = metrics.grid_box_to_norm(pred_box, h_grid, w_grid) if pred_box else None
+    gt_mask = metrics.gt_box_to_grid_mask(bbox, h_grid, w_grid)
+    res["iou_top10"] = metrics.mask_iou(_top_area_mask(amap, 0.10), gt_mask)
+    res["iou_top20"] = metrics.mask_iou(_top_area_mask(amap, 0.20), gt_mask)
+    return res, pred_mask, pred_norm
+
+
+def _select_token_indices(s: int, e: int, limit: int) -> list[int]:
+    idxs = list(range(int(s), int(e)))
+    if limit and limit > 0 and len(idxs) > limit:
+        pos = np.linspace(0, len(idxs) - 1, int(limit))
+        idxs = [idxs[int(round(p))] for p in pos]
+        idxs = list(dict.fromkeys(idxs))
+    return idxs
 
 
 def eagle_probe(
@@ -227,6 +289,9 @@ def eagle_probe(
     region_mode: str = "auto",
     threshold: str = "mean",
     top_frac: float = 0.25,
+    token_map_mode: str = "span",
+    token_limit: int = 0,
+    hint_template: Optional[str] = None,
     keep_map: bool = False,
 ) -> EagleResult:
     """Run EAGLE for one (sample, condition) and reduce to the G0 metrics.
@@ -248,51 +313,134 @@ def eagle_probe(
     # rollout's answer text; its original positions don't matter).
     from baseline.g0.engine import build_inputs
 
-    inputs = build_inputs(gm, img, problem, hint_bbox=hint_bbox)
+    inputs = build_inputs(gm, img, problem, hint_bbox=hint_bbox, hint_template=hint_template)
     prompt_len = int(inputs["input_ids"].shape[1])
     comp = completion_ids.to(device)
     full_ids = torch.cat([inputs["input_ids"][0], comp])
-    target_positions = [prompt_len + j for j in range(s, e)]
-    max_pos = max(target_positions)  # last answer token's position
-    eval_ids = full_ids[:max_pos]    # input ends right before the last answer token
-    target_ids = comp[s:e]
-
-    adaptor = G0EagleAdaptor(
-        gm, problem, hint_bbox=hint_bbox, eval_image=img, eval_ids=eval_ids,
-        target_positions=target_positions, target_ids=target_ids,
-    )
 
     image_bgr = np.array(img)[:, :, ::-1].copy()  # RGB→BGR, HxWx3 uint8
     V_set, region_mode_used = sub_region_division(
         image_bgr.astype(np.uint8), n_regions, mode=region_mode, return_mode=True)
-    explainer = EfficientMLLMSubModularExplanationVisionV2(
-        adaptor, lambda1=lambda1, lambda2=lambda2, search_scope=search_scope,
-        pending_samples=pending_samples, update_step=update_step, batch_size=batch_size,
-    )
-    S_set, jf = explainer(image_bgr.astype(np.float32), V_set)
+
+    def make_adaptor(ss: int, ee: int) -> G0EagleAdaptor:
+        target_positions = [prompt_len + j for j in range(ss, ee)]
+        max_pos = max(target_positions)  # last target token's position
+        eval_ids = full_ids[:max_pos]    # input ends right before the last target token
+        return G0EagleAdaptor(
+            gm, problem, hint_bbox=hint_bbox, eval_image=img, eval_ids=eval_ids,
+            target_positions=target_positions, target_ids=comp[ss:ee],
+            hint_template=hint_template,
+        )
+
+    def run_once(ss: int, ee: int):
+        adaptor = make_adaptor(ss, ee)
+        explainer = EfficientMLLMSubModularExplanationVisionV2(
+            adaptor, lambda1=lambda1, lambda2=lambda2, search_scope=search_scope,
+            pending_samples=pending_samples, update_step=update_step, batch_size=batch_size,
+        )
+        s_set, jf = explainer(image_bgr.astype(np.float32), V_set.copy())
+        amap = add_value(s_set, jf)[0][:, :, 0].astype(np.float64)
+        return s_set, jf, amap
+
+    def token_detail(j: int, jf: dict, amap: np.ndarray) -> dict:
+        org_p = float(np.asarray(jf.get("org_score", [float("nan")]), dtype=np.float64).mean())
+        base_p = float(np.asarray(jf.get("baseline_score", [float("nan")]), dtype=np.float64).mean())
+        tok_res, _, _ = _map_metrics(amap, bbox, threshold, top_frac)
+        return {
+            "token_index": int(j),
+            "token_id": int(comp[j].detach().cpu().item()),
+            "token_text": gm.tokenizer.decode([int(comp[j].detach().cpu().item())],
+                                              skip_special_tokens=False,
+                                              clean_up_tokenization_spaces=False),
+            "org_prob": org_p,
+            "baseline_prob": base_p,
+            "org_logp": _mean_log_probs([org_p]),
+            "baseline_logp": _mean_log_probs([base_p]),
+            "visual_log_lift": _mean_log_probs([org_p]) - _mean_log_probs([base_p]),
+            "visual_reliance": org_p - base_p,
+            "visual_fraction": (org_p - base_p) / org_p if org_p > 1e-6 else float("nan"),
+            "pointing_at1": float(tok_res["pointing"]),
+            "energy_in_box": float(tok_res["energy"]) if np.isfinite(tok_res["energy"]) else 0.0,
+            "iou_top10": float(tok_res["iou_top10"]),
+            "iou_top20": float(tok_res["iou_top20"]),
+        }
+
+    token_map_mode = str(token_map_mode or "span")
+    if token_map_mode not in {"span", "per_token_mean", "per_token_max"}:
+        raise ValueError(f"unknown token_map_mode={token_map_mode!r}")
+
+    token_details: list[dict] = []
+    token_maps_arr = None
+    if token_map_mode == "span":
+        S_set, jf, amap = run_once(s, e)
+        token_indices = list(range(s, e))
+        token_details = [
+            {
+                "token_index": int(j),
+                "token_id": int(comp[j].detach().cpu().item()),
+                "token_text": gm.tokenizer.decode([int(comp[j].detach().cpu().item())],
+                                                  skip_special_tokens=False,
+                                                  clean_up_tokenization_spaces=False),
+            }
+            for j in token_indices
+        ]
+        agg_jf = jf
+        agg_s_set = S_set
+    else:
+        token_indices = _select_token_indices(s, e, token_limit)
+        token_maps = []
+        for j in token_indices:
+            _, jf_one, amap_one = run_once(j, j + 1)
+            token_maps.append(amap_one)
+            token_details.append(token_detail(j, jf_one, amap_one))
+        token_maps_arr = np.stack(token_maps, axis=0) if token_maps else np.zeros((0, image_bgr.shape[0], image_bgr.shape[1]))
+        amap = token_maps_arr.mean(axis=0) if token_map_mode == "per_token_mean" else token_maps_arr.max(axis=0)
+        amap = amap - float(np.nanmin(amap))
+        mx = float(np.nanmax(amap))
+        amap = amap / mx if mx > 1e-8 else amap
+        # Keep a span-level EAGLE run only for scalar insertion/deletion curves when
+        # requested through per-token mode. Metrics and visualization use amap above.
+        S_set, jf, _ = run_once(s, e)
+        agg_jf = jf
+        agg_s_set = S_set
 
     # ---- attribution map → looking metrics (resolution-agnostic geometry) ----
-    amap = add_value(S_set, jf)[0][:, :, 0].astype(np.float64)  # [H,W] in [0,1]
-    res = metrics.iou_map_vs_gt(amap, bbox, sigma=0.0, threshold=threshold, top_frac=top_frac)
-    pred_mask = (metrics.binarize_top_frac(amap, top_frac) if threshold == "top_frac"
-                 else metrics.binarize_mean_relu(amap))
-    pred_box = metrics.bbox_from_mask(pred_mask)
-    h_grid, w_grid = amap.shape
-    pred_norm = metrics.grid_box_to_norm(pred_box, h_grid, w_grid) if pred_box else None
+    res, pred_mask, pred_norm = _map_metrics(amap, bbox, threshold, top_frac)
 
     # ---- reliance / faithfulness (using metrics) ----
-    org_tok = np.asarray(jf.get("org_score", []), dtype=np.float64)
-    base_tok = np.asarray(jf.get("baseline_score", []), dtype=np.float64)
+    target_adaptor = make_adaptor(s, e)
+    src = torch.from_numpy(image_bgr.astype(np.float32))
+    mask10 = torch.from_numpy(_top_area_mask(amap, 0.10).astype(np.float32))[:, :, None]
+    mask20 = torch.from_numpy(_top_area_mask(amap, 0.20).astype(np.float32))[:, :, None]
+    scoring_images = torch.stack([
+        src,
+        torch.zeros_like(src),
+        src * (1.0 - mask10),
+        src * mask10,
+        src * (1.0 - mask20),
+        src * mask20,
+    ]).to(device)
+    with torch.no_grad():
+        full_scores = target_adaptor(scoring_images).detach().cpu().numpy()
+    org_tok = np.asarray(full_scores[0], dtype=np.float64)
+    base_tok = np.asarray(full_scores[1], dtype=np.float64)
+    del10_logp = _mean_log_probs(full_scores[2])
+    ins10_logp = _mean_log_probs(full_scores[3])
+    del20_logp = _mean_log_probs(full_scores[4])
+    ins20_logp = _mean_log_probs(full_scores[5])
     org = float(org_tok.mean()) if org_tok.size else float("nan")
     base = float(base_tok.mean()) if base_tok.size else float("nan")
+    org_logp = _mean_log_probs(org_tok)
+    base_logp = _mean_log_probs(base_tok)
     visual_reliance = org - base
     visual_fraction = (visual_reliance / org) if org > 1e-6 else float("nan")
-    # Log-lift: mean Δlog p over answer tokens. Less diluted than the raw-prob mean
-    # by high-prob "easy" tokens (punctuation/common words) in a multi-token answer.
-    org_logp = float(np.log(np.clip(org_tok, 1e-12, None)).mean()) if org_tok.size else float("nan")
-    base_logp = float(np.log(np.clip(base_tok, 1e-12, None)).mean()) if base_tok.size else float("nan")
     visual_log_lift = org_logp - base_logp
-    ins_auc, del_auc = faithfulness_auc(jf)
+    ins_auc, del_auc = faithfulness_auc(agg_jf)
+    rec_denom = org_logp - base_logp
+    insertion_recovery_frac_top20 = (
+        (ins20_logp - base_logp) / rec_denom
+        if np.isfinite(rec_denom) and abs(rec_denom) > 1e-8 else float("nan")
+    )
 
     return EagleResult(
         iou_eagle=float(res["mask_iou"]),
@@ -314,6 +462,24 @@ def eagle_probe(
         region_mode_used=region_mode_used,
         boxed_span_mode=spans.mode,
         pred_box_norm=pred_norm,
+        pointing_at1=float(res["pointing"]),
+        energy_in_box=float(res["energy"]) if np.isfinite(res["energy"]) else 0.0,
+        iou_top10=float(res["iou_top10"]),
+        iou_top20=float(res["iou_top20"]),
+        deletion_logp_drop=float(org_logp - del20_logp),
+        insertion_logp_recovery=float(ins20_logp - base_logp),
+        deletion_logp_drop_top10=float(org_logp - del10_logp),
+        deletion_logp_drop_top20=float(org_logp - del20_logp),
+        insertion_logp_recovery_top10=float(ins10_logp - base_logp),
+        insertion_logp_recovery_top20=float(ins20_logp - base_logp),
+        insertion_recovery_frac_top20=float(insertion_recovery_frac_top20),
+        token_map_mode=token_map_mode,
+        token_map_count=len(token_indices),
+        token_indices=[int(j) for j in token_indices],
+        token_details=token_details,
         attribution_map=amap if keep_map else None,
         pred_mask=pred_mask if keep_map else None,
+        token_maps=token_maps_arr if keep_map else None,
+        eagle_s_set=np.asarray(agg_s_set) if keep_map else None,
+        eagle_json_file=agg_jf if keep_map else None,
     )

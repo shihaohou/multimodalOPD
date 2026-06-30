@@ -38,10 +38,13 @@ SUBSETS="${SUBSETS:-}"
 OUTPUT_SUBDIR="${OUTPUT_SUBDIR:-}"
 EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-128}"
 EAGLE_IMAGE_SIZE="${EAGLE_IMAGE_SIZE:-}"
+EAGLE_TOKEN_MODE="${EAGLE_TOKEN_MODE:-per_token_mean}"
+EAGLE_TOKEN_LIMIT="${EAGLE_TOKEN_LIMIT:-16}"
 MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-}"
 ATTN="${ATTN:-sdpa}"
 WITH_SALR1="${WITH_SALR1:-0}"
 NO_USE_JUDGE="${NO_USE_JUDGE:-0}"
+SAVE_EAGLE_ARTIFACTS="${SAVE_EAGLE_ARTIFACTS:-1}"
 
 run_dirs=()
 if [[ -n "${RUN_DIRS:-}" ]]; then
@@ -72,6 +75,8 @@ for d in "${run_dirs[@]}"; do
     --conditions "$CONDITIONS"
     --per-subset "$PER_SUBSET"
     --eagle-batch-size "$EAGLE_BATCH_SIZE"
+    --eagle-token-mode "$EAGLE_TOKEN_MODE"
+    --eagle-token-limit "$EAGLE_TOKEN_LIMIT"
   )
   [[ -n "$MAX_CASES" ]] && args+=(--max-cases "$MAX_CASES")
   [[ -n "$SUBSETS" ]] && args+=(--subsets "$SUBSETS")
@@ -81,7 +86,8 @@ for d in "${run_dirs[@]}"; do
   [[ -n "$ATTN" ]] && args+=(--attn "$ATTN")
   [[ "$WITH_SALR1" == "1" || "$WITH_SALR1" == "true" ]] && args+=(--with-salr1)
   [[ "$NO_USE_JUDGE" == "1" || "$NO_USE_JUDGE" == "true" ]] && args+=(--no-use-judge)
+  [[ "$SAVE_EAGLE_ARTIFACTS" == "1" || "$SAVE_EAGLE_ARTIFACTS" == "true" ]] && args+=(--save-eagle-artifacts)
 
-  echo "[eagle_viz] rendering $d selects=$SELECTS span_modes=$SPAN_MODES per_subset=$PER_SUBSET conditions=$CONDITIONS"
+  echo "[eagle_viz] rendering $d selects=$SELECTS span_modes=$SPAN_MODES token_mode=$EAGLE_TOKEN_MODE per_subset=$PER_SUBSET conditions=$CONDITIONS"
   "${PY[@]}" -m baseline.g0.viz_eagle_g0 "${args[@]}"
 done

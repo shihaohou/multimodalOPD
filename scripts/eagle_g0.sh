@@ -68,6 +68,10 @@ EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-8}"
 REGION_MODE="${REGION_MODE:-auto}"                 # auto|slico|slic|grid
 EAGLE_THRESHOLD="${EAGLE_THRESHOLD:-mean}"         # mean|top_frac — DO a sensitivity check both ways
 EAGLE_TOP_FRAC="${EAGLE_TOP_FRAC:-0.25}"
+EXPLAIN_SPAN_MODE="${EXPLAIN_SPAN_MODE:-answer}"  # answer | sentence
+EAGLE_TOKEN_MODE="${EAGLE_TOKEN_MODE:-span}"      # span | per_token_mean | per_token_max
+EAGLE_TOKEN_LIMIT="${EAGLE_TOKEN_LIMIT:-0}"       # 0 = all target tokens
+SAVE_EAGLE_ARTIFACTS="${SAVE_EAGLE_ARTIFACTS:-0}"
 ANSWER_TOKENS="${ANSWER_TOKENS:-8}"
 GRAD_PROBES="${GRAD_PROBES:-1}"                    # 1 = also run LH+GLIMPSE (EAGLE-vs-LH); 0 = EAGLE only (cleaner n, faster)
 SALR1="${SALR1:-1}"                                # 1 = also compute Saliency-R1 map (secondary baseline); 0 = off
@@ -117,11 +121,13 @@ common_flags=(
   --search-scope "$SEARCH_SCOPE" --pending-samples "$PENDING_SAMPLES" --update-step "$UPDATE_STEP"
   --eagle-batch-size "$EAGLE_BATCH_SIZE" --region-mode "$REGION_MODE" --answer-tokens "$ANSWER_TOKENS"
   --eagle-threshold "$EAGLE_THRESHOLD" --eagle-top-frac "$EAGLE_TOP_FRAC"
+  --explain-span-mode "$EXPLAIN_SPAN_MODE" --eagle-token-mode "$EAGLE_TOKEN_MODE" --eagle-token-limit "$EAGLE_TOKEN_LIMIT"
   --salr1-layers "$SALR1_LAYERS" --salr1-think-row-mode "$SALR1_THINK_ROW_MODE"
   --calib-limit "$CALIB_LIMIT" --viz-per-subset "$VIZ_PER_SUBSET"
 )
 [[ "$GRAD_PROBES" == "1" || "$GRAD_PROBES" == "true" ]] || common_flags+=(--no-grad-probes)
 [[ "$SALR1" == "1" || "$SALR1" == "true" ]] || common_flags+=(--no-salr1)
+[[ "$SAVE_EAGLE_ARTIFACTS" == "1" || "$SAVE_EAGLE_ARTIFACTS" == "true" ]] && common_flags+=(--save-eagle-artifacts)
 
 echo "[eagle_g0] model=$MODEL_NAME gpus=$GPUS workers_per_gpu=$WORKERS_PER_GPU shards=$NUM_SHARDS attn=$ATTN limit_mode=$LIMIT_MODE conditions=$CONDITIONS out=$OUTPUT_DIR"
 pids=()

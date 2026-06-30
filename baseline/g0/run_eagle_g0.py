@@ -42,7 +42,16 @@ from baseline.g0 import glimpse as glimpse_mod
 from baseline.g0 import localization_heads as lh_mod
 from baseline.g0 import salr1_probe as salr1_mod
 from baseline.g0.answer_spans import resolve_answer_spans, span_predictor_rows
-from baseline.g0.engine import build_inputs, generate_completion, grad_attention_forward, is_correct, load_g0_model, visual_grid
+from baseline.g0.engine import (
+    HIDDEN_HINT_TEMPLATE,
+    VISIBLE_HINT_TEMPLATE,
+    build_inputs,
+    generate_completion,
+    grad_attention_forward,
+    is_correct,
+    load_g0_model,
+    visual_grid,
+)
 from baseline.g0.run_g0 import _json_safe, resolve_glimpse_layers, save_head_stats
 from baseline.probe.saliency_data import bbox_area, load_saliency_samples
 
@@ -60,7 +69,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--limit-mode", default="per_shard", choices=["per_shard", "global"],
                    help="per_shard keeps the historical behavior: LIMIT applies inside each shard. "
                         "global applies LIMIT before sharding, so extra shards/workers split the same eval set.")
-    p.add_argument("--conditions", default="plain,hint", help="plain (no hint) and/or hint (silent GT-box).")
+    p.add_argument("--conditions", default="plain,hint",
+                   help="plain, hint (visible bbox hint), and/or hidden_hint (silent no-verbalize bbox hint).")
     p.add_argument("--hint-mode", default="generate", choices=["generate", "score_plain_y"],
                    help="generate: the hint condition re-generates under the hint prompt (natural behavior). "
                         "score_plain_y: score the SAME plain rollout under the hint prompt — the OPD-faithful "
@@ -95,6 +105,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eagle-top-frac", type=float, default=0.25)
     p.add_argument("--explain-span-mode", default="answer", choices=["answer", "sentence"],
                    help="EAGLE target tokens: boxed/last-K answer span, or the whole generated completion.")
+    p.add_argument("--eagle-token-mode", default="span",
+                   choices=["span", "per_token_mean", "per_token_max"],
+                   help="span = one EAGLE run over the whole target span; per_token_* = run one map per token and aggregate.")
+    p.add_argument("--eagle-token-limit", type=int, default=0,
+                   help="Max target tokens to explain in per_token_* mode; 0 means all tokens in the target span.")
+    p.add_argument("--save-eagle-artifacts", action="store_true",
+                   help="Save aggregate/per-token EAGLE maps and per-token reliance details for later plotting.")
     # grad probes (LH + GLIMPSE) on the same rollout
     p.add_argument("--grad-probes", dest="grad_probes", action="store_true", default=True,
                    help="Also compute LH + GLIMPSE (default ON) → EAGLE-vs-LH comparison.")
@@ -127,6 +144,18 @@ def _records_path(out_dir, num_shards=1, shard_index=0):
     if num_shards and num_shards > 1:
         return os.path.join(out_dir, f"records.shard{shard_index}of{num_shards}.jsonl")
     return os.path.join(out_dir, "records.jsonl")
+
+
+def _condition_prompt(condition: str, bbox):
+    """Return (condition_name, hint_bbox, hint_template) for an eval condition."""
+    cond = str(condition or "plain").strip().lower()
+    if cond in {"plain", "natural", "none"}:
+        return "plain", None, None
+    if cond in {"hint", "visible_hint"}:
+        return "hint", bbox, VISIBLE_HINT_TEMPLATE
+    if cond in {"hidden_hint", "silent_hint"}:
+        return "hidden_hint", bbox, HIDDEN_HINT_TEMPLATE
+    raise ValueError(f"unknown condition {condition!r}; use plain,hint,hidden_hint")
 
 
 def grad_probe_block(gm, inputs, full_ids, prompt_len, completion_ids, bbox, spans, selected_heads, args, want_viz):
@@ -205,14 +234,16 @@ def salr1_block(gm, inputs, full_ids, prompt_len, completion_ids, text, bbox, sp
     return d, res
 
 
-def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_completion=None):
+def run_condition(gm, sample, *, hint=False, condition=None, selected_heads=None, args=None,
+                  want_viz=False, reuse_completion=None):
     """One (sample, condition) → (record, viz_handles, (completion_ids, text)).
 
     ``reuse_completion`` (the plain rollout) skips generation and SCORES that same
     answer under this condition's prompt — the OPD-faithful ``score_plain_y`` mode.
     """
     bbox = sample.bbox_norm
-    inputs = build_inputs(gm, sample.image, sample.problem, hint_bbox=bbox if hint else None)
+    cond_name, hint_bbox, hint_template = _condition_prompt(condition or ("hint" if hint else "plain"), bbox)
+    inputs = build_inputs(gm, sample.image, sample.problem, hint_bbox=hint_bbox, hint_template=hint_template)
     prompt_len = int(inputs["input_ids"].shape[1])
     if reuse_completion is not None:
         completion_ids, text = reuse_completion
@@ -264,17 +295,20 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
 
     eg = eagle_mod.eagle_probe(
         gm, sample.image, sample.problem, bbox, completion_ids,
-        hint_bbox=bbox if hint else None, boxed_span=eagle_span, answer_k=args.answer_tokens,
+        hint_bbox=hint_bbox, boxed_span=eagle_span, answer_k=args.answer_tokens,
         n_regions=args.n_regions, search_scope=args.search_scope, pending_samples=args.pending_samples,
         update_step=args.update_step, batch_size=args.eagle_batch_size, eagle_image_size=args.eagle_image_size,
         region_mode=args.region_mode, threshold=args.eagle_threshold, top_frac=args.eagle_top_frac,
+        token_map_mode=getattr(args, "eagle_token_mode", "span"),
+        token_limit=getattr(args, "eagle_token_limit", 0),
+        hint_template=hint_template,
         keep_map=want_viz,
     )
     eg.boxed_span_mode = eagle_span_label
 
     record = {
         "sample_id": str(sample.sample_id), "subset": sample.subset, "model": gm.name,
-        "condition": "hint" if hint else "plain", "hint_mode": args.hint_mode,
+        "condition": cond_name, "hint_mode": args.hint_mode,
         "correct": bool(is_correct(text, sample.solution)),
         "bbox_area": float(bbox_area(bbox)), "gt_bbox": [float(x) for x in bbox],
         "boxed_span_mode": eg.boxed_span_mode, "region_mode_used": eg.region_mode_used,
@@ -284,11 +318,25 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
         # EAGLE — looking (causal) + using (reliance) + faithfulness
         "iou_eagle": eg.iou_eagle, "eagle_bbox_iou": eg.bbox_iou, "pointing_eagle": eg.pointing_eagle,
         "area_eagle": eg.area_eagle, "eagle_energy": eg.energy,
+        "pointing_at1": eg.pointing_at1, "energy_in_box": eg.energy_in_box,
+        "iou_top10": eg.iou_top10, "iou_top20": eg.iou_top20,
         "visual_reliance": eg.visual_reliance, "text_reliance": eg.text_reliance,
         "visual_fraction": eg.visual_fraction, "visual_log_lift": eg.visual_log_lift,
         "org_score": eg.org_score, "baseline_score": eg.baseline_score,
         "org_logp": eg.org_logp, "baseline_logp": eg.baseline_logp,
-        "sufficiency": eg.sufficiency, "necessity": eg.necessity, "n_regions": eg.n_regions,
+        "sufficiency": eg.sufficiency, "necessity": eg.necessity,
+        "deletion_logp_drop": eg.deletion_logp_drop,
+        "insertion_logp_recovery": eg.insertion_logp_recovery,
+        "deletion_logp_drop_top10": eg.deletion_logp_drop_top10,
+        "deletion_logp_drop_top20": eg.deletion_logp_drop_top20,
+        "insertion_logp_recovery_top10": eg.insertion_logp_recovery_top10,
+        "insertion_logp_recovery_top20": eg.insertion_logp_recovery_top20,
+        "insertion_recovery_frac_top20": eg.insertion_recovery_frac_top20,
+        "n_regions": eg.n_regions,
+        "eagle_token_mode": eg.token_map_mode,
+        "eagle_token_count": eg.token_map_count,
+        "eagle_token_indices": eg.token_indices,
+        "eagle_token_details": eg.token_details,
         "eagle_pred_box": list(eg.pred_box_norm) if eg.pred_box_norm else None,
         # judge fields
         "question": sample.problem, "solution": sample.solution, "pred_boxed": pred_boxed,
@@ -300,82 +348,152 @@ def run_condition(gm, sample, *, hint, selected_heads, args, want_viz, reuse_com
 
 
 def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir="viz"):
-    """Panels: image+GT · EAGLE heatmap · EAGLE keep · EAGLE masked · GLIMPSE(answer) · LH · Saliency-R1.
+    """Save the EAGLE official-style explanation heatmap for the final aggregate map."""
+    image = sample.image.convert("RGB")
+    viz_dir = os.path.join(out_dir, subdir)
+    os.makedirs(viz_dir, exist_ok=True)
+    path = os.path.join(viz_dir, f"{tag}.png")
+    if getattr(eg, "attribution_map", None) is None:
+        print(f"[eagle_g0] viz skip {sample.subset}/{sample.sample_id}: no EAGLE attribution_map")
+        return None
 
-    GT box drawn green, predicted box red. "keep"/"masked" show the model's view
-    if only the important region were kept / removed (EAGLE's causal region)."""
+    eagle_repo = os.environ.get("EAGLE_REPO", "/Users/houshihao/project/code/EAGLE-master")
+    eagle_viz_py = os.path.join(eagle_repo, "visualization", "visualization.py")
+    if os.path.exists(eagle_viz_py):
+        try:
+            import importlib.util
+            import tempfile
+
+            spec = importlib.util.spec_from_file_location("_original_eagle_visualization", eagle_viz_py)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"could not load {eagle_viz_py}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            fd, image_path = tempfile.mkstemp(prefix="eagle_g0_", suffix=".png")
+            os.close(fd)
+            try:
+                image.save(image_path)
+                if (
+                    getattr(eg, "token_map_mode", "span") == "span"
+                    and getattr(eg, "eagle_s_set", None) is not None
+                    and isinstance(getattr(eg, "eagle_json_file", None), dict)
+                    and "smdl_score" in eg.eagle_json_file
+                ):
+                    mod.visualization_mllm(image_path, eg.eagle_s_set, eg.eagle_json_file, save_path=path)
+                else:
+                    mod.visualization_mllm(
+                        image_path, np.asarray(eg.attribution_map, dtype=np.float32), {}, save_path=path
+                    )
+            finally:
+                try:
+                    os.remove(image_path)
+                except OSError:
+                    pass
+            return path
+        except Exception as exc:  # noqa: BLE001
+            print(f"[eagle_g0] original EAGLE viz fallback {sample.subset}/{sample.sample_id}: {exc}")
+
     try:
+        import cv2
         import matplotlib
 
         matplotlib.use("Agg")
-        import matplotlib.patches as mpatches
         import matplotlib.pyplot as plt
-        from PIL import Image as _Im
     except Exception as exc:
-        print(f"[eagle_g0] viz skip {sample.subset}/{sample.sample_id}: matplotlib import failed: {exc}")
+        print(f"[eagle_g0] viz skip {sample.subset}/{sample.sample_id}: cv2/matplotlib import failed: {exc}")
         return None
-    image = sample.image.convert("RGB")
-    W, H = image.size
-    bbox = sample.bbox_norm
-    img_arr = np.asarray(image)
+    mask = np.asarray(eg.attribution_map, dtype=np.float32)
+    mask = mask - float(np.nanmin(mask))
+    mx = float(np.nanmax(mask))
+    mask = mask / (mx + 1e-8)
+    mask = (mask * 255.0).astype(np.uint8)
 
-    heat_panels = [("EAGLE (causal)", eg.attribution_map, eg.pred_box_norm)]
-    if gl_res is not None and getattr(gl_res, "visual_map_boxed", None) is not None:
-        heat_panels.append(("GLIMPSE (answer)", gl_res.visual_map_boxed, None))
-    if lh_first is not None and getattr(lh_first, "assembled_map", None) is not None:
-        heat_panels.append(("LH (first-step)", lh_first.assembled_map, lh_first.pred_box_norm))
-    if salr1_res is not None and getattr(salr1_res, "pos_map", None) is not None:
-        heat_panels.append((f"Saliency-R1 ({salr1_res.span_mode})", salr1_res.pos_map, None))
+    # Same smoothing/colormap recipe as EAGLE visualization.visualization.gen_cam.
+    w, h = mask.shape[1], mask.shape[0]
+    image_bgr = cv2.resize(np.asarray(image)[:, :, ::-1], (w, h))
+    small_w, small_h = max(1, int(w / 20)), max(1, int(h / 20))
+    mask = cv2.resize(mask, (small_w, small_h))
+    mask = cv2.resize(mask, (w, h))
+    heatmap = cv2.applyColorMap(np.uint8(mask), cv2.COLORMAP_VIRIDIS).astype(np.float32)
+    cam = (0.5 * heatmap + 0.5 * image_bgr.astype(np.float32)).astype(np.uint8)
 
-    # EAGLE keep / masked images (resize the downsized region mask to image size).
-    keep_arr = masked_arr = None
-    if getattr(eg, "pred_mask", None) is not None:
-        mask_img = _Im.fromarray((eg.pred_mask.astype(np.uint8) * 255)).resize((W, H), _Im.NEAREST)
-        mfull = (np.asarray(mask_img) > 127)[:, :, None]
-        keep_arr = img_arr * mfull
-        masked_arr = img_arr * (~mfull)
-
-    def _box(ax, box, color):
-        if box is None:
-            return
-        x1, y1, x2, y2 = box
-        ax.add_patch(mpatches.Rectangle((x1 * W, y1 * H), (x2 - x1) * W, (y2 - y1) * H,
-                                        fill=False, edgecolor=color, linewidth=2))
-
-    n = 1 + len(heat_panels) + (2 if keep_arr is not None else 0)
-    fig, axes = plt.subplots(1, n, figsize=(4.5 * n, 4.5))
-    if n == 1:
-        axes = [axes]
-    ax_i = 0
-    axes[ax_i].imshow(image); axes[ax_i].set_title("image + GT(green)"); _box(axes[ax_i], bbox, "lime"); axes[ax_i].axis("off"); ax_i += 1
-    for title, m, pred in heat_panels:
-        ax = axes[ax_i]; ax_i += 1
-        ax.imshow(image)
-        if m is not None:
-            ax.imshow(np.asarray(m), extent=(0, W, H, 0), cmap="jet", alpha=0.5, interpolation="bilinear")
-        _box(ax, bbox, "lime"); _box(ax, pred, "red"); ax.set_title(title); ax.axis("off")
-    if keep_arr is not None:
-        axes[ax_i].imshow(keep_arr); axes[ax_i].set_title("EAGLE keep"); _box(axes[ax_i], bbox, "lime"); axes[ax_i].axis("off"); ax_i += 1
-        axes[ax_i].imshow(masked_arr); axes[ax_i].set_title("EAGLE masked"); _box(axes[ax_i], bbox, "lime"); axes[ax_i].axis("off"); ax_i += 1
-    fig.suptitle(f"{sample.subset} {sample.sample_id} | EAGLE IoU={eg.iou_eagle:.2f} "
-                 f"vis_frac={eg.visual_fraction:.2f} suff={eg.sufficiency:.2f} nec={eg.necessity:.2f}", fontsize=11)
-    fig.tight_layout()
-    viz_dir = os.path.join(out_dir, subdir); os.makedirs(viz_dir, exist_ok=True)
-    path = os.path.join(viz_dir, f"{tag}.png")
-    fig.savefig(path, dpi=90); plt.close(fig)
+    fixed_width = 6
+    top_h = fixed_width * h / max(1, w)
+    fig = plt.figure(figsize=(fixed_width, top_h))
+    gs = fig.add_gridspec(nrows=1, ncols=2, width_ratios=[1.0, 0.035])
+    ax = fig.add_subplot(gs[0, 0])
+    ax.axis("off")
+    ax.set_aspect("equal", adjustable="box")
+    im = ax.imshow(cam[:, :, ::-1])
+    cax = fig.add_subplot(gs[0, 1])
+    cbar = fig.colorbar(im, cax=cax)
+    for spine in cbar.ax.spines.values():
+        spine.set_visible(False)
+    cbar.ax.tick_params(length=0, labelbottom=False, labelleft=False)
+    cbar.ax.set_yticklabels([])
+    fig.subplots_adjust(left=0.02, right=0.985, top=0.985, bottom=0.02, wspace=0.04)
+    fig.savefig(path, bbox_inches="tight", pad_inches=0, dpi=600)
+    plt.close(fig)
     return path
+
+
+def save_eagle_artifacts(out_dir, sample, eg, tag, subdir="eagle_artifacts"):
+    art_dir = os.path.join(out_dir, subdir)
+    os.makedirs(art_dir, exist_ok=True)
+    json_path = os.path.join(art_dir, f"{tag}.json")
+    npz_path = os.path.join(art_dir, f"{tag}.npz")
+    meta = {
+        "sample_id": str(sample.sample_id),
+        "subset": sample.subset,
+        "token_map_mode": eg.token_map_mode,
+        "token_map_count": eg.token_map_count,
+        "token_indices": eg.token_indices,
+        "token_details": eg.token_details,
+        "metrics": {
+            "iou_eagle": eg.iou_eagle,
+            "pointing_at1": eg.pointing_at1,
+            "energy_in_box": eg.energy_in_box,
+            "iou_top10": eg.iou_top10,
+            "iou_top20": eg.iou_top20,
+            "deletion_logp_drop_top10": eg.deletion_logp_drop_top10,
+            "deletion_logp_drop_top20": eg.deletion_logp_drop_top20,
+            "insertion_logp_recovery_top10": eg.insertion_logp_recovery_top10,
+            "insertion_logp_recovery_top20": eg.insertion_logp_recovery_top20,
+            "insertion_recovery_frac_top20": eg.insertion_recovery_frac_top20,
+            "visual_log_lift": eg.visual_log_lift,
+            "org_logp": eg.org_logp,
+            "baseline_logp": eg.baseline_logp,
+        },
+        "eagle_json_file": eg.eagle_json_file,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2, default=_json_safe)
+    arrays = {}
+    if eg.attribution_map is not None:
+        arrays["aggregate_map"] = np.asarray(eg.attribution_map, dtype=np.float32)
+    if eg.pred_mask is not None:
+        arrays["pred_mask"] = np.asarray(eg.pred_mask, dtype=np.uint8)
+    if eg.token_maps is not None:
+        arrays["token_maps"] = np.asarray(eg.token_maps, dtype=np.float32)
+    if eg.eagle_s_set is not None:
+        arrays["eagle_s_set"] = np.asarray(eg.eagle_s_set, dtype=np.uint8)
+    if arrays:
+        np.savez_compressed(npz_path, **arrays)
+    return json_path, npz_path if arrays else None
 
 
 def main() -> None:
     args = parse_args()
     name = args.model_name or os.path.basename(args.model.rstrip("/"))
     os.makedirs(args.output_dir, exist_ok=True)
-    conditions = [c.strip().lower() for c in args.conditions.split(",") if c.strip()]
+    conditions = [_condition_prompt(c, (0.0, 0.0, 1.0, 1.0))[0] for c in args.conditions.split(",") if c.strip()]
+    conditions = list(dict.fromkeys(conditions))
     subsets = [s for s in args.subsets.split(",") if s.strip()] or None
     # score_plain_y needs the plain rollout, so ensure plain is present and first.
     if args.hint_mode == "score_plain_y" and "plain" not in conditions:
         conditions = ["plain"] + conditions
-    conditions = sorted(conditions, key=lambda c: 0 if c == "plain" else 1)
+    order = {"plain": 0, "hint": 1, "hidden_hint": 2}
+    conditions = sorted(conditions, key=lambda c: order.get(c, 99))
     is_main = args.shard_index == 0
     if is_main:
         with open(os.path.join(args.output_dir, "config.json"), "w") as f:
@@ -433,15 +551,15 @@ def main() -> None:
     with open(rec_path, "w") as rf:
         for idx, sample in enumerate(samples):
             want_viz = is_main and viz_count.get(sample.subset, 0) < args.viz_per_subset
+            keep_eagle = want_viz or args.save_eagle_artifacts
             used_viz = False
             plain_completion = None
             for cond in conditions:
-                hint = cond == "hint"
-                reuse = plain_completion if (hint and args.hint_mode == "score_plain_y") else None
+                reuse = plain_completion if (cond != "plain" and args.hint_mode == "score_plain_y") else None
                 try:
                     record, (eg, gl_res, lh_first, salr1_res), comp = run_condition(
-                        gm, sample, hint=hint, selected_heads=selected_heads, args=args,
-                        want_viz=want_viz, reuse_completion=reuse)
+                        gm, sample, condition=cond, selected_heads=selected_heads, args=args,
+                        want_viz=keep_eagle, reuse_completion=reuse)
                 except Exception as exc:
                     n_skip += 1
                     print(f"[eagle_g0] skip {sample.subset}/{sample.sample_id} {cond}: {exc}")
@@ -453,9 +571,13 @@ def main() -> None:
                 rf.write(json.dumps(record, default=_json_safe) + "\n"); rf.flush()
                 n_done += 1
                 if want_viz:
+                    tag = f"{sample.subset}_{sample.sample_id}_{cond}_{args.explain_span_mode}_{args.eagle_token_mode}"
                     save_viz(args.output_dir, sample, eg, gl_res, lh_first,
-                             tag=f"{sample.subset}_{sample.sample_id}_{cond}", salr1_res=salr1_res)
+                             tag=tag, salr1_res=salr1_res)
                     used_viz = True
+                if want_viz or args.save_eagle_artifacts:
+                    tag = f"{sample.subset}_{sample.sample_id}_{cond}_{args.explain_span_mode}_{args.eagle_token_mode}"
+                    save_eagle_artifacts(args.output_dir, sample, eg, tag)
             if used_viz:
                 viz_count[sample.subset] = viz_count.get(sample.subset, 0) + 1
             if args.device == "cuda":

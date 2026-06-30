@@ -20,6 +20,9 @@ SPAN_MODES="${SPAN_MODES:-answer,sentence}"
 PER_SUBSET="${PER_SUBSET:-1}"
 CONDITIONS="${CONDITIONS:-plain,hint}"
 EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-128}"
+EAGLE_TOKEN_MODE="${EAGLE_TOKEN_MODE:-per_token_mean}"
+EAGLE_TOKEN_LIMIT="${EAGLE_TOKEN_LIMIT:-16}"
+SAVE_EAGLE_ARTIFACTS="${SAVE_EAGLE_ARTIFACTS:-1}"
 
 run_dirs=()
 if [[ -n "${RUN_DIRS:-}" ]]; then
@@ -57,7 +60,7 @@ if [[ "${#tasks[@]}" -eq 0 ]]; then
   exit 1
 fi
 
-echo "[eagle_viz_multi] run_dirs=${#run_dirs[@]} tasks=${#tasks[@]} gpus=$GPUS selectors=$SELECTS span_modes=$SPAN_MODES per_subset=$PER_SUBSET"
+echo "[eagle_viz_multi] run_dirs=${#run_dirs[@]} tasks=${#tasks[@]} gpus=$GPUS selectors=$SELECTS span_modes=$SPAN_MODES token_mode=$EAGLE_TOKEN_MODE per_subset=$PER_SUBSET"
 
 worker() {
   local gpu="$1"
@@ -73,6 +76,8 @@ worker() {
     echo "[eagle_viz_multi] GPU $gpu -> $d selector=$selector log=$log"
     if ! GPU="$gpu" RUN_DIRS="$d" SELECTS="$selector" SPAN_MODES="$SPAN_MODES" \
       PER_SUBSET="$PER_SUBSET" CONDITIONS="$CONDITIONS" EAGLE_BATCH_SIZE="$EAGLE_BATCH_SIZE" \
+      EAGLE_TOKEN_MODE="$EAGLE_TOKEN_MODE" EAGLE_TOKEN_LIMIT="$EAGLE_TOKEN_LIMIT" \
+      SAVE_EAGLE_ARTIFACTS="$SAVE_EAGLE_ARTIFACTS" \
       bash scripts/eagle_g0_viz.sh > "$log" 2>&1; then
       echo "[eagle_viz_multi] FAILED GPU $gpu -> $d selector=$selector (see $log)" >&2
       fail=$((fail + 1))

@@ -7,9 +7,8 @@ evidence-engine loaders / part-resolver where possible:
   * model load → ``baseline.evidence.sanity_check._load_model`` (eager attn,
     bf16, ``output_attentions``-capable) + ``resolve_model_parts``
     (``image_token_id`` / ``spatial_merge_size`` / head dims from config).
-  * the three condition prompts → ``build_opd_messages`` (C1 teacher / C3 student,
-    plain image+question) and ``build_hint_teacher_messages`` (C2, the silent
-    bbox hint, ``baseline.hint``). One ``OPD_SYSTEM_PROMPT`` for all three.
+  * the condition prompts → OPD's plain image+question prompt plus optional bbox
+    hint text. One ``OPD_SYSTEM_PROMPT`` for all conditions.
   * correctness → ``baseline.eval.grading.attempt_correct`` (rule grader).
 
 Two forward helpers expose the eager attention the probes consume:
@@ -41,6 +40,29 @@ if TYPE_CHECKING:  # pragma: no cover
     from baseline.evidence.saliency_engine import SaliencyModelParts
 
 BoxNorm = tuple[float, float, float, float]
+
+VISIBLE_HINT_TEMPLATE = (
+    "Hint: the evidence needed to answer the question is inside the bounding box "
+    "{bbox} (normalized to [0,1], top-left origin, [x1, y1, x2, y2])."
+)
+
+HIDDEN_HINT_TEMPLATE = (
+    "Hint: the evidence needed to answer the question is inside the bounding box "
+    "{bbox} (normalized to [0,1], top-left origin, [x1, y1, x2, y2]). Use this only "
+    "to decide where to look in the image, then answer the question directly. Do NOT "
+    "mention the bounding box, the coordinates, this hint, or a crop in your "
+    "reasoning or your answer."
+)
+
+
+def format_bbox_hint(
+    bbox: BoxNorm,
+    *,
+    template: str = HIDDEN_HINT_TEMPLATE,
+    decimals: int = 2,
+) -> str:
+    coords = "[" + ", ".join(f"{v:.{decimals}f}" for v in bbox) + "]"
+    return template.format(bbox=coords)
 
 
 # --------------------------------------------------------------------- correctness
@@ -153,21 +175,29 @@ def build_messages(
     hint_bbox: Optional[BoxNorm] = None,
     system_prompt: Optional[str] = None,
     hint_decimals: int = 2,
+    hint_template: Optional[str] = None,
 ) -> list:
     """The chat messages for a condition (plain vs C2 silent-hint).
 
     Factored out of :func:`build_inputs` so the EAGLE adaptor can build the chat
     *text* once and re-run the processor over many perturbed images.
     """
-    from baseline.hint.opd_hint_collator import build_hint_teacher_messages, format_bbox_hint
-    from baseline.opd_data_collator import OPD_SYSTEM_PROMPT, build_opd_messages
+    from baseline.opd_data_collator import OPD_SYSTEM_PROMPT, build_opd_messages, format_opd_student_prompt
 
     if system_prompt is None:
         system_prompt = OPD_SYSTEM_PROMPT
     if hint_bbox is None:
         return build_opd_messages(problem, image, system_prompt=system_prompt, suffix="")
-    hint = format_bbox_hint(hint_bbox, decimals=hint_decimals)
-    return build_hint_teacher_messages(problem, image, hint, system_prompt=system_prompt, suffix="")
+    hint = format_bbox_hint(hint_bbox, template=hint_template or HIDDEN_HINT_TEMPLATE, decimals=hint_decimals)
+    content: list[dict[str, object]] = []
+    if image is not None:
+        content.append({"type": "image", "image": image})
+    content.append({"type": "text", "text": f"{format_opd_student_prompt(problem, '')}\n\n{hint}"})
+    messages: list[dict[str, object]] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": [{"type": "text", "text": system_prompt}]})
+    messages.append({"role": "user", "content": content})
+    return messages
 
 
 def build_inputs(
@@ -178,19 +208,21 @@ def build_inputs(
     hint_bbox: Optional[BoxNorm] = None,
     system_prompt: Optional[str] = None,
     hint_decimals: int = 2,
+    hint_template: Optional[str] = None,
 ) -> dict[str, torch.Tensor]:
     """Tokenize one (image, question) into model inputs for a condition.
 
     ``hint_bbox=None`` builds the plain student/natural prompt (C1 teacher, C3
     student). A box builds the **C2** privileged teacher prompt: the same image +
-    question with the silent bbox hint appended (``baseline.hint`` HINT_TEMPLATE,
-    "use this to decide where to look … do NOT mention the box"). Identical to the
+    question with the silent bbox hint appended (``HIDDEN_HINT_TEMPLATE``:
+    "use this to decide where to look ... do NOT mention the box"). Identical to the
     natural prompt apart from that appended sentence. ``system_prompt=None`` uses
     the shared ``OPD_SYSTEM_PROMPT`` (the one prompt teacher GRPO / student / eval
     all agree on).
     """
     messages = build_messages(
-        image, problem, hint_bbox=hint_bbox, system_prompt=system_prompt, hint_decimals=hint_decimals
+        image, problem, hint_bbox=hint_bbox, system_prompt=system_prompt,
+        hint_decimals=hint_decimals, hint_template=hint_template,
     )
     text = gm.processor.apply_chat_template(
         messages, tokenize=False, add_generation_prompt=True
