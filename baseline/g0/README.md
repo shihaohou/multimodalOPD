@@ -151,4 +151,65 @@ can compare C1/C2/C3 on the same image.
   the 2×2 tables (the verdict itself uses correlations, not this).
 * Greedy decoding by default (reproducible); `SAMPLE=1` to sample.
 * CPU self-tests for the geometry/aggregation logic:
-  `python -m baseline.g0.metrics`.
+  `python -m baseline.g0.metrics` (and `python -m baseline.g0.answer_spans`,
+  `python -m baseline.g0.eagle_src.regions`).
+
+## Answer-span precision + LLM-judge correctness (all probes)
+
+Two upgrades the verdict depends on:
+
+* **Boxed-span metrics.** Every probe can target the precise final answer — the
+  tokens inside `\boxed{...}` (`baseline.g0.answer_spans`, fallback last-K) —
+  instead of the noisy last-K proxy. `run_g0` now records `iou_lh_boxed` /
+  `lh_boxed_pointing` (LH), `iou_gl_boxed` / `vt_ratio_boxed` (GLIMPSE, computed
+  from the *same* single backward via a third β mask) and `boxed_span_mode`.
+  `analyze_g0` runs the headline looking-vs-using on the **boxed** span by default
+  (`--span boxed|answer|first`), with span-matched pointing+vt keys.
+* **LLM-judge correctness.** The rule grader under-scores free-form answers,
+  biasing the correctness axis. `baseline.g0.judge_g0` re-grades a run's answers
+  with an OpenAI-compatible judge (dummy key + `--judge-no-think` for self-hosted
+  Qwen3) into a `judgments.jsonl` **sidecar**; `analyze_g0 --use-judge` overlays
+  it. Per-task-type (Visual-CoT subset) breakdown of the verdict is always emitted
+  (object/spatial vs OCR/doc often disagree).
+
+```bash
+# after a run_g0 / run_eagle_g0 run dir exists:
+uv run python -m baseline.g0.judge_g0 --run-dir eval_outputs/g0/run1 \
+    --judge-api-url http://localhost:8000/v1 --judge-model Qwen3-30B-A3B --judge-no-think
+uv run python -m baseline.g0.analyze_g0 --run-dir eval_outputs/g0/run1 --use-judge --span boxed
+```
+
+## EAGLE-G0 — faithful **causal** attribution (looking + reliance)
+
+LH/GLIMPSE read gradients/attention; **EAGLE** (CVPR 2026, arXiv 2509.22496,
+vendored under `eagle_src/`) measures what the answer *causally depends on* by
+perturbing image sub-regions (submodular insertion/deletion search). It is the
+cross-check for "is the attention map even trustworthy?" Per sample/condition
+(`eagle_probe.py`):
+
+| metric | leg | meaning |
+|--------|-----|---------|
+| `iou_eagle` / `pointing_eagle` / `area_eagle` | looking (causal) | important-region map vs GT box |
+| `visual_reliance` = org−baseline, `text_reliance` = baseline, `visual_fraction` | using | does the answer need the image (vs prior)? |
+| `sufficiency` (insertion AUC) / `necessity` (deletion AUC) | causal sanity | keep-only / delete-region effect on the answer prob |
+
+EAGLE is perturbation-based (~hundreds of forwards/sample) → small budget: the
+image is downsized (`EAGLE_IMAGE_SIZE`), the answer is the `\boxed{}` span (last
+`K` rows ⇒ `logits_to_keep=K`), and only `~n_regions` superpixels are searched.
+`run_eagle_g0` also runs the cheap LH+GLIMPSE on the same rollout (default ON) so
+the **EAGLE-vs-LH** comparison falls out of one pass.
+
+```bash
+# all 4 models (teacher + base-8B + OPD-2B + hint-OPD-2B), 2 GPUs each, concurrent:
+export M=/.../models D=/.../datasets
+JUDGE=1 JUDGE_API_URL=http://localhost:8000/v1 JUDGE_MODEL=Qwen3-30B-A3B \
+  bash scripts/eagle_g0_multi.sh
+# → eval_outputs/eagle_g0/{<name>/...}/  +  eval_outputs/eagle_g0/eagle_report.md
+# single model:  MODEL=$M/CapCurriculum-8B GPUS=0,1 bash scripts/eagle_g0.sh
+```
+
+`analyze_eagle_g0` emits four tables (region accuracy w/ EAGLE-vs-LH;
+looking-vs-using via `corr(correct, iou_eagle)` vs `corr(correct, visual_fraction)`;
+hint mechanism plain-vs-hint; OPD/hint training ↑ image-reliance) + per-task-type.
+Region division degrades gracefully: SLICO → skimage SLIC → numpy grid, so it runs
+without `opencv-contrib`.
