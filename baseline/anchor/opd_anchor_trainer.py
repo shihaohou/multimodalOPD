@@ -13,6 +13,8 @@ their last hidden states; the anchor positions are supplied by
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -21,6 +23,14 @@ import torch.nn.functional as F
 
 from baseline.opd_losses import masked_topk_kl_loss
 from baseline.opd_trainer import OPDTrainer
+
+ANCHOR_AUX_PREFIX = "opd_anchor_projectors."
+ANCHOR_AUX_KEYS = {
+    "opd_anchor_projectors.student.weight",
+    "opd_anchor_projectors.student.bias",
+    "opd_anchor_projectors.teacher.weight",
+    "opd_anchor_projectors.teacher.bias",
+}
 
 
 def _first_present(obj: object, names: tuple[str, ...]):
@@ -86,9 +96,11 @@ def ensure_anchor_projectors(
     """Attach projectors to the trainable model so HF/DeepSpeed optimizes P_s."""
     def mark_training_auxiliary(module: nn.Module) -> None:
         ignore = list(getattr(module, "_keys_to_ignore_on_save", None) or [])
-        pattern = r"opd_anchor_projectors\..*"
-        if pattern not in ignore:
-            ignore.append(pattern)
+        # Transformers checks these as exact state-dict keys on some save paths;
+        # regex strings are not portable across Trainer/DeepSpeed saves.
+        for key in sorted(ANCHOR_AUX_KEYS):
+            if key not in ignore:
+                ignore.append(key)
         module._keys_to_ignore_on_save = ignore
 
     existing = getattr(model, "opd_anchor_projectors", None)
@@ -116,6 +128,134 @@ def ensure_anchor_projectors(
     # for the optimizer, but keep inference checkpoints/vLLM eval clean.
     mark_training_auxiliary(model)
     return projectors
+
+
+def _is_anchor_aux_key(name: str) -> bool:
+    return name.startswith(ANCHOR_AUX_PREFIX)
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _filter_state_dict(state: dict[str, torch.Tensor]) -> tuple[dict[str, torch.Tensor], list[str]]:
+    removed = sorted(key for key in state if _is_anchor_aux_key(key))
+    if not removed:
+        return state, []
+    return {key: value for key, value in state.items() if key not in removed}, removed
+
+
+def _strip_safetensors_file(path: Path) -> tuple[list[str], int]:
+    from safetensors import safe_open
+    from safetensors.torch import load_file, save_file
+
+    metadata = None
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+    except Exception:
+        metadata = None
+    state = load_file(str(path), device="cpu")
+    removed_bytes = sum(
+        _tensor_bytes(value)
+        for key, value in state.items()
+        if _is_anchor_aux_key(key) and torch.is_tensor(value)
+    )
+    state, removed = _filter_state_dict(state)
+    if not removed:
+        return [], 0
+    save_file(state, str(path), metadata=metadata)
+    return removed, removed_bytes
+
+
+def _update_index_file(path: Path, removed: list[str], total_size_delta: int) -> None:
+    if not path.exists() or not removed:
+        return
+    data = json.loads(path.read_text(encoding="utf-8"))
+    weight_map = data.get("weight_map")
+    if not isinstance(weight_map, dict):
+        return
+    removed_set = set(removed)
+    data["weight_map"] = {
+        key: value for key, value in weight_map.items() if key not in removed_set
+    }
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict) and "total_size" in metadata:
+        try:
+            metadata["total_size"] = max(0, int(metadata["total_size"]) - total_size_delta)
+        except Exception:
+            pass
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def strip_anchor_auxiliary_weights(checkpoint_dir: str | Path) -> list[str]:
+    """Remove training-only anchor projector weights from a saved checkpoint.
+
+    ``opd_anchor_projectors`` exists only to compute the training loss. It is not a
+    Qwen3-VL module, so vLLM rightfully rejects checkpoints that contain those
+    keys. This function makes anchor checkpoints inference-clean while leaving the
+    actual student weights untouched.
+    """
+    root = Path(checkpoint_dir)
+    if not root.exists() or not root.is_dir():
+        raise FileNotFoundError(f"checkpoint dir not found: {root}")
+
+    removed_all: list[str] = []
+    total_removed_bytes = 0
+
+    safetensor_paths: list[Path] = []
+    index_path = root / "model.safetensors.index.json"
+    if index_path.exists():
+        data = json.loads(index_path.read_text(encoding="utf-8"))
+        weight_map = data.get("weight_map", {})
+        files = sorted(set(str(v) for v in weight_map.values()))
+        safetensor_paths.extend(root / name for name in files if name.endswith(".safetensors"))
+    else:
+        safetensor_paths.extend(sorted(root.glob("*.safetensors")))
+
+    seen: set[Path] = set()
+    for path in safetensor_paths:
+        path = path.resolve()
+        if path in seen or not path.exists():
+            continue
+        seen.add(path)
+        removed, removed_bytes = _strip_safetensors_file(path)
+        if removed:
+            removed_all.extend(removed)
+            total_removed_bytes += removed_bytes
+
+    if removed_all and index_path.exists():
+        _update_index_file(index_path, removed_all, total_removed_bytes)
+
+    bin_paths: list[Path] = []
+    bin_index_path = root / "pytorch_model.bin.index.json"
+    if bin_index_path.exists():
+        data = json.loads(bin_index_path.read_text(encoding="utf-8"))
+        weight_map = data.get("weight_map", {})
+        files = sorted(set(str(v) for v in weight_map.values()))
+        bin_paths.extend(root / name for name in files if name.endswith(".bin"))
+    else:
+        bin_paths.extend(sorted(root.glob("pytorch_model*.bin")))
+    for path in bin_paths:
+        if not path.exists():
+            continue
+        state = torch.load(path, map_location="cpu")
+        if not isinstance(state, dict):
+            continue
+        removed_bytes = sum(
+            _tensor_bytes(value)
+            for key, value in state.items()
+            if _is_anchor_aux_key(key) and torch.is_tensor(value)
+        )
+        state, removed = _filter_state_dict(state)
+        if removed:
+            torch.save(state, path)
+            removed_all.extend(removed)
+            total_removed_bytes += removed_bytes
+    if removed_all and bin_index_path.exists():
+        _update_index_file(bin_index_path, removed_all, total_removed_bytes)
+
+    return sorted(set(removed_all))
 
 
 class OPDAnchorTrainer(OPDTrainer):
@@ -171,6 +311,23 @@ class OPDAnchorTrainer(OPDTrainer):
         if self._is_anchor_projector_weight(name):
             return
         return super()._load_named_weight_into_vllm(name, weight)
+
+    def save_model(
+        self,
+        output_dir: str | None = None,
+        _internal_call: bool = False,
+    ) -> None:
+        super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+        out = output_dir or self.args.output_dir
+        if self.accelerator.is_main_process:
+            removed = strip_anchor_auxiliary_weights(out)
+            if removed:
+                print(
+                    "[OPD-anchor] stripped training-only checkpoint weights: "
+                    + ", ".join(removed),
+                    flush=True,
+                )
+        self.accelerator.wait_for_everyone()
 
     @staticmethod
     def _gather_positions(hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
