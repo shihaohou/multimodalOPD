@@ -10,8 +10,10 @@ set -euo pipefail
 # the method's teacher branch is the same hidden-hint prompt.
 #
 # Required:
-#   DATASET_NAME   HF id or local path with problem/image/answer and a bbox column.
-#   TEACHER_MODEL  Frozen stronger same-family VLM teacher (local HF only).
+#   DATASET_NAME   HF id or local path with problem/image/answer and a bbox column,
+#                  or D=<datasets dir> to default to $D/Visual-CoT.
+#   TEACHER_MODEL  Frozen stronger same-family VLM teacher (local HF only), or
+#                  M=<models dir> to default to $M/CapCurriculum-8B.
 #
 # Example matching the current Qwen3 line:
 #   cd /home/web_server/antispam/project/houshihao/multimodalOPD && git pull
@@ -27,8 +29,40 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
 
-: "${DATASET_NAME:?Set DATASET_NAME to the training dataset id/path.}"
-: "${TEACHER_MODEL:?Set TEACHER_MODEL to a frozen stronger same-family VLM checkpoint.}"
+# Resolve local cluster roots before validating. This mirrors the Qwen3/TAM
+# launchers and also repairs the common typo where an unset $M/$D in
+# MODEL_NAME_OR_PATH=$M/Qwen... expands to /Qwen... before this script starts.
+M="${M:-}"
+D="${D:-}"
+if [[ -n "$D" ]]; then
+  DATASET_NAME="${DATASET_NAME:-${D%/}/Visual-CoT}"
+  if [[ "${DATASET_NAME}" == "/Visual-CoT" && ! -e "$DATASET_NAME" ]]; then
+    DATASET_NAME="${D%/}/Visual-CoT"
+  fi
+fi
+if [[ -n "$M" ]]; then
+  MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${M%/}/Qwen3-VL-2B-Instruct}"
+  TEACHER_MODEL="${TEACHER_MODEL:-${M%/}/CapCurriculum-8B}"
+  if [[ "$MODEL_NAME_OR_PATH" == "/Qwen3-VL-2B-Instruct" && ! -e "$MODEL_NAME_OR_PATH" ]]; then
+    MODEL_NAME_OR_PATH="${M%/}/Qwen3-VL-2B-Instruct"
+  fi
+  if [[ "$TEACHER_MODEL" == "/CapCurriculum-8B" && ! -e "$TEACHER_MODEL" ]]; then
+    TEACHER_MODEL="${M%/}/CapCurriculum-8B"
+  fi
+else
+  MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-VL-2B-Instruct}"
+fi
+
+: "${DATASET_NAME:?Set DATASET_NAME to the training dataset id/path, or D=<datasets dir>.}"
+: "${TEACHER_MODEL:?Set TEACHER_MODEL to a frozen stronger same-family VLM checkpoint, or M=<models dir>.}"
+for _path_var in MODEL_NAME_OR_PATH TEACHER_MODEL DATASET_NAME; do
+  _path_value="${!_path_var}"
+  if [[ "$_path_value" == /* && ! -e "$_path_value" ]]; then
+    echo "[opd-anchor] ERROR: $_path_var=$_path_value is an absolute path that does not exist." >&2
+    echo "[opd-anchor] If you meant to use local roots, export M=<models dir> and D=<datasets dir>, or pass full paths explicitly." >&2
+    exit 2
+  fi
+done
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export TRANSFORMERS_NO_TF=1
@@ -43,7 +77,6 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 NUM_PROCESSES="${NUM_PROCESSES:-8}"
 ACCELERATE_CONFIG="${ACCELERATE_CONFIG:-configs/accelerate_zero2_gpu_8.yaml}"
 OUTPUT_DIR="${OUTPUT_DIR:-}"
-MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-Qwen/Qwen3-VL-2B-Instruct}"
 TEACHER_TORCH_DTYPE="${TEACHER_TORCH_DTYPE:-bfloat16}"
 ATTN_IMPLEMENTATION="${ATTN_IMPLEMENTATION:-flash_attention_2}"
 TEACHER_ATTN_IMPLEMENTATION="${TEACHER_ATTN_IMPLEMENTATION:-flash_attention_2}"
@@ -177,7 +210,7 @@ echo "[opd-anchor] dataset=$DATASET_NAME  bbox_field=$BBOX_FIELD  lambda_anchor=
   --filter_no_bbox "$FILTER_NO_BBOX" \
   --hint_coord_decimals "$HINT_COORD_DECIMALS" \
   --crop_padding "$CROP_PADDING" \
-  "${HINT_TEMPLATE_ARGS[@]}" \
+  ${HINT_TEMPLATE_ARGS:+"${HINT_TEMPLATE_ARGS[@]}"} \
   --lambda_anchor "$LAMBDA_ANCHOR" \
   --anchor_token "$ANCHOR_TOKEN" \
   --num_anchor_tokens "$ANCHOR_NUM_TOKENS" \
@@ -191,7 +224,7 @@ echo "[opd-anchor] dataset=$DATASET_NAME  bbox_field=$BBOX_FIELD  lambda_anchor=
   --output_dir "$OUTPUT_DIR" \
   --run_name "opd_anchor_${RUN_ID}" \
   --run_config "$RUN_CONFIG" \
-  "${LIMIT_ARGS[@]}" \
+  ${LIMIT_ARGS:+"${LIMIT_ARGS[@]}"} \
   --num_train_epochs "$NUM_TRAIN_EPOCHS" \
   --per_device_train_batch_size "$PER_DEVICE_TRAIN_BATCH_SIZE" \
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
@@ -202,7 +235,7 @@ echo "[opd-anchor] dataset=$DATASET_NAME  bbox_field=$BBOX_FIELD  lambda_anchor=
   --max_grad_norm "$MAX_GRAD_NORM" \
   --bf16 \
   --freeze_vision_tower "$FREEZE_VISION_TOWER" \
-  "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
+  ${GRADIENT_CHECKPOINTING_ARGS:+"${GRADIENT_CHECKPOINTING_ARGS[@]}"} \
   --max_prompt_length "$MAX_PROMPT_LENGTH" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
   --generation_temperature "$GENERATION_TEMPERATURE" \
