@@ -346,12 +346,16 @@ def eagle_probe(
         org_p = float(np.asarray(jf.get("org_score", [float("nan")]), dtype=np.float64).mean())
         base_p = float(np.asarray(jf.get("baseline_score", [float("nan")]), dtype=np.float64).mean())
         tok_res, _, _ = _map_metrics(amap, bbox, threshold, top_frac)
+        token_id = int(comp[j].detach().cpu().item())
         return {
             "token_index": int(j),
-            "token_id": int(comp[j].detach().cpu().item()),
-            "token_text": gm.tokenizer.decode([int(comp[j].detach().cpu().item())],
+            "token_id": token_id,
+            "token_text": gm.tokenizer.decode([token_id],
                                               skip_special_tokens=False,
                                               clean_up_tokenization_spaces=False),
+            "token_display_text": gm.tokenizer.decode(
+                [token_id], skip_special_tokens=True, clean_up_tokenization_spaces=False
+            ),
             "org_prob": org_p,
             "baseline_prob": base_p,
             "org_logp": _mean_log_probs([org_p]),
@@ -383,6 +387,11 @@ def eagle_probe(
                 "token_text": gm.tokenizer.decode([int(comp[j].detach().cpu().item())],
                                                   skip_special_tokens=False,
                                                   clean_up_tokenization_spaces=False),
+                "token_display_text": gm.tokenizer.decode(
+                    [int(comp[j].detach().cpu().item())],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=False,
+                ),
                 "org_prob": float(org_scores[k]) if k < org_scores.size else float("nan"),
                 "baseline_prob": float(base_scores[k]) if k < base_scores.size else float("nan"),
                 "org_logp": _mean_log_probs([org_scores[k]]) if k < org_scores.size else float("nan"),

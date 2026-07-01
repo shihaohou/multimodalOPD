@@ -356,7 +356,7 @@ def run_condition(gm, sample, *, hint=False, condition=None, selected_heads=None
 def _token_plot_inputs(eg):
     words, scores = [], []
     for detail in getattr(eg, "token_details", None) or []:
-        raw = str(detail.get("token_text", ""))
+        raw = str(detail.get("token_display_text", detail.get("token_text", "")))
         label = raw.replace("\n", "\\n").replace("\t", "\\t")
         label = label if label.strip() else "<space>"
         score = detail.get("visual_log_lift", detail.get("visual_reliance"))
@@ -370,8 +370,16 @@ def _token_plot_inputs(eg):
     return words, scores
 
 
+def _original_eagle_words(eg):
+    """Token strings used by EAGLE's original sentence-level visualization."""
+    return [
+        str(detail.get("token_display_text", detail.get("token_text", "")))
+        for detail in (getattr(eg, "token_details", None) or [])
+    ]
+
+
 def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir="viz"):
-    """Save the EAGLE official-style explanation heatmap for the final aggregate map."""
+    """Save an explanation heatmap, using EAGLE's original path for span mode."""
     image = sample.image.convert("RGB")
     viz_dir = os.path.join(out_dir, subdir)
     os.makedirs(viz_dir, exist_ok=True)
@@ -397,7 +405,21 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
             os.close(fd)
             try:
                 image.save(image_path)
-                if token_words and hasattr(mod, "visualize_explanation"):
+                original_span = (
+                    getattr(eg, "token_map_mode", "span") == "span"
+                    and getattr(eg, "eagle_s_set", None) is not None
+                    and isinstance(getattr(eg, "eagle_json_file", None), dict)
+                    and "smdl_score" in eg.eagle_json_file
+                )
+                if original_span:
+                    original_payload = dict(eg.eagle_json_file)
+                    original_words = _original_eagle_words(eg)
+                    if original_words:
+                        original_payload["words"] = original_words
+                    mod.visualization_mllm(
+                        image_path, eg.eagle_s_set, original_payload, save_path=path
+                    )
+                elif token_words and hasattr(mod, "visualize_explanation"):
                     amap = np.asarray(eg.attribution_map, dtype=np.float32)
                     amap = amap - float(np.nanmin(amap))
                     amap = amap / (float(np.nanmax(amap)) + 1e-8)
@@ -412,13 +434,6 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
                     mod.visualize_explanation(vis_saliency_map, token_words, token_scores)
                     mod.plt.savefig(path, bbox_inches="tight", pad_inches=0, dpi=600)
                     mod.plt.close()
-                elif (
-                    getattr(eg, "token_map_mode", "span") == "span"
-                    and getattr(eg, "eagle_s_set", None) is not None
-                    and isinstance(getattr(eg, "eagle_json_file", None), dict)
-                    and "smdl_score" in eg.eagle_json_file
-                ):
-                    mod.visualization_mllm(image_path, eg.eagle_s_set, eg.eagle_json_file, save_path=path)
                 else:
                     mod.visualization_mllm(
                         image_path, np.asarray(eg.attribution_map, dtype=np.float32), {}, save_path=path
