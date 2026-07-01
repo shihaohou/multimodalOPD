@@ -13,6 +13,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 cd "$ROOT_DIR"
 
+if [[ -n "${PYRUN:-}" ]]; then read -r -a PY <<< "$PYRUN";
+elif [[ -n "${VIRTUAL_ENV:-}" ]]; then PY=(python);
+else PY=(uv run python); fi
+
 OUTPUT_BASE="${OUTPUT_BASE:-eval_outputs/eagle_g0}"
 GPUS="${GPUS:-${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}}"
 SELECTS="${SELECTS:-wrong,correct}"
@@ -26,6 +30,7 @@ SAVE_EAGLE_ARTIFACTS="${SAVE_EAGLE_ARTIFACTS:-1}"
 SPLIT_SPAN_MODES="${SPLIT_SPAN_MODES:-1}"
 CASE_MANIFEST="${CASE_MANIFEST:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-}"
+COMPOSE_COMPARISONS="${COMPOSE_COMPARISONS:-1}"
 
 if [[ -n "$CASE_MANIFEST" && ! -f "$CASE_MANIFEST" ]]; then
   echo "[eagle_viz_multi] case manifest not found: $CASE_MANIFEST" >&2
@@ -127,3 +132,14 @@ if [[ "$fail" -gt 0 ]]; then
 fi
 
 echo "[eagle_viz_multi] done. PNGs are under eval_outputs/eagle_g0/<model>/viz_{wrong,correct}_{answer,sentence}/"
+
+if [[ ("$COMPOSE_COMPARISONS" == "1" || "$COMPOSE_COMPARISONS" == "true") \
+      && -n "$CASE_MANIFEST" && -n "$OUTPUT_ROOT" && ",$SPAN_MODES," == *",sentence,"* ]]; then
+  echo "[eagle_viz_multi] composing shared four-model comparison sheets"
+  "${PY[@]}" -m baseline.g0.compose_eagle_comparisons \
+    --case-manifest "$CASE_MANIFEST" \
+    --reference-run-dir "${run_dirs[0]}" \
+    --output-root "$OUTPUT_ROOT" \
+    --run-dirs "${run_dirs[@]}" \
+    --conditions "$CONDITIONS"
+fi

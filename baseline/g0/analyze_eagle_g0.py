@@ -37,12 +37,90 @@ import numpy as np
 from baseline.g0.analyze_g0 import _fmt, _mean, _vals, apply_judge, load_records, safe_corr
 
 
-def _load_all(run_dirs: list[str], use_judge: bool) -> list[dict]:
+def apply_sentence_span_metrics(run_dir: str, records: list[dict]) -> tuple[int, int]:
+    path = os.path.join(run_dir, "sentence_span_metrics.jsonl")
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"{path} not found; run baseline.g0.backfill_sentence_span_metrics first"
+        )
+    metric_map = {}
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            metric = json.loads(line)
+            key = (
+                metric.get("model", ""),
+                metric.get("condition", ""),
+                metric.get("subset", ""),
+                str(metric.get("sample_id", "")),
+            )
+            metric_map[key] = metric
+
+    matched = eligible = 0
+    for record in records:
+        if str(record.get("eagle_target_span_mode", "")) != "sentence":
+            continue
+        eligible += 1
+        key = (
+            record.get("model", ""),
+            record.get("condition", ""),
+            record.get("subset", ""),
+            str(record.get("sample_id", "")),
+        )
+        metric = metric_map.get(key)
+        if metric is None:
+            continue
+        for field in (
+            "iou_eagle",
+            "eagle_bbox_iou",
+            "pointing_eagle",
+            "pointing_at1",
+            "area_eagle",
+            "eagle_energy",
+            "energy_in_box",
+            "iou_top10",
+            "iou_top20",
+            "eagle_pred_box",
+        ):
+            if field in metric:
+                record[field] = metric[field]
+        # These top-area interventions were scored against the old aggregate map
+        # and cannot be reconstructed without model forwards.
+        for field in (
+            "deletion_logp_drop",
+            "insertion_logp_recovery",
+            "deletion_logp_drop_top10",
+            "deletion_logp_drop_top20",
+            "insertion_logp_recovery_top10",
+            "insertion_logp_recovery_top20",
+            "insertion_recovery_frac_top20",
+        ):
+            record[field] = float("nan")
+        record["spatial_metric_source"] = "sentence_span_artifact"
+        matched += 1
+    print(f"[eagle.analyze] applied sentence-span spatial metrics to {matched}/{eligible} records.")
+    return matched, eligible
+
+
+def _load_all(run_dirs: list[str], use_judge: bool, use_sentence_span_metrics: bool) -> list[dict]:
     recs: list[dict] = []
     for d in run_dirs:
         rs = load_records(d)
         if use_judge:
-            apply_judge(d, rs)
+            judged = apply_judge(d, rs)
+            if judged != len(rs):
+                raise RuntimeError(
+                    f"{d}: LLM judge only matched {judged}/{len(rs)} records; "
+                    "finish judge_g0 before generating the final report"
+                )
+        if use_sentence_span_metrics:
+            matched, eligible = apply_sentence_span_metrics(d, rs)
+            if matched != eligible:
+                raise RuntimeError(
+                    f"{d}: sentence-span metrics only matched {matched}/{eligible}; "
+                    "rerun backfill without --allow-missing"
+                )
         for r in rs:
             r.setdefault("_run_dir", d)
         recs.extend(rs)
@@ -339,6 +417,7 @@ def table4_training(by_model, base_keys, opd_keys, hint_keys) -> dict:
 def write_report(out_dir, analysis) -> None:
     L = ["# EAGLE-G0 — faithful causal attribution report", ""]
     L.append(f"_correctness source: **{analysis.get('correctness_source','rule')}** · "
+             f"spatial metric source: **{analysis.get('spatial_metric_source','record')}** · "
              f"{analysis.get('n_records',0)} records across {analysis.get('n_models',0)} models_")
     L.append("")
 
@@ -358,6 +437,10 @@ def write_report(out_dir, analysis) -> None:
         L.append("_Point@1 = max heat patch in GT. Energy = heatmap mass inside GT. "
                  "IoU@10/20 threshold the top 10%/20% area of the final aggregate map. "
                  "DelDrop/InsRec are target-span logp drop/recovery after deleting/keeping top-20% attributed area._")
+        if analysis.get("spatial_metric_source") == "sentence_span_artifact":
+            L.append("")
+            L.append("_DelDrop/InsRec are left blank because offline sentence-map reconstruction has no model "
+                     "forwards; Acc, IoU, Point@1, Energy, visual reliance, and span AUC metrics remain valid._")
         # Saliency-R1 health: holistic-rate (went through the thinking bottleneck) and
         # valid-rate (non-empty positive map). Low → read salr1_abs_*, not salr1_pos_*.
         health = [f"{m}: holistic={_fmt(e.get('salr1_holistic_rate'))} valid={_fmt(e.get('salr1_valid_rate'))} "
@@ -481,13 +564,18 @@ def main() -> None:
     ap.add_argument("--run-dirs", nargs="+", required=True, help="One or more model run dirs.")
     ap.add_argument("--output-dir", default=None, help="Where to write the report (default: first run dir).")
     ap.add_argument("--use-judge", action="store_true", help="Overlay judgments.jsonl per dir (LLM correctness).")
+    ap.add_argument(
+        "--use-sentence-span-metrics",
+        action="store_true",
+        help="Overlay sentence_span_metrics.jsonl geometry before reporting.",
+    )
     ap.add_argument("--base-keys", default="qwen3vl-2b,2b-instruct,base",
                     help="Substrings to identify the RAW base student (table 4); -opd/-hint variants are excluded.")
     ap.add_argument("--opd-keys", default="opd,vanilla", help="Substrings for the vanilla-OPD student.")
     ap.add_argument("--hint-keys", default="hint", help="Substrings for the hint-OPD student.")
     args = ap.parse_args()
 
-    records = _load_all(args.run_dirs, args.use_judge)
+    records = _load_all(args.run_dirs, args.use_judge, args.use_sentence_span_metrics)
     if not records:
         raise SystemExit(f"[eagle.analyze] no records in {args.run_dirs}")
     by_model = _by_model(records)
@@ -499,6 +587,7 @@ def main() -> None:
         "n_models": len(by_model),
         "models": sorted(by_model),
         "correctness_source": "llm_judge" if args.use_judge else "rule",
+        "spatial_metric_source": "sentence_span_artifact" if args.use_sentence_span_metrics else "record",
         "table1_region_accuracy": table1_region_accuracy(by_model),
         "group_averages": group_averages(by_model),
         "table2_looking_vs_using": {m: table2_looking_vs_using(recs) for m, recs in by_model.items()},

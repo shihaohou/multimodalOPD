@@ -384,6 +384,9 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
     viz_dir = os.path.join(out_dir, subdir)
     os.makedirs(viz_dir, exist_ok=True)
     path = os.path.join(viz_dir, f"{tag}.png")
+    panel_dir = os.path.join(out_dir, "viz_panels")
+    os.makedirs(panel_dir, exist_ok=True)
+    panel_path = os.path.join(panel_dir, f"{tag}.png")
     if getattr(eg, "attribution_map", None) is None:
         print(f"[eagle_g0] viz skip {sample.subset}/{sample.sample_id}: no EAGLE attribution_map")
         return None
@@ -412,6 +415,21 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
                     and "smdl_score" in eg.eagle_json_file
                 )
                 if original_span:
+                    panel_map = mod.add_value(eg.eagle_s_set, eg.eagle_json_file)[0][:, :, 0]
+                else:
+                    panel_map = np.asarray(eg.attribution_map, dtype=np.float32)
+                panel_map = panel_map - float(np.nanmin(panel_map))
+                panel_map = panel_map / (float(np.nanmax(panel_map)) + 1e-8)
+                image_bgr = mod.cv2.imread(image_path)
+                panel_map = mod.cv2.resize(
+                    panel_map,
+                    (image_bgr.shape[1], image_bgr.shape[0]),
+                    interpolation=mod.cv2.INTER_LINEAR,
+                )
+                panel_map = mod.norm_image(panel_map)
+                vis_saliency_map, _ = mod.gen_cam(image_path, panel_map)
+                mod.cv2.imwrite(panel_path, vis_saliency_map)
+                if original_span:
                     original_payload = dict(eg.eagle_json_file)
                     original_words = _original_eagle_words(eg)
                     if original_words:
@@ -420,17 +438,6 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
                         image_path, eg.eagle_s_set, original_payload, save_path=path
                     )
                 elif token_words and hasattr(mod, "visualize_explanation"):
-                    amap = np.asarray(eg.attribution_map, dtype=np.float32)
-                    amap = amap - float(np.nanmin(amap))
-                    amap = amap / (float(np.nanmax(amap)) + 1e-8)
-                    image_bgr = mod.cv2.imread(image_path)
-                    amap = mod.cv2.resize(
-                        amap,
-                        (image_bgr.shape[1], image_bgr.shape[0]),
-                        interpolation=mod.cv2.INTER_LINEAR,
-                    )
-                    amap = mod.norm_image(amap)
-                    vis_saliency_map, _ = mod.gen_cam(image_path, amap)
                     mod.visualize_explanation(vis_saliency_map, token_words, token_scores)
                     mod.plt.savefig(path, bbox_inches="tight", pad_inches=0, dpi=600)
                     mod.plt.close()
@@ -470,6 +477,7 @@ def save_viz(out_dir, sample, eg, gl_res, lh_first, tag, salr1_res=None, subdir=
     mask = cv2.resize(mask, (w, h))
     heatmap = cv2.applyColorMap(np.uint8(mask), cv2.COLORMAP_VIRIDIS).astype(np.float32)
     cam = (0.5 * heatmap + 0.5 * image_bgr.astype(np.float32)).astype(np.uint8)
+    cv2.imwrite(panel_path, cam)
 
     fixed_width = 6
     top_h = fixed_width * h / max(1, w)
