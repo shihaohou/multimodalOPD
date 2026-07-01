@@ -158,8 +158,43 @@ LORA_ALPHA="${LORA_ALPHA:-128}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
 REPORT_TO="${REPORT_TO:-wandb}"
-ACCELERATE_CMD="${ACCELERATE_CMD:-uv run accelerate}"
+if [[ -z "${ACCELERATE_CMD:-}" ]]; then
+  if [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/accelerate" ]]; then
+    ACCELERATE_CMD="${VIRTUAL_ENV}/bin/accelerate"
+  else
+    ACCELERATE_CMD="uv run accelerate"
+  fi
+fi
 read -r -a ACCELERATE <<< "$ACCELERATE_CMD"
+
+echo "[opd-anchor] accelerate_cmd=$ACCELERATE_CMD  attn=$ATTN_IMPLEMENTATION  teacher_attn=$TEACHER_ATTN_IMPLEMENTATION"
+if [[ "$ATTN_IMPLEMENTATION" == "flash_attention_2" || "$TEACHER_ATTN_IMPLEMENTATION" == "flash_attention_2" ]]; then
+  if [[ "${ACCELERATE[0]}" == "uv" && "${ACCELERATE[1]:-}" == "run" ]]; then
+    FLASH_ATTN_CHECK_CMD=(uv run python)
+  elif [[ "${ACCELERATE[0]}" == */accelerate && -x "$(dirname "${ACCELERATE[0]}")/python" ]]; then
+    FLASH_ATTN_CHECK_CMD=("$(dirname "${ACCELERATE[0]}")/python")
+  else
+    FLASH_ATTN_CHECK_CMD=(python)
+  fi
+  "${FLASH_ATTN_CHECK_CMD[@]}" - <<'PY'
+import importlib.util
+import sys
+
+print(f"[opd-anchor] python={sys.executable}")
+spec = importlib.util.find_spec("flash_attn")
+if spec is None:
+    raise SystemExit(
+        "[opd-anchor] ERROR: flash_attention_2 requested, but this launcher "
+        "environment cannot import flash_attn. If vanilla OPD worked, compare "
+        "ACCELERATE_CMD/PATH and run the anchor script from the same environment; "
+        "or install flash-attn into this .venv. Temporary fallback: "
+        "ATTN_IMPLEMENTATION=sdpa TEACHER_ATTN_IMPLEMENTATION=sdpa."
+    )
+import flash_attn
+
+print(f"[opd-anchor] flash_attn={getattr(flash_attn, '__version__', 'unknown')}")
+PY
+fi
 
 GRADIENT_CHECKPOINTING_ARGS=()
 if [[ "$GRADIENT_CHECKPOINTING" == "true" ]]; then
