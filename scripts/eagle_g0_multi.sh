@@ -72,6 +72,12 @@ JUDGE_API_URL="${JUDGE_API_URL:-http://localhost:8000/v1}"
 JUDGE_MODEL="${JUDGE_MODEL:-Qwen3-30B-A3B}"
 JUDGE_NO_THINK="${JUDGE_NO_THINK:-1}"
 JUDGE_WORKERS="${JUDGE_WORKERS:-16}"
+SHOW_PROGRESS="${SHOW_PROGRESS:-1}"
+PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-60}"
+PROGRESS_LABEL="${PROGRESS_LABEL:-${HOSTNAME:-local}}"
+EXPECTED_RECORDS_PER_MODEL="${EXPECTED_RECORDS_PER_MODEL:-}"
+SKIP_FINAL_ANALYZE="${SKIP_FINAL_ANALYZE:-0}"
+ALLOW_EXISTING_OUTPUT="${ALLOW_EXISTING_OUTPUT:-0}"
 
 IFS=';' read -r -a MODEL_ARR <<< "$MODELS"
 IFS=';' read -r -a GROUP_ARR <<< "$GPU_GROUPS"
@@ -83,18 +89,80 @@ fi
 echo "[eagle_multi] dataset=$DATASET subsets='${SUBSETS}' limit=$LIMIT limit_mode=$LIMIT_MODE workers_per_gpu=$WORKERS_PER_GPU conditions=$CONDITIONS"
 run_dirs=()
 pids=()
+lock_dirs=()
+
+cleanup_locks() {
+  for lock_dir in "${lock_dirs[@]}"; do
+    rm -f "$lock_dir/owner"
+    rmdir "$lock_dir" 2>/dev/null || true
+  done
+}
+trap cleanup_locks EXIT
+
 for idx in "${!MODEL_ARR[@]}"; do
   entry="${MODEL_ARR[$idx]}"; name="${entry%%=*}"; path="${entry#*=}"; gpus="${GROUP_ARR[$idx]}"
   [[ -z "$name" || -z "$path" ]] && continue
   outdir="$OUTPUT_BASE/$name"; run_dirs+=("$outdir")
+  mkdir -p "$outdir"
+  if compgen -G "$outdir/records*.jsonl" >/dev/null && [[ "$ALLOW_EXISTING_OUTPUT" != "1" && "$ALLOW_EXISTING_OUTPUT" != "true" ]]; then
+    echo "[eagle_multi] REFUSING to overwrite existing records in $outdir." >&2
+    echo "[eagle_multi] Use a new OUTPUT_BASE. ALLOW_EXISTING_OUTPUT=1 is destructive." >&2
+    exit 1
+  fi
+  lock_dir="$outdir/.eagle_run_lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    echo "[eagle_multi] model output is already locked: $outdir" >&2
+    [[ -f "$lock_dir/owner" ]] && cat "$lock_dir/owner" >&2
+    exit 1
+  fi
+  printf 'host=%s pid=%s model=%s\n' "${HOSTNAME:-unknown}" "$$" "$name" > "$lock_dir/owner"
+  lock_dirs+=("$lock_dir")
   echo "[eagle_multi] $name  path=$path  GPUs=$gpus  → $outdir"
   MODEL="$path" MODEL_NAME="$name" GPUS="$gpus" OUTPUT_DIR="$outdir" SKIP_ANALYZE=1 \
     bash scripts/eagle_g0.sh > "$OUTPUT_BASE/${name}.log" 2>&1 &
   pids+=($!)
 done
+
+if [[ -z "$EXPECTED_RECORDS_PER_MODEL" && "$LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+  if [[ -z "$SUBSETS" ]]; then
+    subset_count=10
+  else
+    IFS=',' read -r -a progress_subsets <<< "$SUBSETS"
+    subset_count="${#progress_subsets[@]}"
+  fi
+  IFS=',' read -r -a progress_conditions <<< "$CONDITIONS"
+  EXPECTED_RECORDS_PER_MODEL=$((LIMIT * subset_count * ${#progress_conditions[@]}))
+fi
+
+progress_pid=""
+if [[ "$SHOW_PROGRESS" == "1" || "$SHOW_PROGRESS" == "true" ]]; then
+  progress_args=(
+    --run-dirs "${run_dirs[@]}"
+    --interval "$PROGRESS_INTERVAL"
+    --label "$PROGRESS_LABEL"
+    --watch-pids "${pids[@]}"
+  )
+  [[ -n "$EXPECTED_RECORDS_PER_MODEL" ]] && progress_args+=(--expected-records-per-model "$EXPECTED_RECORDS_PER_MODEL")
+  "${PY[@]}" -m baseline.g0.monitor_eagle_progress "${progress_args[@]}" &
+  progress_pid=$!
+fi
+
 fail=0
 for pid in "${pids[@]}"; do wait "$pid" || fail=$((fail + 1)); done
+if [[ -n "$progress_pid" ]]; then
+  kill "$progress_pid" 2>/dev/null || true
+  wait "$progress_pid" 2>/dev/null || true
+  final_progress_args=(--run-dirs "${run_dirs[@]}" --once --label "$PROGRESS_LABEL")
+  [[ -n "$EXPECTED_RECORDS_PER_MODEL" ]] && final_progress_args+=(--expected-records-per-model "$EXPECTED_RECORDS_PER_MODEL")
+  "${PY[@]}" -m baseline.g0.monitor_eagle_progress "${final_progress_args[@]}"
+fi
 [[ $fail -gt 0 ]] && echo "[eagle_multi] WARNING: $fail worker(s) exited non-zero (see $OUTPUT_BASE/*.log)."
+
+if [[ "$SKIP_FINAL_ANALYZE" == "1" || "$SKIP_FINAL_ANALYZE" == "true" ]]; then
+  echo "[eagle_multi] generation complete; skipped judge/analysis -> $OUTPUT_BASE"
+  [[ "$fail" -gt 0 ]] && exit 1
+  exit 0
+fi
 
 # optional per-dir LLM judge
 USE_JUDGE_FLAG=()
