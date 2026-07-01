@@ -58,6 +58,8 @@ def _stratified_pick(rows: list[dict], count: int, seed: int, category: str) -> 
         subset_rows.sort(key=lambda r: r["sample_id"])
         random.Random(f"{seed}:{category}:{subset}").shuffle(subset_rows)
 
+    if count <= 0:
+        count = sum(len(subset_rows) for subset_rows in by_subset.values())
     picked = []
     subsets = sorted(by_subset)
     while len(picked) < count:
@@ -79,7 +81,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student-run-dir", required=True)
     parser.add_argument("--output", required=True, help="Shared JSON manifest path.")
     parser.add_argument("--condition", default="plain")
-    parser.add_argument("--per-category", type=int, default=5)
+    parser.add_argument("--per-category", type=int, default=5, help="Maximum per category; 0 keeps all.")
     parser.add_argument("--subsets", default="")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--use-judge", action="store_true")
@@ -121,7 +123,7 @@ def main() -> None:
     for category in CATEGORIES:
         rows = _stratified_pick(candidates[category], args.per_category, args.seed, category)
         selected[category] = rows
-        if len(rows) < args.per_category:
+        if args.per_category > 0 and len(rows) < args.per_category:
             shortages.append(f"{category}={len(rows)}/{args.per_category}")
 
     if shortages and not args.allow_fewer:
