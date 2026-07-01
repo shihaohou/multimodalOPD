@@ -12,6 +12,7 @@ import tempfile
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from baseline.g0.analyze_g0 import load_records
 from baseline.g0.viz_eagle_g0 import _load_config, load_selected_samples
 from baseline.probe.saliency_data import canon_subset
 
@@ -84,6 +85,35 @@ def _artifact_paths(run_dir: str, subset: str, sample_id: str, condition: str) -
     tag = f"{subset}_{sample_id}_{condition}_sentence_span"
     artifact_dir = os.path.join(run_dir, "eagle_artifacts")
     return os.path.join(artifact_dir, f"{tag}.json"), os.path.join(artifact_dir, f"{tag}.npz")
+
+
+def _md_text(value) -> str:
+    return ("" if value is None else str(value)).replace("```", "'''")
+
+
+def _fmt_float(value) -> str:
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return ""
+    return f"{value:.4f}" if np.isfinite(value) else ""
+
+
+def _record_maps(run_dirs: list[str]) -> dict[str, dict[tuple[str, str, str], dict]]:
+    out: dict[str, dict[tuple[str, str, str], dict]] = {}
+    for run_dir in run_dirs:
+        model_name = os.path.basename(os.path.normpath(run_dir))
+        records = load_records(run_dir)
+        mapped: dict[tuple[str, str, str], dict] = {}
+        for record in records:
+            key = (
+                canon_subset(str(record.get("subset", ""))),
+                str(record.get("sample_id", "")),
+                str(record.get("condition", "")),
+            )
+            mapped[key] = record
+        out[model_name] = mapped
+    return out
 
 
 def _load_eagle_visualization(eagle_repo: str):
@@ -252,6 +282,84 @@ def compose_one(sample, category: str, model_names: list[str], conditions: list[
     return canvas
 
 
+def write_response_markdown(
+    comparison_root: str,
+    categories: dict,
+    samples: dict,
+    model_names: list[str],
+    conditions: list[str],
+    run_dirs: list[str],
+) -> str:
+    record_maps = _record_maps(run_dirs)
+    lines = ["# EAGLE Comparison Responses", ""]
+    for category, rows in categories.items():
+        lines.extend([f"## {category}", ""])
+        for row in rows:
+            key = (canon_subset(str(row["subset"])), str(row["sample_id"]))
+            sample = samples.get(key)
+            if sample is None:
+                continue
+            image_source = getattr(sample, "image_source", None) or ""
+            rel_sheet = os.path.join(category, f"{sample.subset}_{sample.sample_id}.png")
+            lines.extend(
+                [
+                    f"### {sample.subset}/{sample.sample_id}",
+                    "",
+                    f"- Sheet: [{rel_sheet}]({rel_sheet})",
+                    f"- Image source: `{image_source}`",
+                    f"- GT bbox: `{list(sample.bbox_norm)}`",
+                    "",
+                    "**Question**",
+                    "",
+                    "```text",
+                    _md_text(sample.problem),
+                    "```",
+                    "",
+                    "**Ground Truth Answer**",
+                    "",
+                    "```text",
+                    _md_text(sample.solution),
+                    "```",
+                    "",
+                ]
+            )
+            for condition in conditions:
+                lines.extend([f"#### {condition}", ""])
+                for model_name in model_names:
+                    record = record_maps.get(model_name, {}).get((key[0], key[1], condition))
+                    lines.append(f"**{model_name}**")
+                    lines.append("")
+                    if record is None:
+                        lines.extend(["Missing record.", ""])
+                        continue
+                    lines.extend(
+                        [
+                            f"- Correct(rule): `{record.get('correct', '')}`",
+                            f"- IoU_EAGLE: `{_fmt_float(record.get('iou_eagle'))}`",
+                            f"- Pointing@1: `{_fmt_float(record.get('pointing_at1'))}`",
+                            f"- Energy-in-box: `{_fmt_float(record.get('energy_in_box'))}`",
+                            f"- Visual log lift: `{_fmt_float(record.get('visual_log_lift'))}`",
+                            "",
+                            "Prompt:",
+                            "",
+                            "```text",
+                            _md_text(record.get("prompt", "")),
+                            "```",
+                            "",
+                            "Response:",
+                            "",
+                            "```text",
+                            _md_text(record.get("completion", "")),
+                            "```",
+                            "",
+                        ]
+                    )
+    path = os.path.join(comparison_root, "responses.md")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    return path
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case-manifest", required=True)
@@ -316,7 +424,11 @@ def main() -> None:
 
     with open(os.path.join(comparison_root, "README.md"), "w", encoding="utf-8") as handle:
         handle.write("\n".join(index_lines) + "\n")
+    response_md = write_response_markdown(
+        comparison_root, categories, samples, model_names, conditions, args.run_dirs
+    )
     print(f"[eagle.compose] wrote {wrote} comparison sheet(s) -> {comparison_root}")
+    print(f"[eagle.compose] wrote response markdown -> {response_md}")
 
 
 if __name__ == "__main__":
