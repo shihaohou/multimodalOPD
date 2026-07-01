@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -39,6 +40,16 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+
+try:
+    from transformers import Qwen3_5ForConditionalGeneration
+except ImportError:  # transformers<=4.57.1 may not yet ship Qwen3.5.
+    Qwen3_5ForConditionalGeneration = None
+
+try:
+    from transformers import AutoModelForMultimodalLM
+except ImportError:
+    AutoModelForMultimodalLM = None
 
 import vigos.dataset_utils as dataset_utils
 from baseline.opd_data_collator import OPDDataCollator, resolve_opd_system_prompt
@@ -72,15 +83,34 @@ def _opd_model_class_for_checkpoint(
 
     (Lives in the OPD layer so ``vigos/`` stays untouched.)
     """
-    config = AutoConfig.from_pretrained(
-        model_name_or_path, trust_remote_code=trust_remote_code
-    )
-    model_type = getattr(config, "model_type", "") or ""
+    try:
+        config = AutoConfig.from_pretrained(
+            model_name_or_path, trust_remote_code=trust_remote_code
+        )
+        model_type = getattr(config, "model_type", "") or ""
+    except Exception:
+        config_path = Path(model_name_or_path) / "config.json"
+        if not config_path.exists():
+            raise
+        with config_path.open("r", encoding="utf-8") as handle:
+            model_type = str(json.load(handle).get("model_type", "") or "")
     base = model_type[: -len("_text")] if model_type.endswith("_text") else model_type
     if base == "qwen2_5_vl":
         return Qwen2_5_VLForConditionalGeneration, model_type
     if base == "qwen3_vl":
         return Qwen3VLForConditionalGeneration, model_type
+    if base == "qwen3_5":
+        qwen35_class = Qwen3_5ForConditionalGeneration or AutoModelForMultimodalLM
+        if qwen35_class is None:
+            raise ValueError(
+                "Qwen3.5 checkpoints use model_type='qwen3_5' (or a top-level "
+                "'qwen3_5_text' in some re-saves) and require a Transformers build "
+                "that exports Qwen3_5ForConditionalGeneration or "
+                "AutoModelForMultimodalLM. Install a newer Transformers/source build; "
+                "do not load Qwen3.5 with the Qwen3-VL model class because the text "
+                "architecture differs."
+            )
+        return qwen35_class, model_type
     return _model_class_for_checkpoint(model_name_or_path, trust_remote_code)
 
 # ViRL39K-aware loader (local parquet -> problem/image/answer); falls through to
