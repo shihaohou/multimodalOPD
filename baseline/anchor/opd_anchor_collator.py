@@ -292,6 +292,8 @@ class OPDAnchorDataCollator(OPDDataCollator):
         sample_ids: list[int] = []
         hint_texts: list[str] = []
         has_hint: list[int] = []
+        bbox_values: list[list[float]] = []
+        bbox_masks: list[int] = []
 
         for local_idx, feature in enumerate(features):
             image = _safe_rgb_image(feature.get("images", feature.get("image")))
@@ -300,6 +302,12 @@ class OPDAnchorDataCollator(OPDDataCollator):
             answer = normalize_reference_answer(feature.get(self.answer_field))
             sample_id = int(feature.get("problem_id", local_idx))
             bbox = parse_bbox_norm(feature.get(self.bbox_field))
+            if bbox is None:
+                bbox_values.append([0.0, 0.0, 0.0, 0.0])
+                bbox_masks.append(0)
+            else:
+                bbox_values.append([float(v) for v in bbox])
+                bbox_masks.append(1)
 
             student_message = build_anchor_messages(
                 problem,
@@ -391,5 +399,7 @@ class OPDAnchorDataCollator(OPDDataCollator):
         result["sample_ids"] = torch.tensor(sample_ids, dtype=torch.long)
         result["hint_texts"] = hint_texts
         result["has_hint"] = torch.tensor(has_hint, dtype=torch.long)
+        result["bbox_norm"] = torch.tensor(bbox_values, dtype=torch.float32)
+        result["bbox_attention_mask"] = torch.tensor(bbox_masks, dtype=torch.bool)
         result["anchor_texts"] = [self.anchor_text for _ in features]
         return result
