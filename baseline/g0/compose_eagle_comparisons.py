@@ -89,7 +89,13 @@ def _artifact_paths(run_dir: str, subset: str, sample_id: str, condition: str) -
 def _load_eagle_visualization(eagle_repo: str):
     path = os.path.join(eagle_repo, "visualization", "visualization.py")
     if not os.path.exists(path):
-        raise FileNotFoundError(f"original EAGLE visualization not found: {path}")
+        from baseline.g0.eagle_src import visualization
+
+        print(
+            f"[eagle.compose] external EAGLE visualization not found at {path}; "
+            "using vendored original EAGLE functions"
+        )
+        return visualization
     spec = importlib.util.spec_from_file_location("_original_eagle_artifact_visualization", path)
     if spec is None or spec.loader is None:
         raise ImportError(f"could not load {path}")
@@ -162,6 +168,7 @@ def render_missing_artifact_panels(
     if not missing_jobs:
         return 0, 0
 
+    print(f"[eagle.compose] rendering {len(missing_jobs)} missing panel(s) from artifacts", flush=True)
     eagle_viz = _load_eagle_visualization(eagle_repo)
     rendered = failed = 0
     by_sample = {}
@@ -184,6 +191,13 @@ def render_missing_artifact_panels(
                     print(
                         f"[eagle.compose] panel failed {model_name} "
                         f"{sample.subset}/{sample.sample_id} {condition}: {exc}"
+                    )
+                done = rendered + failed
+                if done % 50 == 0 or done == len(missing_jobs):
+                    print(
+                        f"[eagle.compose] panels {done}/{len(missing_jobs)} "
+                        f"(rendered={rendered}, failed={failed})",
+                        flush=True,
                     )
         finally:
             try:
@@ -296,6 +310,8 @@ def main() -> None:
             relpath = os.path.relpath(path, comparison_root)
             index_lines.append(f"- [{sample.subset}/{sample.sample_id}]({relpath})")
             wrote += 1
+            if wrote % 10 == 0:
+                print(f"[eagle.compose] comparison sheets {wrote}/{len(keys)}", flush=True)
         index_lines.append("")
 
     with open(os.path.join(comparison_root, "README.md"), "w", encoding="utf-8") as handle:

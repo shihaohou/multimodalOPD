@@ -44,6 +44,45 @@ def _index(records: list[dict], condition: str, subsets: set[str] | None) -> dic
     return out
 
 
+def _complete_artifact_keys(run_dir: str, conditions: list[str]) -> set[tuple[str, str]]:
+    records = _dedupe(load_records(run_dir))
+    index = {
+        (
+            str(record.get("condition", "")),
+            canon_subset(record.get("subset", "")),
+            str(record.get("sample_id", "")),
+        ): record
+        for record in records
+    }
+    candidate_keys = {
+        (subset, sample_id)
+        for condition, subset, sample_id in index
+        if condition == conditions[0]
+    }
+    complete = set()
+    for subset, sample_id in candidate_keys:
+        ok = True
+        for condition in conditions:
+            record = index.get((condition, subset, sample_id))
+            if record is None:
+                ok = False
+                break
+            tag = (
+                f"{record.get('subset', '')}_{record.get('sample_id', '')}_{condition}_"
+                f"{record.get('eagle_target_span_mode', '')}_{record.get('eagle_token_mode', '')}"
+            )
+            artifact_dir = os.path.join(run_dir, "eagle_artifacts")
+            if not (
+                os.path.exists(os.path.join(artifact_dir, f"{tag}.json"))
+                and os.path.exists(os.path.join(artifact_dir, f"{tag}.npz"))
+            ):
+                ok = False
+                break
+        if ok:
+            complete.add((subset, sample_id))
+    return complete
+
+
 def _category(student_correct: bool, teacher_correct: bool) -> str:
     stu = "correct" if student_correct else "wrong"
     tea = "correct" if teacher_correct else "wrong"
@@ -86,6 +125,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--use-judge", action="store_true")
     parser.add_argument("--allow-fewer", action="store_true")
+    parser.add_argument(
+        "--required-run-dirs",
+        nargs="+",
+        default=[],
+        help="Keep only samples with complete artifacts in every listed run.",
+    )
+    parser.add_argument("--required-conditions", default="plain,hint,hidden_hint")
     return parser.parse_args()
 
 
@@ -107,6 +153,16 @@ def main() -> None:
     teacher = _index(teacher_records, args.condition, subsets)
     student = _index(student_records, args.condition, subsets)
     shared_keys = sorted(set(teacher) & set(student))
+    required_conditions = [value.strip() for value in args.required_conditions.split(",") if value.strip()]
+    if args.required_run_dirs:
+        if not required_conditions:
+            raise SystemExit("[eagle.pairwise] --required-conditions is empty")
+        complete_keys = None
+        for run_dir in args.required_run_dirs:
+            run_keys = _complete_artifact_keys(run_dir, required_conditions)
+            print(f"[eagle.pairwise] complete artifacts {run_dir}: {len(run_keys)} samples")
+            complete_keys = run_keys if complete_keys is None else complete_keys & run_keys
+        shared_keys = sorted(set(shared_keys) & (complete_keys or set()))
     if not shared_keys:
         raise SystemExit("[eagle.pairwise] no shared teacher/student records found")
 
@@ -148,6 +204,8 @@ def main() -> None:
         "correctness_source": "llm_judge" if args.use_judge else "rule",
         "per_category": args.per_category,
         "shared_record_count": len(shared_keys),
+        "required_run_dirs": args.required_run_dirs,
+        "required_conditions": required_conditions if args.required_run_dirs else [],
         "candidate_counts": {category: len(candidates[category]) for category in CATEGORIES},
         "categories": selected,
     }
