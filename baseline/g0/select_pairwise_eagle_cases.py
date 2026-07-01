@@ -94,8 +94,14 @@ def main() -> None:
     teacher_records = _dedupe(load_records(args.teacher_run_dir))
     student_records = _dedupe(load_records(args.student_run_dir))
     if args.use_judge:
-        apply_judge(args.teacher_run_dir, teacher_records)
-        apply_judge(args.student_run_dir, student_records)
+        teacher_judged = apply_judge(args.teacher_run_dir, teacher_records)
+        student_judged = apply_judge(args.student_run_dir, student_records)
+        if teacher_judged != len(teacher_records) or student_judged != len(student_records):
+            raise SystemExit(
+                "[eagle.pairwise] incomplete LLM judge coverage: "
+                f"teacher={teacher_judged}/{len(teacher_records)}, "
+                f"student={student_judged}/{len(student_records)}"
+            )
 
     subsets = {canon_subset(x) for x in args.subsets.split(",") if x.strip()} or None
     teacher = _index(teacher_records, args.condition, subsets)
