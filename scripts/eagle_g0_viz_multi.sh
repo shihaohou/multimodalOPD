@@ -27,6 +27,12 @@ SPLIT_SPAN_MODES="${SPLIT_SPAN_MODES:-1}"
 CASE_MANIFEST="${CASE_MANIFEST:-}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 
+if [[ -n "$CASE_MANIFEST" && ! -f "$CASE_MANIFEST" ]]; then
+  echo "[eagle_viz_multi] case manifest not found: $CASE_MANIFEST" >&2
+  echo "[eagle_viz_multi] run baseline.g0.select_pairwise_eagle_cases first." >&2
+  exit 1
+fi
+
 run_dirs=()
 if [[ -n "${RUN_DIRS:-}" ]]; then
   IFS=';' read -r -a run_dirs <<< "$RUN_DIRS"

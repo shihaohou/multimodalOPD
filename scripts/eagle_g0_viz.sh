@@ -49,6 +49,12 @@ WITH_SALR1="${WITH_SALR1:-0}"
 NO_USE_JUDGE="${NO_USE_JUDGE:-0}"
 SAVE_EAGLE_ARTIFACTS="${SAVE_EAGLE_ARTIFACTS:-1}"
 
+if [[ -n "$CASE_MANIFEST" && ! -f "$CASE_MANIFEST" ]]; then
+  echo "[eagle_viz] case manifest not found: $CASE_MANIFEST" >&2
+  echo "[eagle_viz] run baseline.g0.select_pairwise_eagle_cases first." >&2
+  exit 1
+fi
+
 run_dirs=()
 if [[ -n "${RUN_DIRS:-}" ]]; then
   IFS=';' read -r -a run_dirs <<< "$RUN_DIRS"
