@@ -27,6 +27,8 @@ else PY=(uv run python); fi
 [[ -n "${GPU:-}" ]] && export CUDA_VISIBLE_DEVICES="$GPU"
 
 OUTPUT_BASE="${OUTPUT_BASE:-eval_outputs/eagle_g0}"
+SELECTION_RUN_DIR="${SELECTION_RUN_DIR:-}"
+CASE_MANIFEST="${CASE_MANIFEST:-}"
 SELECT="${SELECT:-wrong}"
 SELECTS="${SELECTS:-$SELECT}"
 SPAN_MODES="${SPAN_MODES:-answer}"
@@ -36,6 +38,7 @@ PER_SUBSET="${PER_SUBSET:-3}"
 MAX_CASES="${MAX_CASES:-}"
 SUBSETS="${SUBSETS:-}"
 OUTPUT_SUBDIR="${OUTPUT_SUBDIR:-}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 EAGLE_BATCH_SIZE="${EAGLE_BATCH_SIZE:-128}"
 EAGLE_IMAGE_SIZE="${EAGLE_IMAGE_SIZE:-}"
 EAGLE_TOKEN_MODE="${EAGLE_TOKEN_MODE:-span}"
@@ -80,7 +83,10 @@ for d in "${run_dirs[@]}"; do
   )
   [[ -n "$MAX_CASES" ]] && args+=(--max-cases "$MAX_CASES")
   [[ -n "$SUBSETS" ]] && args+=(--subsets "$SUBSETS")
+  [[ -n "$SELECTION_RUN_DIR" ]] && args+=(--selection-run-dir "$SELECTION_RUN_DIR")
+  [[ -n "$CASE_MANIFEST" ]] && args+=(--case-manifest "$CASE_MANIFEST")
   [[ -n "$OUTPUT_SUBDIR" ]] && args+=(--output-subdir "$OUTPUT_SUBDIR")
+  [[ -n "$OUTPUT_ROOT" ]] && args+=(--output-root "$OUTPUT_ROOT")
   [[ -n "$EAGLE_IMAGE_SIZE" ]] && args+=(--eagle-image-size "$EAGLE_IMAGE_SIZE")
   [[ -n "$MAX_NEW_TOKENS" ]] && args+=(--max-new-tokens "$MAX_NEW_TOKENS")
   [[ -n "$ATTN" ]] && args+=(--attn "$ATTN")

@@ -117,6 +117,7 @@ def select_cases(
     for subset, rows in sorted(by_subset.items()):
         if key_fn is None:
             rng = random.Random(f"{seed}:{subset}")
+            rows.sort(key=lambda r: str(r.get("sample_id", "")))
             rng.shuffle(rows)
             picked = rows[:per_subset]
         else:
@@ -204,6 +205,12 @@ def _viz_args_from_config(cfg: dict, cli: argparse.Namespace) -> Namespace:
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Render selected post-hoc EAGLE-G0 visualizations.")
     ap.add_argument("--run-dir", required=True, help="One model directory under eval_outputs/eagle_g0.")
+    ap.add_argument(
+        "--selection-run-dir",
+        default=None,
+        help="Select cases from this reference model, then render them with --run-dir.",
+    )
+    ap.add_argument("--case-manifest", default=None, help="Shared case groups produced by pairwise selection.")
     ap.add_argument("--select", default="wrong", choices=sorted(SELECTORS))
     ap.add_argument("--selects", default="", help="Comma list of selectors; overrides --select.")
     ap.add_argument("--span-modes", default="answer",
@@ -215,6 +222,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--max-cases", type=int, default=None, help="Optional global cap after per-subset selection.")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--output-subdir", default=None, help="Default: viz_<select>.")
+    ap.add_argument("--output-root", default=None, help="Write under OUTPUT_ROOT/<run-dir-name> instead of --run-dir.")
     ap.add_argument("--no-use-judge", dest="use_judge", action="store_false",
                     help="Do not overlay judgments.jsonl before selecting cases.")
     ap.set_defaults(use_judge=True)
@@ -234,9 +242,10 @@ def _split_csv(text: str) -> list[str]:
     return [x.strip() for x in str(text).split(",") if x.strip()]
 
 
-def _resolve_selects(args: argparse.Namespace) -> list[str]:
+def _resolve_selects(args: argparse.Namespace, allowed: set[str] | None = None) -> list[str]:
     selects = _split_csv(args.selects) if args.selects else [args.select]
-    bad = [s for s in selects if s not in SELECTORS]
+    allowed = set(SELECTORS) if allowed is None else allowed
+    bad = [s for s in selects if s not in allowed]
     if bad:
         raise SystemExit(f"[eagle.viz] bad selector(s): {','.join(bad)}")
     return list(dict.fromkeys(selects))
@@ -252,9 +261,7 @@ def _resolve_span_modes(args: argparse.Namespace) -> list[str]:
 
 def _subdir_name(base: str | None, select: str, span_mode: str, multi_span: bool) -> str:
     if base:
-        if multi_span:
-            return f"{base}_{select}_{span_mode}"
-        return f"{base}_{select}"
+        return f"{base}_{select}_{span_mode}"
     if span_mode == "answer" and not multi_span:
         return f"viz_{select}"
     return f"viz_{select}_{span_mode}"
@@ -263,14 +270,27 @@ def _subdir_name(base: str | None, select: str, span_mode: str, multi_span: bool
 def main() -> None:
     args = parse_args()
     cfg = _load_config(args.run_dir)
-    records = _dedupe_records(load_records(args.run_dir))
-    if args.use_judge:
-        apply_judge(args.run_dir, records)
-
-    available = _available_conditions(records)
-    if not available:
-        raise SystemExit(f"[eagle.viz] no records found in {args.run_dir}")
-    rank_condition = args.rank_condition if args.rank_condition in available else available[0]
+    case_groups = None
+    records = []
+    rank_condition = args.rank_condition
+    if args.case_manifest:
+        with open(args.case_manifest, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        case_groups = manifest.get("categories") or manifest.get("selectors")
+        if not isinstance(case_groups, dict) or not case_groups:
+            raise SystemExit(f"[eagle.viz] no case groups in {args.case_manifest}")
+        print(f"[eagle.viz] using shared case manifest {args.case_manifest}")
+    else:
+        selection_run_dir = args.selection_run_dir or args.run_dir
+        records = _dedupe_records(load_records(selection_run_dir))
+        if args.use_judge:
+            apply_judge(selection_run_dir, records)
+        available = _available_conditions(records)
+        if not available:
+            raise SystemExit(f"[eagle.viz] no records found in {selection_run_dir}")
+        rank_condition = args.rank_condition if args.rank_condition in available else available[0]
+        if selection_run_dir != args.run_dir:
+            print(f"[eagle.viz] selecting shared cases from {selection_run_dir}")
     render_conditions = [_condition_prompt(c, (0.0, 0.0, 1.0, 1.0))[0]
                          for c in args.conditions.split(",") if c.strip()]
     render_conditions = list(dict.fromkeys(render_conditions))
@@ -280,14 +300,20 @@ def main() -> None:
         render_conditions = ["plain"] + render_conditions
 
     subset_filter = {canon_subset(s) for s in args.subsets.split(",") if s.strip()} or None
-    selects = _resolve_selects(args)
+    selects = _resolve_selects(args, set(case_groups) if case_groups is not None else None)
     span_modes = _resolve_span_modes(args)
     chosen_by_select: dict[str, list[dict]] = {}
     for select in selects:
-        chosen = select_cases(
-            records, select=select, rank_condition=rank_condition, subsets=subset_filter,
-            per_subset=args.per_subset, max_cases=args.max_cases, seed=args.seed,
-        )
+        if case_groups is not None:
+            chosen = [
+                row for row in case_groups[select]
+                if subset_filter is None or canon_subset(row.get("subset", "")) in subset_filter
+            ]
+        else:
+            chosen = select_cases(
+                records, select=select, rank_condition=rank_condition, subsets=subset_filter,
+                per_subset=args.per_subset, max_cases=args.max_cases, seed=args.seed,
+            )
         if not chosen:
             print(f"[eagle.viz] WARNING: no cases selected for {select}/{rank_condition}")
             continue
@@ -312,6 +338,10 @@ def main() -> None:
         min_pixels=getattr(ns, "min_pixels", None), max_pixels=getattr(ns, "max_pixels", None),
     )
 
+    render_root = args.run_dir
+    if args.output_root:
+        render_root = os.path.join(args.output_root, os.path.basename(os.path.normpath(args.run_dir)))
+        os.makedirs(render_root, exist_ok=True)
     explicit_subdir = args.output_subdir
     multi_span = len(span_modes) > 1 or any(mode != "answer" for mode in span_modes)
     wrote = 0
@@ -343,21 +373,21 @@ def main() -> None:
 
                     subdir = _subdir_name(explicit_subdir, select, span_mode, multi_span)
                     path = save_viz(
-                        args.run_dir, sample, eg, gl_res, lh_first,
+                        render_root, sample, eg, gl_res, lh_first,
                         tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
                         salr1_res=salr1_res, subdir=subdir,
                     )
                     save_viz_markdown(
-                        args.run_dir, sample, record, eg,
+                        render_root, sample, record, eg,
                         tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
                         viz_path=path,
                     )
                     if ns.save_eagle_artifacts:
                         save_eagle_artifacts(
-                            args.run_dir, sample, eg,
+                            render_root, sample, eg,
                             tag=f"{sample.subset}_{sample.sample_id}_{cond}_{span_mode}_{ns.eagle_token_mode}",
                         )
-                    out_dir = os.path.join(args.run_dir, subdir)
+                    out_dir = os.path.join(render_root, subdir)
                     output_dirs.add(out_dir)
                     if path and os.path.exists(path):
                         print(f"[eagle.viz] wrote {path} "
