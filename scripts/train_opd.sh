@@ -142,6 +142,11 @@ LORA_ALPHA="${LORA_ALPHA:-128}"
 LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 LORA_TARGET_MODULES="${LORA_TARGET_MODULES:-q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj}"
 REPORT_TO="${REPORT_TO:-wandb}"
+# Launcher command. Default keeps the historical project-managed environment
+# (`uv run accelerate`). For Qwen3.5 experiments in a separately upgraded venv, set
+# ACCELERATE_CMD=accelerate so uv does not re-sync the old pyproject pins.
+ACCELERATE_CMD="${ACCELERATE_CMD:-uv run accelerate}"
+read -r -a ACCELERATE <<< "$ACCELERATE_CMD"
 
 GRADIENT_CHECKPOINTING_ARGS=()
 if [[ "$GRADIENT_CHECKPOINTING" == "true" ]]; then
@@ -177,7 +182,7 @@ DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
 RUN_CONFIG="${RUN_CONFIG:-opd_${DATASET_TAG}}_${RUN_ID}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
 
-uv run accelerate launch \
+"${ACCELERATE[@]}" launch \
   --config_file "$ACCELERATE_CONFIG" \
   --num_processes "$NUM_PROCESSES" \
   --main_process_port "${MAIN_PROCESS_PORT:-13378}" \
