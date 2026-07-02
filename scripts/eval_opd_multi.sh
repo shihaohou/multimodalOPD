@@ -232,6 +232,7 @@ if [[ "$EVAL_BACKEND" == "lmms_fast" ]]; then
   fi
   echo "  DATASETS=${DATASETS}"
   echo "  PROMPT_MODE=${PROMPT_MODE:-lmms}  LMMS_EVAL_DIR=${LMMS_EVAL_DIR:-/Users/houshihao/project/code/lmms-eval-main}"
+  [[ "$PHASE" != "judge" ]] && echo "  BUILD_WORKERS=${BUILD_WORKERS:-1}"
   [[ "$PHASE" == "judge" ]] && echo "  JUDGE_WORKERS=${JUDGE_WORKERS:-1}"
   [[ "$PHASE" == "judge" ]] && echo "  JUDGE_MODEL=${JUDGE_MODEL:-${MODEL_VERSION:-}}"
   [[ "$PHASE" == "judge" && -n "${JUDGE_EXTRA_BODY:-}" ]] && echo "  JUDGE_EXTRA_BODY=${JUDGE_EXTRA_BODY}"

@@ -64,6 +64,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--limit", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=0)
+    p.add_argument(
+        "--build-workers",
+        type=int,
+        default=int(os.environ.get("BUILD_WORKERS", "1")),
+        help="Concurrent workers for doc_to_text/doc_to_visual/chat-template request building.",
+    )
     p.add_argument("--max-tokens", type=int, default=None, help="Override task max_new_tokens.")
     p.add_argument("--temperature", type=float, default=None, help="Override task temperature.")
     p.add_argument("--top-p", type=float, default=None, help="Override task top_p.")
@@ -332,6 +338,51 @@ def build_prompt(processor: Any, task_text: str, images: list[Any], args: argpar
     )
 
 
+def build_request_for_doc(
+    task: Any,
+    docs: Any,
+    doc_id: int,
+    processor: Any,
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], tuple[int, Any, str, list[Any], Any]]:
+    doc = docs[doc_id]
+    text = task.doc_to_text(doc)
+    visuals = task.doc_to_visual(doc) or []
+    prompt = build_prompt(processor, text, visuals, args)
+    return vllm_request(prompt, visuals), (doc_id, doc, text, visuals, prompt)
+
+
+def build_requests(
+    task: Any,
+    docs: Any,
+    total: int,
+    processor: Any,
+    args: argparse.Namespace,
+) -> tuple[list[dict[str, Any]], list[tuple[int, Any, str, list[Any], Any]]]:
+    workers = max(1, int(args.build_workers or 1))
+    doc_ids = range(total)
+    if workers == 1:
+        built = [
+            build_request_for_doc(task, docs, doc_id, processor, args)
+            for doc_id in tqdm(doc_ids, desc=f"build {task.task_name}")
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            built = list(
+                tqdm(
+                    pool.map(
+                        lambda doc_id: build_request_for_doc(task, docs, doc_id, processor, args),
+                        doc_ids,
+                    ),
+                    total=total,
+                    desc=f"build {task.task_name} x{workers}",
+                )
+            )
+    requests = [item[0] for item in built]
+    request_docs = [item[1] for item in built]
+    return requests, request_docs
+
+
 def _flatten_scalars(value: Any, prefix: str = "") -> dict[str, float | int | str | None]:
     if isinstance(value, dict):
         flat: dict[str, float | int | str | None] = {}
@@ -531,15 +582,7 @@ def main() -> None:
         else:
             assert processor is not None and engine is not None
             sampling_params = task_sampling_params(task, args)
-            requests: list[dict[str, Any]] = []
-            request_docs: list[tuple[int, Any, str, list[Any], Any]] = []
-            for doc_id in tqdm(range(total), desc=f"build {task_name}"):
-                doc = docs[doc_id]
-                text = task.doc_to_text(doc)
-                visuals = task.doc_to_visual(doc) or []
-                prompt = build_prompt(processor, text, visuals, args)
-                requests.append(vllm_request(prompt, visuals))
-                request_docs.append((doc_id, doc, text, visuals, prompt))
+            requests, request_docs = build_requests(task, docs, total, processor, args)
 
             batch = args.batch_size or 0
             chunk = len(requests) if batch <= 0 else batch
