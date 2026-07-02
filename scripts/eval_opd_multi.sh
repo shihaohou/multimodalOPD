@@ -233,6 +233,7 @@ if [[ "$EVAL_BACKEND" == "lmms_fast" ]]; then
   echo "  DATASETS=${DATASETS}"
   echo "  PROMPT_MODE=${PROMPT_MODE:-lmms}  LMMS_EVAL_DIR=${LMMS_EVAL_DIR:-/Users/houshihao/project/code/lmms-eval-main}"
   [[ "$PHASE" == "judge" ]] && echo "  JUDGE_WORKERS=${JUDGE_WORKERS:-1}"
+  [[ "$PHASE" == "judge" && -n "${JUDGE_EXTRA_BODY:-}" ]] && echo "  JUDGE_EXTRA_BODY=${JUDGE_EXTRA_BODY}"
   [[ "$RESUME" == "true" ]] && echo "  RESUME=true: jobs already complete will be skipped"
 
   if [[ "$DRYRUN" == "1" ]]; then

@@ -91,6 +91,14 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("JUDGE_WORKERS", "1")),
         help="Concurrent workers for lmms-eval process_results during scoring.",
     )
+    p.add_argument(
+        "--judge-extra-body",
+        default=os.environ.get("JUDGE_EXTRA_BODY", ""),
+        help=(
+            "JSON merged into each OpenAI-compatible judge request body. "
+            'For Qwen3 thinking judges, use: {"chat_template_kwargs":{"enable_thinking":false}}'
+        ),
+    )
     return p.parse_args()
 
 
@@ -138,6 +146,96 @@ def patch_lmms_openai_provider() -> None:
 
     patched_init._opd_patched = True
     openai_provider.OpenAIProvider.__init__ = patched_init
+
+
+def parse_judge_extra_body(raw: str) -> dict[str, Any]:
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JUDGE_EXTRA_BODY JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise SystemExit("JUDGE_EXTRA_BODY must be a JSON object.")
+    return value
+
+
+def _merge_dicts(base: dict[str, Any], extra: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _judge_endpoints() -> set[str]:
+    urls = {
+        os.environ.get("OPENAI_API_URL", ""),
+        os.environ.get("LLM_JUDGE_URL", ""),
+    }
+    return {url.split("?", 1)[0].rstrip("/") for url in urls if url.strip()}
+
+
+def _is_judge_post(url: str, endpoints: set[str]) -> bool:
+    normalized = str(url).split("?", 1)[0].rstrip("/")
+    if normalized in endpoints:
+        return True
+    # Some lmms-eval providers construct Azure/OpenAI-compatible endpoints after
+    # import. Restrict the broad fallback to chat-completions style judge calls.
+    return normalized.endswith("/chat/completions") and bool(endpoints)
+
+
+def patch_judge_extra_body(extra_body: dict[str, Any]) -> None:
+    """Merge JUDGE_EXTRA_BODY into lmms-eval judge calls.
+
+    lmms-eval tasks are not consistent about judge transport: some use the
+    llm_judge provider, some call requests.post directly, and a few call the
+    OpenAI SDK directly. Patch both request paths so one env knob covers them.
+    """
+    if not extra_body:
+        return
+
+    try:
+        import requests
+    except Exception:
+        requests = None
+
+    if requests is not None:
+        original_post = requests.post
+        if not getattr(original_post, "_opd_extra_body_patched", False):
+            endpoints = _judge_endpoints()
+
+            def patched_post(url, *args, **kwargs):
+                payload = kwargs.get("json")
+                if isinstance(payload, dict) and _is_judge_post(str(url), endpoints):
+                    kwargs["json"] = _merge_dicts(payload, extra_body)
+                return original_post(url, *args, **kwargs)
+
+            patched_post._opd_extra_body_patched = True
+            requests.post = patched_post
+
+    try:
+        from openai.resources.chat.completions import Completions
+    except Exception:
+        return
+
+    original_create = Completions.create
+    if getattr(original_create, "_opd_extra_body_patched", False):
+        return
+
+    def patched_create(self, *args, **kwargs):
+        current = kwargs.get("extra_body")
+        if isinstance(current, dict):
+            kwargs["extra_body"] = _merge_dicts(current, extra_body)
+        elif current is None:
+            kwargs["extra_body"] = dict(extra_body)
+        return original_create(self, *args, **kwargs)
+
+    patched_create._opd_extra_body_patched = True
+    Completions.create = patched_create
 
 
 def flatten_tasks(task_dict: dict[Any, Any]) -> Iterable[tuple[str, Any]]:
@@ -336,7 +434,9 @@ def main() -> None:
         raise SystemExit("--skip-score and --score-only are mutually exclusive.")
     normalize_lmms_api_type()
     lmms_dir = add_lmms_eval_to_path(args.lmms_eval_dir)
+    judge_extra_body = parse_judge_extra_body(args.judge_extra_body)
     patch_lmms_openai_provider()
+    patch_judge_extra_body(judge_extra_body)
 
     from lmms_eval.tasks import TaskManager, get_task_dict
 
@@ -458,6 +558,7 @@ def main() -> None:
                 "output_type": task.OUTPUT_TYPE,
                 "num_samples": total,
                 "judge_workers": 0,
+                "judge_extra_body": {},
                 "generation_kwargs": task.get_config("generation_kwargs"),
                 "responses": str(response_path),
             }
@@ -477,6 +578,7 @@ def main() -> None:
             "output_type": task.OUTPUT_TYPE,
             "num_samples": total,
             "judge_workers": args.judge_workers,
+            "judge_extra_body": judge_extra_body,
             "generation_kwargs": task.get_config("generation_kwargs"),
             "responses": str(response_path),
             "scored": str(scored_path),
@@ -501,6 +603,7 @@ def main() -> None:
                     "output_dir": str(output_dir),
                     "prompt_mode": args.prompt_mode,
                     "lmms_model_name": args.lmms_model_name,
+                    "judge_extra_body": judge_extra_body,
                     "task_map": task_map,
                     "task_metrics": raw_task_info,
                 },
@@ -527,6 +630,7 @@ def main() -> None:
         "prompt_mode": args.prompt_mode,
         "lmms_model_name": args.lmms_model_name,
         "judge_workers": args.judge_workers,
+        "judge_extra_body": judge_extra_body,
         "task_map": task_map,
         "task_metrics": raw_task_info,
         "benchmarks": benchmarks,
