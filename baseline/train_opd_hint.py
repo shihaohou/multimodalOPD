@@ -48,6 +48,7 @@ from baseline.probe.saliency_data import parse_bbox_norm
 from baseline.train_opd import (
     OPDScriptArguments,
     _OPDWandBConfigCallback,
+    _chat_template_kwargs_from_args,
     _opd_model_class_for_checkpoint,
 )
 from vigos.train_vigos import (
@@ -102,6 +103,7 @@ def main() -> None:
     parser = HfArgumentParser((OPDHintScriptArguments, TrainingArguments))
     script_args, training_args = parser.parse_args_into_dataclasses()
     training_args.remove_unused_columns = False
+    chat_template_kwargs = _chat_template_kwargs_from_args(script_args)
     if not _cli_arg_was_provided("--learning_rate", "--learning-rate"):
         training_args.learning_rate = DEFAULT_LEARNING_RATE
 
@@ -158,6 +160,7 @@ def main() -> None:
             f"OPD system prompt: style={script_args.opd_system_prompt!r} -> "
             f"{resolve_opd_system_prompt(script_args.opd_system_prompt)!r}"
         )
+        print(f"Chat template kwargs: {chat_template_kwargs}")
         print(
             "Distillation: "
             f"loss_mode={script_args.opd_loss_mode}, "
@@ -310,6 +313,7 @@ def main() -> None:
         hint_template=script_args.hint_template,
         hint_coord_decimals=script_args.hint_coord_decimals,
         crop_padding=script_args.crop_padding,
+        chat_template_kwargs=chat_template_kwargs,
     )
 
     # --- Trainer ----------------------------------------------------------------
@@ -374,6 +378,8 @@ def main() -> None:
                     "ghd_hint_template": script_args.hint_template,
                     "ghd_hint_coord_decimals": script_args.hint_coord_decimals,
                     "ghd_crop_padding": script_args.crop_padding,
+                    "opd_chat_template_kwargs": chat_template_kwargs,
+                    "opd_enable_thinking": script_args.enable_thinking,
                 }
             )
         )

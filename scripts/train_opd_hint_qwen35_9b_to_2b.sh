@@ -28,6 +28,11 @@ export FILTER_NO_BBOX="${FILTER_NO_BBOX:-true}"
 # Cap Qwen3.5 visual tokens. Without this, high-res Visual-CoT images can expand
 # to ~16k image placeholders and be cut by MAX_PROMPT_LENGTH truncation.
 export MAX_PIXELS="${MAX_PIXELS:-1048576}"
+# Qwen3.5 thinking is controlled by the HF chat template, not by prompt text.
+# Keep non-thinking mode explicit for reproducibility; freecot avoids asking for
+# literal <think> tags after disabling the template's thinking mode.
+export OPD_ENABLE_THINKING="${OPD_ENABLE_THINKING:-false}"
+export OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-freecot}"
 # Qwen3.5 needs a newer vLLM than the repo's Qwen3 stack. Default to HF rollout
 # for compatibility; set USE_VLLM=true only in an environment with Qwen3.5 vLLM support.
 export USE_VLLM="${USE_VLLM:-false}"
@@ -46,6 +51,7 @@ echo "[hint-opd-qwen35] student=$MODEL_NAME_OR_PATH"
 echo "[hint-opd-qwen35] teacher=$TEACHER_MODEL"
 echo "[hint-opd-qwen35] dataset=$DATASET_NAME answer_field=$ANSWER_FIELD bbox_field=$BBOX_FIELD"
 echo "[hint-opd-qwen35] use_vllm=$USE_VLLM"
+echo "[hint-opd-qwen35] opd_enable_thinking=$OPD_ENABLE_THINKING prompt_style=$OPD_PROMPT_STYLE"
 echo "[hint-opd-qwen35] privilege=$TEACHER_PRIVILEGE_MODE run_config=${RUN_CONFIG}_<RUN_ID>"
 
 exec bash scripts/train_opd_hint_qwen3_2b.sh

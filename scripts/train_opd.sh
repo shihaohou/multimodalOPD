@@ -93,6 +93,10 @@ OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
 # free-text CoT, no tags -> direct reasoning then \boxed{}) | reason (<reason> tags)
 # | none, or a raw system-prompt string. Keep this in sync with the eval scripts.
 OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
+# Optional HF chat-template thinking-mode switch. For Qwen3.5, set
+# OPD_ENABLE_THINKING=false to render the prompt with non-thinking mode.
+# Empty/unset means "do not pass the kwarg; use the checkpoint default".
+OPD_ENABLE_THINKING="${OPD_ENABLE_THINKING:-}"
 # Paper (Table 4) rollout: temperature 1.0, top_p 1.0, no top-k (0 -> vLLM -1).
 GENERATION_TEMPERATURE="${GENERATION_TEMPERATURE:-1.0}"
 GENERATION_TOP_P="${GENERATION_TOP_P:-1.0}"
@@ -182,6 +186,11 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
+CHAT_TEMPLATE_ARGS=()
+if [[ -n "$OPD_ENABLE_THINKING" ]]; then
+  CHAT_TEMPLATE_ARGS+=(--enable_thinking "$OPD_ENABLE_THINKING")
+fi
+
 DATALOADER_ARGS=(
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
   --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS"
@@ -223,6 +232,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
   --answer_field "$ANSWER_FIELD" \
   --opd_prompt_suffix "$OPD_PROMPT_SUFFIX" \
   --opd_system_prompt "$OPD_PROMPT_STYLE" \
+  "${CHAT_TEMPLATE_ARGS[@]}" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "opd_qwen25_3b_${RUN_ID}" \
   --run_config "$RUN_CONFIG" \

@@ -206,7 +206,7 @@ class OPDHintDataCollator(OPDDataCollator):
             )
             teacher_messages.append(message)
             teacher_prompt_texts.append(
-                self.processor.apply_chat_template(
+                self._apply_chat_template(
                     message, tokenize=False, add_generation_prompt=True
                 )
             )

@@ -78,6 +78,10 @@ MIN_PIXELS="${MIN_PIXELS:-}"
 ANSWER_FIELD="${ANSWER_FIELD:-solution}"
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
 OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-think}"
+# Optional HF chat-template thinking-mode switch. For Qwen3.5, set
+# OPD_ENABLE_THINKING=false to render the prompt with non-thinking mode.
+# Empty/unset means "do not pass the kwarg; use the checkpoint default".
+OPD_ENABLE_THINKING="${OPD_ENABLE_THINKING:-}"
 # --- Grounding-privilege knobs ----------------------------------------------
 # How the teacher is privileged with the box: hint (full image + text coords, the
 # default) | crop (image cropped to the box, no text — a zoomed evidence view).
@@ -162,6 +166,11 @@ if [[ -n "$MIN_PIXELS" ]]; then
   PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
 fi
 
+CHAT_TEMPLATE_ARGS=()
+if [[ -n "$OPD_ENABLE_THINKING" ]]; then
+  CHAT_TEMPLATE_ARGS+=(--enable_thinking "$OPD_ENABLE_THINKING")
+fi
+
 DATALOADER_ARGS=(
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
   --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS"
@@ -201,6 +210,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
   "${HINT_TEMPLATE_ARGS[@]}" \
   --opd_prompt_suffix "$OPD_PROMPT_SUFFIX" \
   --opd_system_prompt "$OPD_PROMPT_STYLE" \
+  "${CHAT_TEMPLATE_ARGS[@]}" \
   --output_dir "$OUTPUT_DIR" \
   --run_name "opd_hint_qwen3_2b_${RUN_ID}" \
   --run_config "$RUN_CONFIG" \

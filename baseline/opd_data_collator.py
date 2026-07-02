@@ -202,7 +202,7 @@ class OPDDataCollator(ViGOSDataCollator):
             student_messages.append(student_message)
             # No assistant prefill: the model freely generates its own response.
             student_prompt_texts.append(
-                self.processor.apply_chat_template(
+                self._apply_chat_template(
                     student_message,
                     tokenize=False,
                     add_generation_prompt=True,

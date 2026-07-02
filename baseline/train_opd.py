@@ -139,6 +139,9 @@ class OPDScriptArguments:
     min_image_size: int = 3
     max_pixels: Optional[int] = None
     min_pixels: Optional[int] = None
+    # Passed through to HF apply_chat_template as a template variable. For Qwen3.5
+    # this is the real thinking-mode switch; unset means "use the checkpoint default".
+    enable_thinking: Optional[bool] = None
     max_prompt_length: int = 32768
     max_completion_length: int = 4096
     attn_implementation: str = "flash_attention_2"
@@ -207,6 +210,13 @@ class OPDScriptArguments:
     )
 
 
+def _chat_template_kwargs_from_args(script_args: OPDScriptArguments) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {}
+    if script_args.enable_thinking is not None:
+        kwargs["enable_thinking"] = script_args.enable_thinking
+    return kwargs
+
+
 class _OPDWandBConfigCallback(TrainerCallback):
     """Log static run config to WandB once at train start (best effort)."""
 
@@ -232,6 +242,7 @@ def main() -> None:
     parser = HfArgumentParser((OPDScriptArguments, TrainingArguments))
     script_args, training_args = parser.parse_args_into_dataclasses()
     training_args.remove_unused_columns = False
+    chat_template_kwargs = _chat_template_kwargs_from_args(script_args)
     if not _cli_arg_was_provided("--learning_rate", "--learning-rate"):
         training_args.learning_rate = DEFAULT_LEARNING_RATE
 
@@ -286,6 +297,7 @@ def main() -> None:
             f"OPD system prompt: style={script_args.opd_system_prompt!r} -> "
             f"{resolve_opd_system_prompt(script_args.opd_system_prompt)!r}"
         )
+        print(f"Chat template kwargs: {chat_template_kwargs}")
         print(
             "Rollout sampling: "
             f"temperature={script_args.generation_temperature}, "
@@ -465,6 +477,7 @@ def main() -> None:
         answer_field=script_args.answer_field,
         opd_prompt_suffix=script_args.opd_prompt_suffix,
         system_prompt=resolve_opd_system_prompt(script_args.opd_system_prompt),
+        chat_template_kwargs=chat_template_kwargs,
     )
 
     # --- Trainer ------------------------------------------------------------------
@@ -544,6 +557,8 @@ def main() -> None:
                     "opd_top_k": script_args.opd_top_k,
                     "opd_prompt_suffix": script_args.opd_prompt_suffix,
                     "opd_system_prompt": script_args.opd_system_prompt,
+                    "opd_chat_template_kwargs": chat_template_kwargs,
+                    "opd_enable_thinking": script_args.enable_thinking,
                     "opd_max_prompt_length": script_args.max_prompt_length,
                     "opd_max_completion_length": script_args.max_completion_length,
                 }

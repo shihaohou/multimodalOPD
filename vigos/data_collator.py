@@ -120,12 +120,25 @@ class ViGOSDataCollator:
     processor: Any
     max_prompt_length: int = 32768
     answer_field: str = "answer"
+    chat_template_kwargs: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         tokenizer = getattr(self.processor, "tokenizer", self.processor)
         if getattr(tokenizer, "pad_token", None) is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
+
+    def _apply_chat_template(self, conversation: Any, **kwargs: Any) -> Any:
+        template_kwargs = self.chat_template_kwargs or {}
+        overlap = set(kwargs).intersection(template_kwargs)
+        if overlap:
+            names = ", ".join(sorted(overlap))
+            raise ValueError(f"Duplicate chat-template kwargs: {names}")
+        return self.processor.apply_chat_template(
+            conversation,
+            **kwargs,
+            **template_kwargs,
+        )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         student_messages = []
@@ -164,7 +177,7 @@ class ViGOSDataCollator:
             reasoning_messages.append(reasoning_message)
             reference_messages.append(reference_message)
             student_prompt_texts.append(
-                self.processor.apply_chat_template(
+                self._apply_chat_template(
                     student_message,
                     tokenize=False,
                     add_generation_prompt=True,
@@ -224,7 +237,7 @@ class ViGOSDataCollator:
                 raise ValueError(
                     "max_prompt_length is too small for the requested assistant prefill."
                 )
-        encoded = self.processor.apply_chat_template(
+        encoded = self._apply_chat_template(
             messages,
             tokenize=True,
             add_generation_prompt=True,
