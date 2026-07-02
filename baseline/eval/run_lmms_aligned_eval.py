@@ -118,6 +118,18 @@ def normalize_lmms_api_type() -> None:
     """Avoid lmms-eval MathVerse import crashes from unsupported API_TYPE values."""
     api_type = os.environ.get("API_TYPE", "openai").strip().lower()
     os.environ["API_TYPE"] = api_type if api_type in {"openai", "azure"} else "openai"
+    judge_model = resolve_judge_model()
+    if judge_model:
+        os.environ.setdefault("MODEL_VERSION", judge_model)
+        os.environ.setdefault("JUDGE_MODEL", judge_model)
+
+
+def resolve_judge_model() -> str:
+    for name in ("MODEL_VERSION", "JUDGE_MODEL", "OPENAI_API_MODEL"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return ""
 
 
 def patch_lmms_openai_provider() -> None:
@@ -175,6 +187,7 @@ def _judge_endpoints() -> set[str]:
     urls = {
         os.environ.get("OPENAI_API_URL", ""),
         os.environ.get("LLM_JUDGE_URL", ""),
+        os.environ.get("JUDGE_API_URL", ""),
     }
     return {url.split("?", 1)[0].rstrip("/") for url in urls if url.strip()}
 
@@ -188,14 +201,15 @@ def _is_judge_post(url: str, endpoints: set[str]) -> bool:
     return normalized.endswith("/chat/completions") and bool(endpoints)
 
 
-def patch_judge_extra_body(extra_body: dict[str, Any]) -> None:
-    """Merge JUDGE_EXTRA_BODY into lmms-eval judge calls.
+def patch_judge_request_body(extra_body: dict[str, Any], judge_model: str = "") -> None:
+    """Normalize lmms-eval judge request bodies.
 
     lmms-eval tasks are not consistent about judge transport: some use the
     llm_judge provider, some call requests.post directly, and a few call the
-    OpenAI SDK directly. Patch both request paths so one env knob covers them.
+    OpenAI SDK directly. Patch both request paths so one env knob covers
+    extra_body and hard-coded task defaults such as HallusionBench's gpt-4.
     """
-    if not extra_body:
+    if not extra_body and not judge_model:
         return
 
     try:
@@ -211,7 +225,10 @@ def patch_judge_extra_body(extra_body: dict[str, Any]) -> None:
             def patched_post(url, *args, **kwargs):
                 payload = kwargs.get("json")
                 if isinstance(payload, dict) and _is_judge_post(str(url), endpoints):
-                    kwargs["json"] = _merge_dicts(payload, extra_body)
+                    payload = _merge_dicts(payload, extra_body)
+                    if judge_model:
+                        payload["model"] = judge_model
+                    kwargs["json"] = payload
                 return original_post(url, *args, **kwargs)
 
             patched_post._opd_extra_body_patched = True
@@ -232,6 +249,8 @@ def patch_judge_extra_body(extra_body: dict[str, Any]) -> None:
             kwargs["extra_body"] = _merge_dicts(current, extra_body)
         elif current is None:
             kwargs["extra_body"] = dict(extra_body)
+        if judge_model:
+            kwargs["model"] = judge_model
         return original_create(self, *args, **kwargs)
 
     patched_create._opd_extra_body_patched = True
@@ -435,8 +454,9 @@ def main() -> None:
     normalize_lmms_api_type()
     lmms_dir = add_lmms_eval_to_path(args.lmms_eval_dir)
     judge_extra_body = parse_judge_extra_body(args.judge_extra_body)
+    judge_model = resolve_judge_model()
     patch_lmms_openai_provider()
-    patch_judge_extra_body(judge_extra_body)
+    patch_judge_request_body(judge_extra_body, judge_model)
 
     from lmms_eval.tasks import TaskManager, get_task_dict
 
