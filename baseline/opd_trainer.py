@@ -19,6 +19,8 @@ full-vocabulary masked KL, DDP loss normalization, answer-accuracy metrics). Onl
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +90,42 @@ class OPDTrainer(ViGOSTrainer):
                     "vllm_server teacher only supports opd_loss_mode='topk_kl' with "
                     "opd_kl_direction='forward' (the server returns top-k logprobs)."
                 )
+
+    def _timing_log_enabled(self) -> bool:
+        if str(os.environ.get("OPD_DEBUG_TIMING", "")).lower() in {"1", "true", "yes"}:
+            return True
+        try:
+            limit = int(os.environ.get("OPD_TIMING_LOG_STEPS", "0") or "0")
+        except ValueError:
+            limit = 0
+        step = int(getattr(getattr(self, "state", None), "global_step", 0) or 0)
+        return limit > 0 and step < limit
+
+    def _timing_log(self, phase: str, *, start: float | None = None, extra: str = "") -> float:
+        now = time.perf_counter()
+        if not self._timing_log_enabled():
+            return now
+        accelerator = getattr(self, "accelerator", None)
+        rank = int(getattr(accelerator, "process_index", 0) or 0)
+        all_ranks = str(os.environ.get("OPD_DEBUG_TIMING_ALL_RANKS", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if rank != 0 and not all_ranks:
+            return now
+        step = int(getattr(getattr(self, "state", None), "global_step", 0) or 0)
+        if start is None:
+            message = f"[OPD-timing][rank{rank}] step={step} start {phase}"
+        else:
+            message = (
+                f"[OPD-timing][rank{rank}] step={step} end {phase} "
+                f"{now - start:.2f}s"
+            )
+        if extra:
+            message = f"{message} {extra}"
+        print(message, flush=True)
+        return now
 
     def _completion_placeholder_token_ids(self) -> set[int]:
         """Image/video placeholder token ids — these must never appear inside a
@@ -230,18 +268,27 @@ class OPDTrainer(ViGOSTrainer):
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+        total_t = self._timing_log("compute_loss")
         student_prompt = self._prompt_inputs(inputs, "student")
+        phase_t = self._timing_log("rollout")
         rollout = self._generate_on_policy(model, student_prompt, inputs)
+        self._timing_log("rollout", start=phase_t)
         # OPD overrides compute_loss wholesale, so the rollout-snapshot hook from
         # ViGOSTrainer.compute_loss is not inherited along this path — call it here
         # (grad-free) so completion_log_steps actually writes prompt->completion
         # JSONL under <output_dir>/completion_samples.
+        phase_t = self._timing_log("completion_snapshot")
         self._maybe_log_completion_snapshot(inputs, rollout)
+        self._timing_log("completion_snapshot", start=phase_t)
 
         completion_ids = rollout["completion_ids"]
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)
 
         # Student forward (with gradients) over the sampled completion.
+        phase_t = self._timing_log(
+            "student_forward",
+            extra=f"completion_shape={tuple(completion_ids.shape)}",
+        )
         student_inputs = self._with_completion(
             student_prompt,
             full_input_ids=rollout["generated_ids"],
@@ -253,8 +300,10 @@ class OPDTrainer(ViGOSTrainer):
             student_outputs.logits, completion_ids.shape[1]
         )
         del student_outputs
+        self._timing_log("student_forward", start=phase_t)
 
         if self.teacher_source == "vllm_server":
+            phase_t = self._timing_log("teacher_server_score")
             # Server returns the teacher's top-k token ids + logprobs at each
             # completion position (vLLM prompt_logprobs); forward top-k KL only.
             teacher_topk_ids, teacher_topk_logprobs = self.teacher_client.score_topk(
@@ -276,7 +325,9 @@ class OPDTrainer(ViGOSTrainer):
             # the teacher-vs-student rollout curves are unavailable here.
             student_diag_logits = student_logits
             teacher_diag_logits = None
+            self._timing_log("teacher_server_score", start=phase_t)
         else:
+            phase_t = self._timing_log("teacher_forward")
             # Local frozen teacher forward (full logits). full_kl+reverse uses the
             # exact full-vocab path (vigos.losses.masked_kl_loss); everything else
             # (top-k, forward, jsd) goes through masked_topk_kl_loss (top_k=None
@@ -298,10 +349,12 @@ class OPDTrainer(ViGOSTrainer):
                     }
                 ],
             )["opd"]
+            self._timing_log("teacher_forward", start=phase_t)
             # Same-family checkpoints can have different padded vocab sizes (e.g.
             # Qwen2.5-VL 3B=151936 vs 7B=152064). Truncate both to the shared (min)
             # vocab; fp32 for KL numerical safety (the bf16 p·log p entropy term
             # explodes when a student prob underflows to exactly 0).
+            phase_t = self._timing_log("kl_loss")
             vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
             student_kl_logits = student_logits[..., :vocab].float()
             teacher_kl_logits = teacher_logits[..., :vocab].float()
@@ -329,6 +382,8 @@ class OPDTrainer(ViGOSTrainer):
                 )
             student_diag_logits = student_kl_logits
             teacher_diag_logits = teacher_kl_logits
+            self._timing_log("kl_loss", start=phase_t)
+        phase_t = self._timing_log("metrics")
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
@@ -369,6 +424,8 @@ class OPDTrainer(ViGOSTrainer):
             )
         )
         self._record_loss_metrics(metrics)
+        self._timing_log("metrics", start=phase_t)
+        self._timing_log("compute_loss", start=total_t)
 
         if return_outputs:
             return loss, {"logits": student_logits.detach()}

@@ -56,20 +56,29 @@ class OPDHintTrainer(OPDTrainer):
         return_outputs: bool = False,
         num_items_in_batch: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Any]:
+        total_t = self._timing_log("compute_loss")
         student_prompt = self._prompt_inputs(inputs, "student")
         # The privileged prompt: same image + question, plus the evidence-box hint
         # text. Built by OPDHintDataCollator; the student never sees it.
         teacher_prompt = self._prompt_inputs(inputs, "teacher")
 
+        phase_t = self._timing_log("rollout")
         rollout = self._generate_on_policy(model, student_prompt, inputs)
+        self._timing_log("rollout", start=phase_t)
         # compute_loss is overridden wholesale, so the rollout-snapshot hook from
         # ViGOSTrainer.compute_loss is not on this path — call it here (grad-free).
+        phase_t = self._timing_log("completion_snapshot")
         self._maybe_log_completion_snapshot(inputs, rollout)
+        self._timing_log("completion_snapshot", start=phase_t)
 
         completion_ids = rollout["completion_ids"]
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)
 
         # --- Student forward (with gradients) on the NON-privileged prompt --------
+        phase_t = self._timing_log(
+            "student_forward",
+            extra=f"completion_shape={tuple(completion_ids.shape)}",
+        )
         student_inputs = self._with_completion(
             student_prompt,
             full_input_ids=rollout["generated_ids"],
@@ -81,11 +90,13 @@ class OPDHintTrainer(OPDTrainer):
             student_outputs.logits, completion_ids.shape[1]
         )
         del student_outputs
+        self._timing_log("student_forward", start=phase_t)
 
         # --- Teacher forward (frozen, no grad) on the PRIVILEGED prompt -----------
         # Same student completion, scored under (image, question, bbox-hint). The
         # extra hint tokens sit before the completion, so _completion_logits' tail
         # slice still lines up token-for-token with the student logits above.
+        phase_t = self._timing_log("teacher_forward")
         teacher_inputs = self._append_completion(
             teacher_prompt,
             completion_ids,
@@ -101,8 +112,10 @@ class OPDHintTrainer(OPDTrainer):
                 }
             ],
         )["ghd"]
+        self._timing_log("teacher_forward", start=phase_t)
 
         # Truncate both to the shared (min) padded vocab; fp32 for KL safety.
+        phase_t = self._timing_log("kl_loss")
         vocab = min(student_logits.shape[-1], teacher_logits.shape[-1])
         student_kl_logits = student_logits[..., :vocab].float()
         teacher_kl_logits = teacher_logits[..., :vocab].float()
@@ -125,7 +138,9 @@ class OPDHintTrainer(OPDTrainer):
                 completion_attention,
                 completion_ids,
             )
+        self._timing_log("kl_loss", start=phase_t)
 
+        phase_t = self._timing_log("metrics")
         opd_loss, _, opd_loss_numerator, opd_loss_count = (
             self._distributed_masked_loss_with_stats(opd_loss, completion_attention)
         )
@@ -169,6 +184,8 @@ class OPDHintTrainer(OPDTrainer):
             )
         )
         self._record_loss_metrics(metrics)
+        self._timing_log("metrics", start=phase_t)
+        self._timing_log("compute_loss", start=total_t)
 
         if return_outputs:
             return loss, {"logits": student_logits.detach()}
