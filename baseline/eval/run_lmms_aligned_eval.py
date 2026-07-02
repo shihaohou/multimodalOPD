@@ -169,7 +169,13 @@ def task_sampling_params(task: Any, args: argparse.Namespace):
     if isinstance(stop, str):
         stop = [stop]
     if isinstance(stop, list):
-        stop = [s for s in stop if s]
+        # lmms-eval injects the fewshot delimiter "\n\n" as a default `until`
+        # when a task omits explicit stop strings. Qwen3-VL's lmms-eval model
+        # removes that default before post-processing; using it as a vLLM hard
+        # stop truncates CoT-style answers after the first paragraph.
+        stop = [s for s in stop if s and s != "\n\n"]
+        if not stop:
+            stop = None
     else:
         stop = None
     return SamplingParams(
