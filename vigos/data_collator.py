@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -127,6 +128,10 @@ class ViGOSDataCollator:
         if getattr(tokenizer, "pad_token", None) is None:
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
+        self._chat_template_accepts_processor_kwargs = (
+            "processor_kwargs"
+            in inspect.signature(self.processor.apply_chat_template).parameters
+        )
 
     def _apply_chat_template(self, conversation: Any, **kwargs: Any) -> Any:
         template_kwargs = self.chat_template_kwargs or {}
@@ -138,6 +143,34 @@ class ViGOSDataCollator:
             conversation,
             **kwargs,
             **template_kwargs,
+        )
+
+    def _apply_chat_template_tokenized(
+        self,
+        conversation: Any,
+        *,
+        max_length: int,
+    ) -> dict[str, torch.Tensor]:
+        processor_kwargs = {
+            "return_tensors": "pt",
+            "padding": True,
+            "truncation": True,
+            "max_length": max_length,
+        }
+        if self._chat_template_accepts_processor_kwargs:
+            return self._apply_chat_template(
+                conversation,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                processor_kwargs=processor_kwargs,
+            )
+        return self._apply_chat_template(
+            conversation,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_dict=True,
+            **processor_kwargs,
         )
 
     def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
@@ -237,14 +270,8 @@ class ViGOSDataCollator:
                 raise ValueError(
                     "max_prompt_length is too small for the requested assistant prefill."
                 )
-        encoded = self._apply_chat_template(
+        encoded = self._apply_chat_template_tokenized(
             messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
             max_length=max_length,
         )
         if prefill_ids:
