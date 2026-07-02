@@ -96,6 +96,7 @@ RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-eval_outputs/bench_${RUN_ID}}"
 DRYRUN="${DRYRUN:-0}"
 PHASE="${PHASE:-all}"   # generate | judge | all
+EVAL_BACKEND="${EVAL_BACKEND:-lmms_fast}"  # lmms_fast | opd
 # RESUME -> skip jobs whose output is already complete, so rerunning the SAME command
 # only redoes the failed/missing ones (generate/all: needs summary.json; judge: needs
 # judgments/*.jsonl). Accept 1/true/yes/on.
@@ -124,7 +125,14 @@ esac
 JUDGED_DEFAULT="mathvista mathverse mathvision MMMU mmmu_pro_10options mmmu-pro-vision mmstar hallusionbench"
 DET_DEFAULT="pope chartqa vqav2"
 VSTAR_DEFAULT="vstar"
-DATASETS="${DATASETS:-$JUDGED_DEFAULT $DET_DEFAULT $VSTAR_DEFAULT}"
+LMMS_FAST_DEFAULT="mathvista mathverse mathvision MMMU MMMU-Pro MMStar HallusionBench POPE ChartQA vstar HRBench4K HRBench8K MME-RealWorld-Lite"
+if [[ -z "${DATASETS:-}" ]]; then
+  if [[ "$EVAL_BACKEND" == "lmms_fast" ]]; then
+    DATASETS="$LMMS_FAST_DEFAULT"
+  else
+    DATASETS="$JUDGED_DEFAULT $DET_DEFAULT $VSTAR_DEFAULT"
+  fi
+fi
 
 # Shared-disk layout (identical on every machine -> sane defaults so the common
 # command needs only MODELS/OUTPUT_ROOT/PHASE). Override any of these via env on a box
@@ -166,6 +174,133 @@ case "$PHASE" in
   generate|judge|all) ;;
   *) echo "ERROR: PHASE must be generate|judge|all (got '$PHASE')." >&2; exit 1 ;;
 esac
+case "$EVAL_BACKEND" in
+  opd|lmms_fast) ;;
+  *) echo "ERROR: EVAL_BACKEND must be opd|lmms_fast (got '$EVAL_BACKEND')." >&2; exit 1 ;;
+esac
+
+if [[ "$EVAL_BACKEND" == "lmms_fast" ]]; then
+  LMMS_DATASET_ITEMS=()
+  while IFS= read -r bench; do
+    [[ -n "$bench" ]] && LMMS_DATASET_ITEMS+=("$bench")
+  done < <(python3 baseline/eval/lmms_eval_bridge.py benchmarks --benchmarks "$DATASETS")
+
+  LMMS_SPECS=()
+  IFS=';' read -r -a _models <<< "$MODELS"
+  for tm in "${_models[@]}"; do
+    [[ -z "$tm" ]] && continue
+    if [[ "$tm" == *=* ]]; then
+      tag="${tm%%=*}"; model="${tm#*=}"
+    else
+      tag=""; model="$tm"
+    fi
+    [[ "$model" != /* && -n "${M:-}" && -e "$M/$model" ]] && model="$M/$model"
+    [[ -z "$tag" ]] && tag="$(model_id "$model")"
+    for bench in "${LMMS_DATASET_ITEMS[@]}"; do
+      [[ -n "$bench" ]] && LMMS_SPECS+=("lmms_fast|${tag}|${model}|${bench}")
+    done
+  done
+  [[ ${#LMMS_SPECS[@]} -eq 0 ]] && { echo "No lmms_fast jobs to run (check MODELS / DATASETS)."; exit 1; }
+
+  mkdir -p "$OUTPUT_ROOT"
+  lmms_job_out() {
+    local s; s="$3"; s="${s//[^A-Za-z0-9_.-]/_}"
+    printf '%s/%s/_lmms_%s' "$OUTPUT_ROOT" "$2" "$s"
+  }
+  lmms_job_done() {
+    case "$PHASE" in
+      generate) [[ -f "$1/generation_complete.json" ]] ;;
+      judge|all) [[ -f "$1/summary.json" ]] ;;
+      *) return 1 ;;
+    esac
+  }
+  lmms_label() { echo "$1"; }
+  run_lmms_job() {
+    local card="$1" tag="$2" model="$3" bench="$4" out logf
+    out="$(lmms_job_out lmms_fast "$tag" "$bench")"
+    mkdir -p "$out"
+    logf="$out/${PHASE}.log"
+    CUDA_VISIBLE_DEVICES="$card" MODEL_PATH="$model" MODEL_NAME="$tag" \
+      DATASETS="$bench" OUTPUT_DIR="$out" LMMS_PHASE="$PHASE" \
+      bash scripts/eval_lmms_aligned.sh > "$logf" 2>&1
+  }
+
+  if [[ "$PHASE" == "judge" ]]; then
+    echo "Planned ${#LMMS_SPECS[@]} lmms_fast score jobs (no local eval GPU) -> ${OUTPUT_ROOT}"
+  else
+    echo "Planned ${#LMMS_SPECS[@]} lmms_fast jobs over ${NGPU} GPU(s) [${CARDS[*]}] -> ${OUTPUT_ROOT}"
+  fi
+  echo "  DATASETS=${DATASETS}"
+  echo "  PROMPT_MODE=${PROMPT_MODE:-lmms}  LMMS_EVAL_DIR=${LMMS_EVAL_DIR:-/Users/houshihao/project/code/lmms-eval-main}"
+  [[ "$RESUME" == "true" ]] && echo "  RESUME=true: jobs already complete will be skipped"
+
+  if [[ "$DRYRUN" == "1" ]]; then
+    echo "--- DRYRUN: EVAL_BACKEND=lmms_fast planned jobs ---"
+    i=0
+    for spec in "${LMMS_SPECS[@]}"; do
+      IFS='|' read -r _kind tag model bench <<< "$spec"
+      out="$(lmms_job_out lmms_fast "$tag" "$bench")"
+      if [[ "$RESUME" == "true" ]] && lmms_job_done "$out"; then
+        echo "skip done (RESUME) | ${tag} | ${bench}"
+      elif [[ "$PHASE" == "judge" ]]; then
+        echo "score | ${tag} | ${bench} | $model"
+      else
+        echo "card ${CARDS[$((i % NGPU))]} | ${tag} | ${bench} | $model"
+        i=$((i + 1))
+      fi
+    done
+    exit 0
+  fi
+
+  if [[ "$PHASE" == "judge" ]]; then
+    for spec in "${LMMS_SPECS[@]}"; do
+      IFS='|' read -r _kind tag model bench <<< "$spec"
+      out="$(lmms_job_out lmms_fast "$tag" "$bench")"
+      if [[ "$RESUME" == "true" ]] && lmms_job_done "$out"; then
+        echo "[skip done] ${tag} | ${bench}  (RESUME)"
+        continue
+      fi
+      echo "[score] ${tag} | ${bench}"
+      run_lmms_job "" "$tag" "$model" "$bench"
+    done
+    echo "All ${#LMMS_SPECS[@]} lmms_fast score jobs finished. Per-job log: <id>/_lmms_<bench>/judge.log under ${OUTPUT_ROOT}/"
+    python3 baseline/eval/make_report.py "$OUTPUT_ROOT" \
+      || echo "(report skipped; rerun: python3 baseline/eval/make_report.py $OUTPUT_ROOT)"
+    exit 0
+  fi
+
+  declare -A SLOT
+  for spec in "${LMMS_SPECS[@]}"; do
+    IFS='|' read -r _kind tag model bench <<< "$spec"
+    out="$(lmms_job_out lmms_fast "$tag" "$bench")"
+    if [[ "$RESUME" == "true" ]] && lmms_job_done "$out"; then
+      echo "[skip done] ${tag} | ${bench}  (RESUME)"
+      continue
+    fi
+    card=""
+    while [[ -z "$card" ]]; do
+      for c in "${CARDS[@]}"; do
+        pid="${SLOT[$c]:-}"
+        if [[ -z "$pid" ]] || ! kill -0 "$pid" 2>/dev/null; then
+          card="$c"
+          break
+        fi
+      done
+      [[ -z "$card" ]] && { wait -n 2>/dev/null || sleep 3; }
+    done
+    echo "[launch] card ${card} | ${tag} | ${bench}"
+    run_lmms_job "$card" "$tag" "$model" "$bench" &
+    SLOT[$card]=$!
+    [[ "$LAUNCH_STAGGER" != "0" ]] && sleep "$LAUNCH_STAGGER"
+  done
+  wait
+  echo "All ${#LMMS_SPECS[@]} lmms_fast jobs finished. Per-job log: <id>/_lmms_<bench>/${PHASE}.log under ${OUTPUT_ROOT}/"
+  if [[ "$PHASE" == "all" ]]; then
+    python3 baseline/eval/make_report.py "$OUTPUT_ROOT" \
+      || echo "(report skipped; rerun: python3 baseline/eval/make_report.py $OUTPUT_ROOT)"
+  fi
+  exit 0
+fi
 
 # The judge phase reads what the generate phase saved -> it MUST reuse the same dir.
 # OUTPUT_ROOT defaults to a fresh timestamp, so pin it (or RUN_ID) across both phases.

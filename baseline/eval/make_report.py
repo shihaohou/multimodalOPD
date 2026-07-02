@@ -50,10 +50,11 @@ PRO_AVG_LABEL = "mmmu-pro (avg)"
 # Preferred column order (the standard suite); unknown benchmarks sort alphabetically
 # after these.
 BENCH_ORDER = [
-    "mathvista", "mathverse", "mathvision",
-    "MMMU", "mmmu_pro_10options", "mmmu-pro-vision", PRO_AVG_LABEL,
-    "mmstar", "hallusionbench",
-    "pope (F1)", "chartqa (relax)", "vqav2 (soft)", "vstar (acc)",
+    "mathvista", "MathVista", "mathverse", "MathVerse", "mathvision", "MathVision",
+    "MMMU", "mmmu_pro_10options", "mmmu-pro-vision", PRO_AVG_LABEL, "MMMU-Pro",
+    "mmstar", "MMStar", "hallusionbench", "HallusionBench",
+    "pope (F1)", "POPE", "chartqa (relax)", "ChartQA", "vqav2 (soft)",
+    "vstar (acc)", "V* Bench", "HRBench4K", "HRBench8K", "MME-RealWorld-Lite",
 ]
 
 AVG_LABEL = "Avg (judged)"
@@ -82,7 +83,17 @@ def collect(root: str):
         if tag not in tags:
             tags.append(tag)
         bms = summary.get("benchmarks")
-        if isinstance(bms, dict):  # deterministic (run_vqa_eval): name -> {metrics: {...}}
+        if summary.get("backend") in {"lmms-eval", "lmms-eval-fast"} and isinstance(bms, dict):
+            for name, score in bms.items():
+                label = (score or {}).get("label") or name
+                val = (score or {}).get("score")
+                if not isinstance(val, (int, float)):
+                    metric = (score or {}).get("primary_metric")
+                    metrics = (score or {}).get("metrics") or {}
+                    val = metrics.get(metric) if metric else None
+                matrix.setdefault(label, {})[tag] = val if isinstance(val, (int, float)) else None
+                det_labels.add(label)
+        elif isinstance(bms, dict):  # deterministic (run_vqa_eval): name -> {metrics: {...}}
             for name, score in bms.items():
                 key, label = DET_METRIC.get(name, (None, name))
                 val = ((score or {}).get("metrics") or {}).get(key) if key else None
