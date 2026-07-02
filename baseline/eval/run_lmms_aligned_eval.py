@@ -19,6 +19,7 @@ import inspect
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -83,6 +84,12 @@ def parse_args() -> argparse.Namespace:
         "--score-only",
         action="store_true",
         help="Read saved responses and run lmms-eval process_results/aggregation only.",
+    )
+    p.add_argument(
+        "--judge-workers",
+        type=int,
+        default=int(os.environ.get("JUDGE_WORKERS", "1")),
+        help="Concurrent workers for lmms-eval process_results during scoring.",
     )
     return p.parse_args()
 
@@ -268,26 +275,45 @@ def aggregate_task(task: Any, metric_values: dict[str, list[Any]]) -> dict[str, 
     return out
 
 
-def score_records(task: Any, docs: Any, records: list[dict[str, Any]], split: str) -> tuple[dict[str, list[Any]], list[dict[str, Any]]]:
+def _score_one_record(task: Any, docs: Any, record: dict[str, Any], split: str) -> dict[str, Any]:
+    doc_id = int(record["doc_id"])
+    doc = docs[doc_id]
+    response = str(record.get("response") or "")
+    per_doc = task.process_results(doc, [response])
+    out = dict(record)
+    out.update(
+        {
+            "task": out.get("task") or task.task_name,
+            "split": out.get("split") or split,
+            "target": task.doc_to_target(doc),
+            "process_results": per_doc,
+        }
+    )
+    return out
+
+
+def score_records(task: Any, docs: Any, records: list[dict[str, Any]], split: str, workers: int = 1) -> tuple[dict[str, list[Any]], list[dict[str, Any]]]:
     metric_values: dict[str, list[Any]] = {}
-    scored: list[dict[str, Any]] = []
-    for record in tqdm(records, desc=f"score {task.task_name}"):
-        doc_id = int(record["doc_id"])
-        doc = docs[doc_id]
-        response = str(record.get("response") or "")
-        per_doc = task.process_results(doc, [response])
+    workers = max(1, int(workers or 1))
+    if workers == 1:
+        scored = [
+            _score_one_record(task, docs, record, split)
+            for record in tqdm(records, desc=f"score {task.task_name}")
+        ]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            scored = list(
+                tqdm(
+                    pool.map(lambda record: _score_one_record(task, docs, record, split), records),
+                    total=len(records),
+                    desc=f"score {task.task_name} x{workers}",
+                )
+            )
+
+    for out in scored:
+        per_doc = out["process_results"]
         for metric, value in per_doc.items():
             metric_values.setdefault(metric, []).append(value)
-        out = dict(record)
-        out.update(
-            {
-                "task": out.get("task") or task.task_name,
-                "split": out.get("split") or split,
-                "target": task.doc_to_target(doc),
-                "process_results": per_doc,
-            }
-        )
-        scored.append(out)
     return metric_values, scored
 
 
@@ -431,13 +457,14 @@ def main() -> None:
                 "split": split,
                 "output_type": task.OUTPUT_TYPE,
                 "num_samples": total,
+                "judge_workers": 0,
                 "generation_kwargs": task.get_config("generation_kwargs"),
                 "responses": str(response_path),
             }
             print(f"[{task_name}] wrote responses={response_path} samples={total}")
             continue
 
-        metric_values, scored = score_records(task, docs, records, split)
+        metric_values, scored = score_records(task, docs, records, split, args.judge_workers)
         scored_path = scored_dir / f"{task_name}.jsonl"
         with scored_path.open("w", encoding="utf-8") as fh:
             for record in scored:
@@ -449,6 +476,7 @@ def main() -> None:
             "split": split,
             "output_type": task.OUTPUT_TYPE,
             "num_samples": total,
+            "judge_workers": args.judge_workers,
             "generation_kwargs": task.get_config("generation_kwargs"),
             "responses": str(response_path),
             "scored": str(scored_path),
@@ -498,6 +526,7 @@ def main() -> None:
         "output_dir": str(output_dir),
         "prompt_mode": args.prompt_mode,
         "lmms_model_name": args.lmms_model_name,
+        "judge_workers": args.judge_workers,
         "task_map": task_map,
         "task_metrics": raw_task_info,
         "benchmarks": benchmarks,
