@@ -13,6 +13,8 @@ drops into ``OPDTrainer`` and ``_distributed_masked_loss_with_stats`` unchanged.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -57,20 +59,42 @@ def masked_topk_kl_loss(
         # Keep both tensors in the autograd graph so DDP sees a gradient.
         return (student_logits.sum() + teacher_logits.sum()) * 0.0
 
-    student_active = student_logits[mask]
-    teacher_active = teacher_logits[mask]
-    per_token = _topk_divergence(
-        student_active,
-        teacher_active,
-        top_k=top_k,
-        direction=direction,
-        temperature=temperature,
-    )
-    if token_clip is not None and token_clip > 0:
-        # Symmetric clamp: the diff-clamped surrogate (see _topk_divergence) can dip
-        # slightly negative, so bound both tails — verl `loss_max_clamp` semantics.
-        per_token = per_token.clamp(min=-token_clip, max=token_clip)
-    return per_token.sum() / mask.sum().to(dtype=per_token.dtype).clamp_min(1.0)
+    chunk_size = _kl_chunk_size()
+    active_positions = mask.nonzero(as_tuple=False)
+    if chunk_size <= 0 or int(active_positions.shape[0]) <= chunk_size:
+        student_active = student_logits[mask]
+        teacher_active = teacher_logits[mask]
+        per_token = _topk_divergence(
+            student_active,
+            teacher_active,
+            top_k=top_k,
+            direction=direction,
+            temperature=temperature,
+        )
+        if token_clip is not None and token_clip > 0:
+            # Symmetric clamp: the diff-clamped surrogate (see _topk_divergence) can dip
+            # slightly negative, so bound both tails — verl `loss_max_clamp` semantics.
+            per_token = per_token.clamp(min=-token_clip, max=token_clip)
+        return per_token.sum() / mask.sum().to(dtype=per_token.dtype).clamp_min(1.0)
+
+    # Avoid materializing [all_active_tokens, vocab] log-prob tensors. With long
+    # rollouts (e.g. mb=8, C=2048, V~150k), the unchunked top-k KL path needs
+    # multiple extra 8GB tensors per rank even though it only keeps top-k terms.
+    total = student_logits.new_zeros((), dtype=torch.float32)
+    for start in range(0, int(active_positions.shape[0]), chunk_size):
+        pos = active_positions[start : start + chunk_size]
+        index = tuple(pos[:, dim] for dim in range(pos.shape[1]))
+        per_token = _topk_divergence(
+            student_logits[index],
+            teacher_logits[index],
+            top_k=top_k,
+            direction=direction,
+            temperature=temperature,
+        )
+        if token_clip is not None and token_clip > 0:
+            per_token = per_token.clamp(min=-token_clip, max=token_clip)
+        total = total + per_token.sum().float()
+    return total / mask.sum().to(device=student_logits.device, dtype=total.dtype).clamp_min(1.0)
 
 
 def masked_topk_kl_loss_from_teacher_topk(
@@ -178,3 +202,11 @@ def _topk_divergence(
         min=-_LOGPROB_DIFF_CLAMP, max=_LOGPROB_DIFF_CLAMP
     )
     return (p_log_probs.exp() * diff).sum(dim=-1)
+
+
+def _kl_chunk_size() -> int:
+    raw = os.environ.get("OPD_KL_CHUNK_SIZE", "256")
+    try:
+        return int(raw)
+    except ValueError:
+        return 256
