@@ -39,6 +39,7 @@ MODEL_INPUT_KEYS = {
     "image_grid_thw",
     "pixel_values_videos",
     "video_grid_thw",
+    "mm_token_type_ids",
     "second_per_grid_ts",
 }
 
@@ -2039,6 +2040,26 @@ class ViGOSTrainer(Trainer):
         }
         result["input_ids"] = full_input_ids
         result["attention_mask"] = full_attention_mask
+        if "mm_token_type_ids" in prompt_inputs:
+            prompt_token_types = prompt_inputs["mm_token_type_ids"]
+            completion_len = int(full_input_ids.shape[1]) - int(
+                prompt_token_types.shape[1]
+            )
+            if completion_len < 0:
+                raise ValueError(
+                    "full_input_ids is shorter than prompt mm_token_type_ids."
+                )
+            if completion_len > 0:
+                # Qwen3.5 modality ids: text=0, image=1, video=2. Generated
+                # completion tokens are text.
+                completion_token_types = prompt_token_types.new_zeros(
+                    (prompt_token_types.shape[0], completion_len)
+                )
+                prompt_token_types = torch.cat(
+                    [prompt_token_types, completion_token_types],
+                    dim=1,
+                )
+            result["mm_token_type_ids"] = prompt_token_types
         return result
 
     @staticmethod
@@ -2150,6 +2171,14 @@ class ViGOSTrainer(Trainer):
                         f"Cannot merge non-tensor model input {key!r}: "
                         f"{type(value)!r}."
                     )
+                if (
+                    key == "mm_token_type_ids"
+                    and value.ndim == 2
+                    and int(value.shape[1]) < max_length
+                ):
+                    pad_width = max_length - int(value.shape[1])
+                    token_type_pad = value.new_zeros((value.shape[0], pad_width))
+                    value = torch.cat([token_type_pad, value], dim=1)
                 values.append(value)
             merged[key] = torch.cat(values, dim=0)
         return merged, batch_slices

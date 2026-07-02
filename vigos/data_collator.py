@@ -275,4 +275,16 @@ def _append_token_suffix(
         [encoded["attention_mask"], suffix_attention],
         dim=1,
     )
+    if "mm_token_type_ids" in encoded:
+        # Qwen3.5 uses modality ids for M-RoPE: text=0, image=1, video=2.
+        # Assistant prefill tokens are text tokens.
+        suffix_token_types = torch.zeros(
+            suffix.shape,
+            dtype=encoded["mm_token_type_ids"].dtype,
+            device=encoded["mm_token_type_ids"].device,
+        )
+        encoded["mm_token_type_ids"] = torch.cat(
+            [encoded["mm_token_type_ids"], suffix_token_types],
+            dim=1,
+        )
     return encoded
