@@ -76,6 +76,12 @@ class OPDEvidenceSlotScriptArguments(OPDScriptArguments):
     evidence_slot_train_teacher_projector: bool = False
     evidence_slot_bbox_bias_beta: float = 2.0
     evidence_slot_normalize_qk: bool = True
+    evidence_slot_inject_student: bool = True
+    evidence_slot_injection_scale: float = 1.0
+    evidence_slot_injection_match_norm: bool = True
+    # Put the hidden hint after <EVID> so the teacher slot query is conditioned
+    # only on image+question; the completion still sees the hint for OPD scoring.
+    evidence_slot_hint_after_anchor: bool = True
 
 
 def _filter_samples_without_bbox(dataset, bbox_field: str):
@@ -162,7 +168,11 @@ def main() -> None:
             f"lambda={script_args.lambda_evidence_slot}, "
             f"projection_dim={script_args.evidence_slot_projection_dim}, "
             f"bbox_beta={script_args.evidence_slot_bbox_bias_beta}, "
-            f"normalize_qk={script_args.evidence_slot_normalize_qk}"
+            f"normalize_qk={script_args.evidence_slot_normalize_qk}, "
+            f"inject_student={script_args.evidence_slot_inject_student}, "
+            f"injection_scale={script_args.evidence_slot_injection_scale}, "
+            f"match_norm={script_args.evidence_slot_injection_match_norm}, "
+            f"hint_after_anchor={script_args.evidence_slot_hint_after_anchor}"
         )
         print(
             "Distillation: "
@@ -307,6 +317,7 @@ def main() -> None:
         num_anchor_tokens=script_args.num_anchor_tokens,
         anchor_indexed_tokens=script_args.anchor_indexed_tokens,
         anchor_answer_cue=script_args.anchor_answer_cue,
+        hint_after_anchor=script_args.evidence_slot_hint_after_anchor,
     )
 
     trainer = OPDEvidenceSlotTrainer(
@@ -331,6 +342,9 @@ def main() -> None:
         ),
         evidence_slot_bbox_bias_beta=script_args.evidence_slot_bbox_bias_beta,
         evidence_slot_normalize_qk=script_args.evidence_slot_normalize_qk,
+        evidence_slot_inject_student=script_args.evidence_slot_inject_student,
+        evidence_slot_injection_scale=script_args.evidence_slot_injection_scale,
+        evidence_slot_injection_match_norm=script_args.evidence_slot_injection_match_norm,
         max_prompt_length=script_args.max_prompt_length,
         max_completion_length=script_args.max_completion_length,
         generation_temperature=script_args.generation_temperature,
@@ -379,6 +393,18 @@ def main() -> None:
                         script_args.evidence_slot_bbox_bias_beta
                     ),
                     "evidence_slot_normalize_qk": script_args.evidence_slot_normalize_qk,
+                    "evidence_slot_inject_student": (
+                        script_args.evidence_slot_inject_student
+                    ),
+                    "evidence_slot_injection_scale": (
+                        script_args.evidence_slot_injection_scale
+                    ),
+                    "evidence_slot_injection_match_norm": (
+                        script_args.evidence_slot_injection_match_norm
+                    ),
+                    "evidence_slot_hint_after_anchor": (
+                        script_args.evidence_slot_hint_after_anchor
+                    ),
                     "ghd_teacher_privilege_mode": script_args.teacher_privilege_mode,
                     "ghd_bbox_field": script_args.bbox_field,
                     "ghd_filter_no_bbox": script_args.filter_no_bbox,

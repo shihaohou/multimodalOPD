@@ -100,9 +100,9 @@ def add_lmms_eval_to_path(path: str) -> str:
 
 
 def normalize_lmms_api_type() -> None:
+    """Avoid lmms-eval MathVerse import crashes from unsupported API_TYPE values."""
     api_type = os.environ.get("API_TYPE", "openai").strip().lower()
-    if api_type not in {"openai", "azure"}:
-        os.environ["API_TYPE"] = "openai"
+    os.environ["API_TYPE"] = api_type if api_type in {"openai", "azure"} else "openai"
 
 
 def patch_lmms_openai_provider() -> None:

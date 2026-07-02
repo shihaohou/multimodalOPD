@@ -61,12 +61,15 @@ def format_anchor_prompt(
     anchor_text: str,
     answer_cue: str,
     hint: str = "",
+    hint_after_anchor: bool = False,
 ) -> str:
-    """Question text with optional hidden hint before the causal anchor."""
+    """Question text with optional hidden hint around the causal anchor."""
     text = format_opd_student_prompt(problem, suffix)
-    if hint:
+    if hint and not hint_after_anchor:
         text = f"{text}\n{hint}"
     text = f"{text}\n{anchor_text}"
+    if hint and hint_after_anchor:
+        text = f"{text}\n{hint}"
     if answer_cue:
         text = f"{text}\n{answer_cue}"
     return text
@@ -81,8 +84,9 @@ def build_anchor_messages(
     anchor_text: str,
     answer_cue: str,
     hint: str = "",
+    hint_after_anchor: bool = False,
 ) -> list[dict[str, Any]]:
-    """``[system, user(image + question [+ hint] + anchor + cue)]``."""
+    """``[system, user(image + question + anchor/hint + cue)]``."""
     content: list[dict[str, Any]] = []
     if image is not None:
         content.append({"type": "image", "image": image})
@@ -95,6 +99,7 @@ def build_anchor_messages(
                 anchor_text=anchor_text,
                 answer_cue=answer_cue,
                 hint=hint,
+                hint_after_anchor=hint_after_anchor,
             ),
         }
     )
@@ -263,6 +268,7 @@ class OPDAnchorDataCollator(OPDDataCollator):
     num_anchor_tokens: int = 1
     anchor_indexed_tokens: bool = True
     anchor_answer_cue: str = DEFAULT_ANCHOR_ANSWER_CUE
+    hint_after_anchor: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -345,6 +351,7 @@ class OPDAnchorDataCollator(OPDDataCollator):
                 anchor_text=self.anchor_text,
                 answer_cue=self.anchor_answer_cue,
                 hint=hint,
+                hint_after_anchor=self.hint_after_anchor,
             )
 
             student_messages.append(student_message)

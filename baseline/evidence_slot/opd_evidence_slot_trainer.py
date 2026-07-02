@@ -11,11 +11,14 @@ not a raw teacher hidden state:
 
 Only the value path comes from visual tokens. The hint/bbox can steer the teacher
 query or attention bias, but the latent that gets aligned is pooled out of image
-token states.
+token states. On the student side, a detached prompt prepass can also inject the
+pooled ``Z_S`` back into the prompt's ``<EVID>`` input embeddings for the main OPD
+scoring forward, so completion tokens train while attending to the evidence slot.
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 from typing import Any
 
@@ -45,6 +48,9 @@ class OPDEvidenceSlotTrainer(OPDTrainer):
         evidence_slot_train_teacher_projector: bool = False,
         evidence_slot_bbox_bias_beta: float = 2.0,
         evidence_slot_normalize_qk: bool = True,
+        evidence_slot_inject_student: bool = True,
+        evidence_slot_injection_scale: float = 1.0,
+        evidence_slot_injection_match_norm: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -61,9 +67,15 @@ class OPDEvidenceSlotTrainer(OPDTrainer):
         )
         self.evidence_slot_bbox_bias_beta = float(evidence_slot_bbox_bias_beta)
         self.evidence_slot_normalize_qk = bool(evidence_slot_normalize_qk)
+        self.evidence_slot_inject_student = bool(evidence_slot_inject_student)
+        self.evidence_slot_injection_scale = float(evidence_slot_injection_scale)
+        self.evidence_slot_injection_match_norm = bool(
+            evidence_slot_injection_match_norm
+        )
         self._student_parts = None
         self._teacher_parts = None
         self._grid_checked = False
+        self._warned_injection_hook = False
 
         unwrapped = self.accelerator.unwrap_model(self.model)
         projectors = ensure_anchor_projectors(
@@ -80,7 +92,10 @@ class OPDEvidenceSlotTrainer(OPDTrainer):
                 f"teacher {projectors.teacher.in_features}->{projectors.teacher.out_features}, "
                 f"lambda={self.lambda_evidence_slot}, "
                 f"bbox_beta={self.evidence_slot_bbox_bias_beta}, "
-                f"normalize_qk={self.evidence_slot_normalize_qk}",
+                f"normalize_qk={self.evidence_slot_normalize_qk}, "
+                f"inject_student={self.evidence_slot_inject_student}, "
+                f"injection_scale={self.evidence_slot_injection_scale}, "
+                f"match_norm={self.evidence_slot_injection_match_norm}",
                 flush=True,
             )
 
@@ -139,6 +154,28 @@ class OPDEvidenceSlotTrainer(OPDTrainer):
                 f"teacher_merge={self._teacher_parts.spatial_merge_size}.",
                 flush=True,
             )
+
+    @staticmethod
+    def _nested_module(root: nn.Module, path: str) -> nn.Module | None:
+        obj: object = root
+        for part in path.split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                return None
+        return obj if isinstance(obj, nn.Module) else None
+
+    def _language_model_module(self, model: nn.Module) -> nn.Module | None:
+        root = self.accelerator.unwrap_model(model)
+        for path in (
+            "model.language_model",
+            "language_model",
+            "base_model.model.model.language_model",
+            "base_model.model.language_model",
+        ):
+            module = self._nested_module(root, path)
+            if module is not None:
+                return module
+        return None
 
     @staticmethod
     def _gather_positions(hidden: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -248,6 +285,137 @@ class OPDEvidenceSlotTrainer(OPDTrainer):
         if inside is not None:
             bbox_mass = attention.float().matmul(inside.to(dtype=torch.float32))
         return z, valid_slots, bbox_mass
+
+    @torch.no_grad()
+    def _student_prompt_carrier_deltas(
+        self,
+        model: nn.Module,
+        student_prompt: dict[str, torch.Tensor],
+        inputs: dict[str, Any],
+    ) -> torch.Tensor | None:
+        """Build detached ``Z_S`` deltas for prompt <EVID> slots.
+
+        This is a no-grad prompt prepass to avoid two train-graph forwards through
+        the same DeepSpeed/ZeRO-wrapped student in one backward. The main full
+        forward still carries gradients; the evidence-slot side loss trains the
+        query/value path, while OPD sees the injected carrier in the scoring pass.
+        """
+        if (
+            not self.evidence_slot_inject_student
+            or self.evidence_slot_injection_scale == 0.0
+        ):
+            return None
+        self._ensure_parts(model)
+        s_parts = self._student_parts
+        assert s_parts is not None
+
+        prompt_inputs = dict(student_prompt)
+        prompt_inputs["logits_to_keep"] = 1
+        with self._temporary_eval_context(model):
+            outputs = model(
+                **prompt_inputs,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        hidden_last = outputs.hidden_states[-1]
+        del outputs
+
+        s_pos = inputs["student_anchor_positions"].to(hidden_last.device)
+        s_mask = inputs["student_anchor_attention_mask"].to(
+            device=hidden_last.device, dtype=torch.bool
+        )
+        image_grid_thw = student_prompt.get("image_grid_thw")
+        deltas = hidden_last.new_zeros(hidden_last.shape)
+        for b in range(hidden_last.shape[0]):
+            slot_mask = s_mask[b]
+            if not bool(slot_mask.any()):
+                continue
+            z, _, _ = self._pool_visual_values(
+                hidden=hidden_last[b],
+                input_ids=student_prompt["input_ids"][b],
+                query_positions=s_pos[b],
+                query_mask=slot_mask,
+                image_token_id=s_parts.image_token_id,
+                image_grid_thw=(
+                    image_grid_thw[b] if isinstance(image_grid_thw, torch.Tensor) else None
+                ),
+                spatial_merge_size=s_parts.spatial_merge_size,
+                bbox=None,
+                bbox_mask=None,
+                bbox_bias_beta=0.0,
+            )
+            if z is None:
+                continue
+            positions = s_pos[b][slot_mask].clamp(
+                min=0, max=max(0, hidden_last.shape[1] - 1)
+            )
+            deltas[b, positions] = z.to(dtype=deltas.dtype)
+        return deltas.detach()
+
+    @contextmanager
+    def _student_evidence_slot_injection(
+        self,
+        model: nn.Module,
+        prompt_deltas: torch.Tensor | None,
+    ):
+        if prompt_deltas is None:
+            yield
+            return
+        language_model = self._language_model_module(model)
+        if language_model is None:
+            if not self._warned_injection_hook and self.accelerator.is_main_process:
+                print(
+                    "[OPD-evidence-slot] warning: could not locate inner language "
+                    "model; student carrier injection is disabled for this step.",
+                    flush=True,
+                )
+                self._warned_injection_hook = True
+            yield
+            return
+
+        def hook(module, args, kwargs):
+            embeds = kwargs.get("inputs_embeds")
+            if embeds is None:
+                if not self._warned_injection_hook and self.accelerator.is_main_process:
+                    print(
+                        "[OPD-evidence-slot] warning: language-model hook did not "
+                        "receive inputs_embeds; carrier injection skipped.",
+                        flush=True,
+                    )
+                    self._warned_injection_hook = True
+                return args, kwargs
+            prompt_len = int(prompt_deltas.shape[1])
+            if (
+                embeds.shape[0] != prompt_deltas.shape[0]
+                or embeds.shape[1] < prompt_len
+                or embeds.shape[-1] != prompt_deltas.shape[-1]
+            ):
+                return args, kwargs
+
+            delta = prompt_deltas.to(device=embeds.device, dtype=embeds.dtype)
+            if self.evidence_slot_injection_match_norm:
+                base = embeds[:, :prompt_len, :]
+                delta_norm = delta.norm(dim=-1, keepdim=True)
+                base_norm = base.detach().norm(dim=-1, keepdim=True)
+                delta = torch.where(
+                    delta_norm > 0,
+                    delta * (base_norm / delta_norm.clamp_min(1e-6)),
+                    delta,
+                )
+
+            updated = embeds.clone()
+            updated[:, :prompt_len, :] = (
+                updated[:, :prompt_len, :]
+                + float(self.evidence_slot_injection_scale) * delta
+            )
+            kwargs["inputs_embeds"] = updated
+            return args, kwargs
+
+        handle = language_model.register_forward_pre_hook(hook, with_kwargs=True)
+        try:
+            yield
+        finally:
+            handle.remove()
 
     def _distributed_vector_objective(
         self,
@@ -464,13 +632,17 @@ class OPDEvidenceSlotTrainer(OPDTrainer):
         completion_attention = rollout["completion_attention_mask"].to(dtype=torch.bool)
         completion_length = completion_ids.shape[1]
 
+        prompt_carrier_deltas = self._student_prompt_carrier_deltas(
+            model, student_prompt, inputs
+        )
         student_inputs = self._with_completion(
             student_prompt,
             full_input_ids=rollout["generated_ids"],
             full_attention_mask=rollout["generated_attention_mask"],
         )
         student_inputs["logits_to_keep"] = completion_length + 1
-        student_outputs = model(**student_inputs, output_hidden_states=True)
+        with self._student_evidence_slot_injection(model, prompt_carrier_deltas):
+            student_outputs = model(**student_inputs, output_hidden_states=True)
         student_hidden_last = student_outputs.hidden_states[-1]
         student_logits = self._completion_logits(student_outputs.logits, completion_length)
         del student_outputs
