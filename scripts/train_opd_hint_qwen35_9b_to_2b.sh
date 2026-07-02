@@ -46,6 +46,11 @@ export FLA_CACHE_RESULTS="${FLA_CACHE_RESULTS:-1}"
 # The training process already holds student + local teacher; keep the colocated
 # rollout engine's KV reservation modest. Raise only if vLLM reports no KV space.
 export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.15}"
+# Keep the terminal readable; W&B still receives full metrics. Override these if
+# debugging processor warnings or Triton autotune choices.
+export TRANSFORMERS_VERBOSITY="${TRANSFORMERS_VERBOSITY:-error}"
+export TRITON_PRINT_AUTOTUNING="${TRITON_PRINT_AUTOTUNING:-0}"
+export OPD_STDOUT_LOG="${OPD_STDOUT_LOG:-1}"
 
 DATASET_TAG="$(basename "${DATASET_NAME%/}")"
 DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
@@ -63,6 +68,7 @@ echo "[hint-opd-qwen35] dataset=$DATASET_NAME answer_field=$ANSWER_FIELD bbox_fi
 echo "[hint-opd-qwen35] use_vllm=$USE_VLLM"
 echo "[hint-opd-qwen35] opd_enable_thinking=$OPD_ENABLE_THINKING prompt_style=$OPD_PROMPT_STYLE"
 echo "[hint-opd-qwen35] triton_cache_dir=$TRITON_CACHE_DIR fla_cache_mode=$FLA_CACHE_MODE vllm_gpu_memory_utilization=$VLLM_GPU_MEMORY_UTILIZATION"
+echo "[hint-opd-qwen35] transformers_verbosity=$TRANSFORMERS_VERBOSITY triton_print_autotuning=$TRITON_PRINT_AUTOTUNING opd_stdout_log=$OPD_STDOUT_LOG"
 echo "[hint-opd-qwen35] privilege=$TEACHER_PRIVILEGE_MODE run_config=${RUN_CONFIG}_<RUN_ID>"
 
 exec bash scripts/train_opd_hint_qwen3_2b.sh

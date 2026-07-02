@@ -127,6 +127,46 @@ class OPDTrainer(ViGOSTrainer):
         print(message, flush=True)
         return now
 
+    def log(self, logs: dict[str, float], *args: Any, **kwargs: Any) -> None:
+        merged_logs = {**logs, **self._last_loss_metrics} if self._last_loss_metrics else dict(logs)
+        result = super().log(logs, *args, **kwargs)
+        self._stdout_step_log(merged_logs)
+        return result
+
+    def _stdout_step_log(self, logs: dict[str, Any]) -> None:
+        enabled = str(os.environ.get("OPD_STDOUT_LOG", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if not enabled:
+            return
+        accelerator = getattr(self, "accelerator", None)
+        if accelerator is not None and not getattr(accelerator, "is_main_process", True):
+            return
+        keys = (
+            "loss",
+            "loss_opd",
+            "answer_accuracy",
+            "completion_length",
+            "grad_norm",
+            "learning_rate",
+            "epoch",
+        )
+        fields = []
+        for key in keys:
+            if key not in logs:
+                continue
+            value = logs[key]
+            if isinstance(value, float):
+                fields.append(f"{key}={value:.6g}")
+            else:
+                fields.append(f"{key}={value}")
+        if not fields:
+            return
+        step = int(getattr(getattr(self, "state", None), "global_step", 0) or 0)
+        print(f"[OPD-log] step={step} " + " ".join(fields), flush=True)
+
     def _completion_placeholder_token_ids(self) -> set[int]:
         """Image/video placeholder token ids — these must never appear inside a
         sampled completion. If the on-policy student emits one, re-running
