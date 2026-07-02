@@ -32,12 +32,15 @@ export OPD_PROMPT_STYLE="${OPD_PROMPT_STYLE:-freecot}"
 # Qwen3.5 needs a newer vLLM than the repo's Qwen3 stack. Default to HF rollout
 # for compatibility; set USE_VLLM=true only in an environment with Qwen3.5 vLLM support.
 export USE_VLLM="${USE_VLLM:-false}"
-# Qwen3.5 uses FLA Triton kernels. FLA defaults to cache disabled, which forces
-# slow per-shape autotuning; prefer shipped/fuzzy/default configs and persist
-# Triton autotune results across reruns.
+# Qwen3.5 uses FLA Triton kernels. Avoid per-shape autotune during training: it
+# is slow and can OOM while benchmarking backward configs. Override with
+# FLA_CACHE_MODE=full only when intentionally profiling configs.
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${P%/}/triton-cache}"
-export FLA_CACHE_MODE="${FLA_CACHE_MODE:-full}"
+export FLA_CACHE_MODE="${FLA_CACHE_MODE:-default}"
 export FLA_CACHE_RESULTS="${FLA_CACHE_RESULTS:-1}"
+# The training process already holds student + local teacher; keep the colocated
+# rollout engine's KV reservation modest. Raise only if vLLM reports no KV space.
+export VLLM_GPU_MEMORY_UTILIZATION="${VLLM_GPU_MEMORY_UTILIZATION:-0.15}"
 
 DATASET_TAG="$(basename "${DATASET_NAME%/}")"
 DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
@@ -49,7 +52,7 @@ echo "[opd-qwen35] teacher=$TEACHER_MODEL"
 echo "[opd-qwen35] dataset=$DATASET_NAME answer_field=$ANSWER_FIELD"
 echo "[opd-qwen35] use_vllm=$USE_VLLM"
 echo "[opd-qwen35] opd_enable_thinking=$OPD_ENABLE_THINKING prompt_style=$OPD_PROMPT_STYLE"
-echo "[opd-qwen35] triton_cache_dir=$TRITON_CACHE_DIR fla_cache_mode=$FLA_CACHE_MODE"
+echo "[opd-qwen35] triton_cache_dir=$TRITON_CACHE_DIR fla_cache_mode=$FLA_CACHE_MODE vllm_gpu_memory_utilization=$VLLM_GPU_MEMORY_UTILIZATION"
 echo "[opd-qwen35] run_config=${RUN_CONFIG}_<RUN_ID>"
 
 exec bash scripts/train_opd.sh
