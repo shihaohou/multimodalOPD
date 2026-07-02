@@ -26,6 +26,10 @@ export TRANSFORMERS_NO_TF=1
 export TOKENIZERS_PARALLELISM=false
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore:Palette images with Transparency:UserWarning}"
+case "$(printf '%s' "${API_TYPE:-openai}" | tr '[:upper:]' '[:lower:]')" in
+  openai|azure) export API_TYPE="$(printf '%s' "${API_TYPE:-openai}" | tr '[:upper:]' '[:lower:]')" ;;
+  *) export API_TYPE=openai ;;
+esac
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d-%H%M%S)}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_outputs/lmms_aligned_${RUN_ID}}"

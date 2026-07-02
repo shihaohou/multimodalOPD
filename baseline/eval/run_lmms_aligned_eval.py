@@ -99,6 +99,12 @@ def add_lmms_eval_to_path(path: str) -> str:
     return lmms_dir
 
 
+def normalize_lmms_api_type() -> None:
+    api_type = os.environ.get("API_TYPE", "openai").strip().lower()
+    if api_type not in {"openai", "azure"}:
+        os.environ["API_TYPE"] = "openai"
+
+
 def patch_lmms_openai_provider() -> None:
     """Let one OPENAI_API_URL work for both lmms-eval judge call styles.
 
@@ -296,6 +302,7 @@ def main() -> None:
     args = parse_args()
     if args.skip_score and args.score_only:
         raise SystemExit("--skip-score and --score-only are mutually exclusive.")
+    normalize_lmms_api_type()
     lmms_dir = add_lmms_eval_to_path(args.lmms_eval_dir)
     patch_lmms_openai_provider()
 
