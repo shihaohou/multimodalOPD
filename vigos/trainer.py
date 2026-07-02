@@ -101,6 +101,8 @@ class ViGOSTrainer(Trainer):
         vllm_max_model_len: int | None = None,
         vllm_max_num_seqs: int | None = None,
         vllm_disable_custom_all_reduce: bool = False,
+        max_pixels: int | None = None,
+        min_pixels: int | None = None,
         vllm_server_base_url: str | None = None,
         vllm_server_host: str = "127.0.0.1",
         vllm_server_port: int = 8000,
@@ -138,6 +140,8 @@ class ViGOSTrainer(Trainer):
         self.vllm_max_model_len = vllm_max_model_len
         self.vllm_max_num_seqs = vllm_max_num_seqs
         self.vllm_disable_custom_all_reduce = vllm_disable_custom_all_reduce
+        self.max_pixels = max_pixels
+        self.min_pixels = min_pixels
         self.vllm_server_base_url = vllm_server_base_url
         self.vllm_server_host = vllm_server_host
         self.vllm_server_port = vllm_server_port
@@ -1653,6 +1657,12 @@ class ViGOSTrainer(Trainer):
 
         # max_num_seqs is tied to the local micro-batch by default to avoid vLLM
         # reserving memory for more concurrent rollouts than training can consume.
+        mm_processor_kwargs: dict[str, Any] = {"use_fast": False}
+        if self.max_pixels is not None:
+            mm_processor_kwargs["max_pixels"] = self.max_pixels
+        if self.min_pixels is not None:
+            mm_processor_kwargs["min_pixels"] = self.min_pixels
+
         self.vllm_engine = LLM(
             model=self.model_name_or_path,
             trust_remote_code=True,
@@ -1664,7 +1674,7 @@ class ViGOSTrainer(Trainer):
             distributed_executor_backend="external_launcher",
             seed=self.accelerator.process_index // self.vllm_tensor_parallel_size,
             limit_mm_per_prompt={"image": 1},
-            mm_processor_kwargs={"use_fast": False},
+            mm_processor_kwargs=mm_processor_kwargs,
             disable_custom_all_reduce=self.vllm_disable_custom_all_reduce,
         )
         self.accelerator.wait_for_everyone()

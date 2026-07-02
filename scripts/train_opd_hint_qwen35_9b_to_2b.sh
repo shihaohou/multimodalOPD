@@ -25,6 +25,9 @@ export ANSWER_FIELD="${ANSWER_FIELD:-answer}"
 export BBOX_FIELD="${BBOX_FIELD:-bbox}"
 export TEACHER_PRIVILEGE_MODE="${TEACHER_PRIVILEGE_MODE:-hint}"
 export FILTER_NO_BBOX="${FILTER_NO_BBOX:-true}"
+# Cap Qwen3.5 visual tokens. Without this, high-res Visual-CoT images can expand
+# to ~16k image placeholders and be cut by MAX_PROMPT_LENGTH truncation.
+export MAX_PIXELS="${MAX_PIXELS:-1048576}"
 # Qwen3.5 needs a newer vLLM than the repo's Qwen3 stack. Default to HF rollout
 # for compatibility; set USE_VLLM=true only in an environment with Qwen3.5 vLLM support.
 export USE_VLLM="${USE_VLLM:-false}"

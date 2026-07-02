@@ -72,6 +72,8 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
 FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-16384}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
+MAX_PIXELS="${MAX_PIXELS:-}"
+MIN_PIXELS="${MIN_PIXELS:-}"
 # saliency-r1-8k uses 'solution' for the GT answer; override per dataset.
 ANSWER_FIELD="${ANSWER_FIELD:-solution}"
 OPD_PROMPT_SUFFIX="${OPD_PROMPT_SUFFIX:-}"
@@ -152,6 +154,14 @@ if [[ -n "$HINT_TEMPLATE" ]]; then
   HINT_TEMPLATE_ARGS=(--hint_template "$HINT_TEMPLATE")
 fi
 
+PIXEL_ARGS=()
+if [[ -n "$MAX_PIXELS" ]]; then
+  PIXEL_ARGS+=(--max_pixels "$MAX_PIXELS")
+fi
+if [[ -n "$MIN_PIXELS" ]]; then
+  PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
+fi
+
 DATALOADER_ARGS=(
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
   --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS"
@@ -208,6 +218,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
   "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
   --max_prompt_length "$MAX_PROMPT_LENGTH" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
+  "${PIXEL_ARGS[@]}" \
   --generation_temperature "$GENERATION_TEMPERATURE" \
   --generation_top_p "$GENERATION_TOP_P" \
   --generation_top_k "$GENERATION_TOP_K" \

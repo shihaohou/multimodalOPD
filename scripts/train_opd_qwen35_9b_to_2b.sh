@@ -20,6 +20,9 @@ export MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${M%/}/Qwen3.5-2B}"
 export TEACHER_MODEL="${TEACHER_MODEL:-${M%/}/Qwen3.5-9B}"
 export DATASET_NAME="${DATASET_NAME:-${D%/}/Visual-CoT}"
 export ANSWER_FIELD="${ANSWER_FIELD:-answer}"
+# Cap Qwen3.5 visual tokens. Without this, high-res Visual-CoT images can expand
+# to ~16k image placeholders and be cut by MAX_PROMPT_LENGTH truncation.
+export MAX_PIXELS="${MAX_PIXELS:-1048576}"
 # Qwen3.5 needs a newer vLLM than the repo's Qwen3 stack. Default to HF rollout
 # for compatibility; set USE_VLLM=true only in an environment with Qwen3.5 vLLM support.
 export USE_VLLM="${USE_VLLM:-false}"

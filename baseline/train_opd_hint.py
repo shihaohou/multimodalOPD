@@ -170,10 +170,17 @@ def main() -> None:
 
     set_seed(training_args.seed)
 
+    processor_kwargs = {
+        "trust_remote_code": script_args.trust_remote_code,
+        "use_fast": False,
+    }
+    if script_args.max_pixels is not None:
+        processor_kwargs["max_pixels"] = script_args.max_pixels
+    if script_args.min_pixels is not None:
+        processor_kwargs["min_pixels"] = script_args.min_pixels
     processor = AutoProcessor.from_pretrained(
         script_args.model_name_or_path,
-        trust_remote_code=script_args.trust_remote_code,
-        use_fast=False,
+        **processor_kwargs,
     )
     tokenizer = getattr(processor, "tokenizer", processor)
     if getattr(tokenizer, "pad_token", None) is None:
@@ -341,6 +348,8 @@ def main() -> None:
         or script_args.max_prompt_length + script_args.max_completion_length,
         vllm_max_num_seqs=script_args.vllm_max_num_seqs,
         vllm_disable_custom_all_reduce=script_args.vllm_disable_custom_all_reduce,
+        max_pixels=script_args.max_pixels,
+        min_pixels=script_args.min_pixels,
         completion_log_steps=script_args.completion_log_steps,
         completion_log_max_samples=script_args.completion_log_max_samples,
     )

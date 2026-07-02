@@ -80,6 +80,11 @@ FREEZE_VISION_TOWER="${FREEZE_VISION_TOWER:-false}"
 # Paper (Table 4): max input prompt 16384, max response 2048.
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-16384}"
 MAX_COMPLETION_LENGTH="${MAX_COMPLETION_LENGTH:-2048}"
+# Optional image-resolution cap passed to the HF/vLLM multimodal processors. Useful
+# for Qwen3.5: its native processor can emit 16k image tokens for high-res images,
+# and tokenizer truncation may then cut the image placeholder span.
+MAX_PIXELS="${MAX_PIXELS:-}"
+MIN_PIXELS="${MIN_PIXELS:-}"
 ANSWER_FIELD="${ANSWER_FIELD:-answer}"
 # Format instruction lives in the unified system prompt (baseline/opd_data_collator
 # OPD_SYSTEM_PROMPT); the user turn is just the question, so no suffix by default.
@@ -169,6 +174,14 @@ if [[ -n "$VLLM_SERVER_REQUEST_BATCH_SIZE" ]]; then
   VLLM_SERVER_ARGS+=(--vllm_server_request_batch_size "$VLLM_SERVER_REQUEST_BATCH_SIZE")
 fi
 
+PIXEL_ARGS=()
+if [[ -n "$MAX_PIXELS" ]]; then
+  PIXEL_ARGS+=(--max_pixels "$MAX_PIXELS")
+fi
+if [[ -n "$MIN_PIXELS" ]]; then
+  PIXEL_ARGS+=(--min_pixels "$MIN_PIXELS")
+fi
+
 DATALOADER_ARGS=(
   --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
   --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS"
@@ -227,6 +240,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
   "${GRADIENT_CHECKPOINTING_ARGS[@]}" \
   --max_prompt_length "$MAX_PROMPT_LENGTH" \
   --max_completion_length "$MAX_COMPLETION_LENGTH" \
+  "${PIXEL_ARGS[@]}" \
   --generation_temperature "$GENERATION_TEMPERATURE" \
   --generation_top_p "$GENERATION_TOP_P" \
   --generation_top_k "$GENERATION_TOP_K" \
