@@ -78,7 +78,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--max-model-len", type=int, default=None)
+    p.add_argument("--max-num-seqs", type=int, default=None)
+    p.add_argument("--max-num-batched-tokens", type=int, default=None)
     p.add_argument("--limit-images", type=int, default=16)
+    p.add_argument("--mm-processor-cache-gb", type=float, default=None)
+    p.add_argument(
+        "--mm-processor-kwargs",
+        default="",
+        help="JSON forwarded to vLLM's multimodal processor.",
+    )
     p.add_argument("--dtype", default="auto")
     p.add_argument("--tokenizer-mode", default="auto")
     p.add_argument(

@@ -20,6 +20,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
@@ -92,7 +93,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--tensor-parallel-size", type=int, default=1)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     p.add_argument("--max-model-len", type=int, default=None)
+    p.add_argument("--max-num-seqs", type=int, default=None)
+    p.add_argument("--max-num-batched-tokens", type=int, default=None)
     p.add_argument("--limit-images", type=int, default=16)
+    p.add_argument("--mm-processor-cache-gb", type=float, default=None)
+    p.add_argument(
+        "--mm-processor-kwargs",
+        default="",
+        help="JSON forwarded to vLLM's multimodal processor, e.g. image processor kwargs.",
+    )
     p.add_argument("--dtype", default="auto")
     p.add_argument(
         "--tokenizer-mode",
@@ -204,10 +213,35 @@ def make_engine(args: argparse.Namespace):
     )
     if args.max_model_len is not None:
         kwargs["max_model_len"] = args.max_model_len
+    for arg_name, kw_name in (
+        ("max_num_seqs", "max_num_seqs"),
+        ("max_num_batched_tokens", "max_num_batched_tokens"),
+        ("mm_processor_cache_gb", "mm_processor_cache_gb"),
+    ):
+        value = getattr(args, arg_name, None)
+        if value is not None:
+            kwargs[kw_name] = value
+    mm_processor_kwargs = str(getattr(args, "mm_processor_kwargs", "") or "").strip()
+    if mm_processor_kwargs:
+        try:
+            kwargs["mm_processor_kwargs"] = json.loads(mm_processor_kwargs)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"Invalid --mm-processor-kwargs JSON: {exc}") from exc
+        if not isinstance(kwargs["mm_processor_kwargs"], dict):
+            raise SystemExit("--mm-processor-kwargs must be a JSON object.")
     # Escape hatch for models that crash vLLM's CUDA-graph/torch.compile path with an
     # "illegal memory access" (seen on some finetuned Qwen3-VL checkpoints): run eager.
     if os.environ.get("VLLM_ENFORCE_EAGER", "").strip().lower() in {"1", "true", "yes"}:
         kwargs["enforce_eager"] = True
+    try:
+        params = inspect.signature(LLM).parameters
+        accepts_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        for key in list(kwargs):
+            if key not in params and not accepts_kwargs:
+                print(f"[vLLM] ignoring unsupported LLM argument: {key}", file=sys.stderr)
+                kwargs.pop(key)
+    except Exception:
+        pass
     return LLM(**kwargs)
 
 
