@@ -152,6 +152,14 @@ if [[ -n "$HINT_TEMPLATE" ]]; then
   HINT_TEMPLATE_ARGS=(--hint_template "$HINT_TEMPLATE")
 fi
 
+DATALOADER_ARGS=(
+  --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
+  --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS"
+)
+if (( DATALOADER_NUM_WORKERS > 0 )); then
+  DATALOADER_ARGS+=(--dataloader_prefetch_factor "$DATALOADER_PREFETCH_FACTOR")
+fi
+
 DATASET_TAG="$(basename "${DATASET_NAME%/}")"
 DATASET_TAG="${DATASET_TAG//[^A-Za-z0-9._-]/_}"
 # Mode in the tag (opd_hint_… vs opd_crop_…) so hint/crop runs never collide.
@@ -226,9 +234,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
   --save_total_limit "$SAVE_TOTAL_LIMIT" \
   --save_only_model "$SAVE_ONLY_MODEL" \
   --logging_steps "$LOGGING_STEPS" \
-  --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
-  --dataloader_prefetch_factor "$DATALOADER_PREFETCH_FACTOR" \
-  --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS" \
+  "${DATALOADER_ARGS[@]}" \
   --report_to "$REPORT_TO" \
   --lora_r "$LORA_R" \
   --lora_alpha "$LORA_ALPHA" \

@@ -169,6 +169,14 @@ if [[ -n "$VLLM_SERVER_REQUEST_BATCH_SIZE" ]]; then
   VLLM_SERVER_ARGS+=(--vllm_server_request_batch_size "$VLLM_SERVER_REQUEST_BATCH_SIZE")
 fi
 
+DATALOADER_ARGS=(
+  --dataloader_num_workers "$DATALOADER_NUM_WORKERS"
+  --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS"
+)
+if (( DATALOADER_NUM_WORKERS > 0 )); then
+  DATALOADER_ARGS+=(--dataloader_prefetch_factor "$DATALOADER_PREFETCH_FACTOR")
+fi
+
 # Dataset basename into RUN_CONFIG (-> output dir AND wandb run_name) so runs on
 # different training sets (Vision-SR1-47K vs ViRL39K vs ...) never collide.
 # Sanitized to [A-Za-z0-9._-] for path/wandb safety.
@@ -250,9 +258,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-runs/${RUN_CONFIG}}"
   --save_total_limit "$SAVE_TOTAL_LIMIT" \
   --save_only_model "$SAVE_ONLY_MODEL" \
   --logging_steps "$LOGGING_STEPS" \
-  --dataloader_num_workers "$DATALOADER_NUM_WORKERS" \
-  --dataloader_prefetch_factor "$DATALOADER_PREFETCH_FACTOR" \
-  --dataloader_persistent_workers "$DATALOADER_PERSISTENT_WORKERS" \
+  "${DATALOADER_ARGS[@]}" \
   --report_to "$REPORT_TO" \
   --lora_r "$LORA_R" \
   --lora_alpha "$LORA_ALPHA" \
